@@ -15,7 +15,7 @@ class InferenceTextEncoderWrapper(nn.Module):
         # print('self.t:', self.t)
         # print('text_input_ids:', text_input_ids)
         # print('attention_mask:', attention_mask)
-        result = self.t(text_input_ids, attention_mask)  # , attention_mask
+        result = self.t(text_input_ids)  # , attention_mask
         # print('result:', type(result), result)
         # return [result['last_hidden_state'].to(self.dtype)]
         return SimpleNamespace(last_hidden_state=result['last_hidden_state'].to(self.dtype))
@@ -50,11 +50,11 @@ class SimpleWrapper(nn.Module):
         super().__init__()
         self.model = model
     def forward(self, x, **kwargs):
-        print('self.model:', self.model)
-        print('x:', x.shape, x)
-        print('kwargs:', kwargs)
+        # print('self.model:', self.model)
+        # print('x:', x.shape, x)
+        # print('kwargs:', kwargs)
         output = self.model(x)
-        print('output:', output.shape, output)
+        # print('output:', output.shape, output)
         return output
 
 import torch
