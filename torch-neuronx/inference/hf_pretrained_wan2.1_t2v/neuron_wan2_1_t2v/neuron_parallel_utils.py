@@ -206,6 +206,115 @@ def shard_transformer_attn(tp_degree: int, attn: Attention):
     return attn
 
 
+def shard_transformer3d_attn(tp_degree: int, attn: Attention):
+    orig_inner_dim = attn.to_q.out_features
+    dim_head = orig_inner_dim // attn.heads
+    assert orig_inner_dim % attn.heads == 0
+    orig_num_heads = attn.heads
+    total_padded_heads = attn.heads + get_number_of_extra_heads(attn.heads, tp_degree)
+    attn.heads = neuronx_dist_utils.divide(total_padded_heads, tp_degree)
+    attn.sliceable_head_dim = attn.heads
+    new_inner_dim = dim_head * attn.heads
+    attn.inner_dim = new_inner_dim
+    assert attn.to_q.out_features == attn.to_k.out_features and attn.to_q.out_features == attn.to_v.out_features
+
+    # 处理 Q 投影层
+    orig_q = attn.to_q
+    attn.to_q = ColumnParallelLinear(
+        attn.to_q.in_features,
+        attn.to_q.out_features,
+        bias=(attn.to_q.bias is not None),
+        gather_output=False)
+    attn.to_q.weight.data = get_sharded_data(orig_q.weight.data, 0)
+    if attn.to_q.bias is not None:
+        attn.to_q.bias.data = get_sharded_data(orig_q.bias.data, 0)
+    del(orig_q)
+
+    # 处理 K 投影层
+    orig_k = attn.to_k
+    attn.to_k = ColumnParallelLinear(
+        attn.to_k.in_features,
+        attn.to_k.out_features,
+        bias=(attn.to_k.bias is not None),
+        gather_output=False)
+    attn.to_k.weight.data = get_sharded_data(orig_k.weight.data, 0)
+    if attn.to_k.bias is not None:
+        attn.to_k.bias.data = get_sharded_data(orig_k.bias.data, 0)
+    del(orig_k)
+
+    # 处理 V 投影层
+    orig_v = attn.to_v
+    attn.to_v = ColumnParallelLinear(
+        attn.to_v.in_features,
+        attn.to_v.out_features,
+        bias=(attn.to_v.bias is not None),
+        gather_output=False)
+    attn.to_v.weight.data = get_sharded_data(orig_v.weight.data, 0)
+    if attn.to_v.bias is not None:
+        attn.to_v.bias.data = get_sharded_data(orig_v.bias.data, 0)
+    del(orig_v)
+
+    # 处理 norm_q 和 norm_k（如果存在）
+    if hasattr(attn, 'norm_q') and attn.norm_q is not None:
+        # RMSNorm 的 weight 需要按照新的维度进行分片
+        if hasattr(attn.norm_q, 'weight'):
+            orig_weight = attn.norm_q.weight.data
+            # 分片权重以匹配分片后的query维度
+            attn.norm_q.weight.data = get_sharded_data(orig_weight, 0)
+            
+    if hasattr(attn, 'norm_k') and attn.norm_k is not None:
+        if hasattr(attn.norm_k, 'weight'):
+            orig_weight = attn.norm_k.weight.data
+            # 分片权重以匹配分片后的key维度
+            attn.norm_k.weight.data = get_sharded_data(orig_weight, 0)
+
+    # 处理 add_k_proj 和 add_v_proj（如果存在，用于I2V）
+    if hasattr(attn, 'add_k_proj') and attn.add_k_proj is not None:
+        orig_add_k = attn.add_k_proj
+        attn.add_k_proj = ColumnParallelLinear(
+            orig_add_k.in_features,
+            orig_add_k.out_features,
+            bias=(orig_add_k.bias is not None),
+            gather_output=False)
+        attn.add_k_proj.weight.data = get_sharded_data(orig_add_k.weight.data, 0)
+        if orig_add_k.bias is not None:
+            attn.add_k_proj.bias.data = get_sharded_data(orig_add_k.bias.data, 0)
+        del(orig_add_k)
+        
+    if hasattr(attn, 'add_v_proj') and attn.add_v_proj is not None:
+        orig_add_v = attn.add_v_proj
+        attn.add_v_proj = ColumnParallelLinear(
+            orig_add_v.in_features,
+            orig_add_v.out_features,
+            bias=(orig_add_v.bias is not None),
+            gather_output=False)
+        attn.add_v_proj.weight.data = get_sharded_data(orig_add_v.weight.data, 0)
+        if orig_add_v.bias is not None:
+            attn.add_v_proj.bias.data = get_sharded_data(orig_add_v.bias.data, 0)
+        del(orig_add_v)
+        
+    # 处理 norm_added_k（如果存在）
+    if hasattr(attn, 'norm_added_k') and attn.norm_added_k is not None:
+        if hasattr(attn.norm_added_k, 'weight'):
+            orig_weight = attn.norm_added_k.weight.data
+            attn.norm_added_k.weight.data = get_sharded_data(orig_weight, 0)
+
+    # 处理输出投影层
+    orig_out = attn.to_out[0]
+    attn.to_out[0] = RowParallelLinear(
+        attn.to_out[0].in_features,
+        attn.to_out[0].out_features,
+        bias=(attn.to_out[0].bias is not None),
+        input_is_parallel=True)
+    attn.to_out[0].weight.data = get_sharded_data(orig_out.weight.data, 1)
+    if attn.to_out[0].bias is not None: 
+        attn.to_out[0].bias.data = orig_out.bias.data.detach()
+    del(orig_out)
+    
+    pad_model(attn, tp_degree, orig_num_heads, wrapped_classes=(Attention,))
+    return attn
+
+
 def shard_transformer_feedforward(ff: FeedForward) -> FeedForward:
     orig_proj = ff.net[0].proj
     ff.net[0].proj = ColumnParallelLinear(

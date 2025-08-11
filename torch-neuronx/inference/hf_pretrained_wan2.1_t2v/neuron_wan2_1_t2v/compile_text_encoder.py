@@ -7,12 +7,8 @@ os.environ["NEURON_CUSTOM_SILU"] = "1"
 compiler_flags = """ --verbose=INFO --target=trn1 --model-type=unet-inference --enable-fast-loading-neuron-binaries """ # Use these compiler flags for trn1/inf2
 os.environ["NEURON_CC_FLAGS"] = os.environ.get("NEURON_CC_FLAGS", "") + compiler_flags
 
-import copy
-
-from diffusers import AutoencoderKLWan, WanPipeline
 import torch
 import argparse
-import torch_neuronx
 import neuronx_distributed
 from transformers.models.umt5 import UMT5EncoderModel
 from torch import nn
@@ -69,10 +65,10 @@ class TracingUMT5WrapperTP(nn.Module):
             # 替换 compute_bias 函数
             block.layer[0].SelfAttention.compute_bias = lambda *args, **kwargs: precomputed_bias_tp
     
-    def forward(self, text_input_ids, prompt_attention_mask=None):
+    def forward(self, text_input_ids, attention_mask=None):
         return self.t(
             text_input_ids, 
-            attention_mask=prompt_attention_mask
+            attention_mask=attention_mask
         )
 
 def get_text_encoder(tp_degree: int, sequence_length: int):
@@ -113,9 +109,7 @@ def compile_text_encoder(args):
     
     with torch.no_grad():
         sample_inputs = torch.ones((batch_size, sequence_length), dtype=torch.int64), \
-            torch.ones((batch_size, sequence_length), dtype=torch.int64)
-        # sample_inputs = torch.tensor([[49406, 18376, 525, 7496, 49407] + [0] * (sequence_length - 5)], dtype=torch.int64)
-        
+            torch.ones((batch_size, sequence_length), dtype=torch.int64)        
         compiled_text_encoder = neuronx_distributed.trace.parallel_model_trace(
             get_text_encoder_f,
             sample_inputs,

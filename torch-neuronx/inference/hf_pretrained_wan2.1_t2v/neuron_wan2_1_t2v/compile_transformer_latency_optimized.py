@@ -9,31 +9,31 @@ compiler_flags = """ --verbose=INFO --target=trn1 --model-type=unet-inference --
 os.environ["NEURON_CC_FLAGS"] = os.environ.get("NEURON_CC_FLAGS", "") + compiler_flags
 
 import copy
-import math
-from typing import Optional
 
 from diffusers import AutoencoderKLWan, WanPipeline
 import torch
 import argparse
 import neuronx_distributed
-import torch_neuronx
 
 from torch import nn
 import torch.nn.functional as F
 from functools import partial
 
 from neuron_commons import attention_wrapper_for_transformer
-from neuron_parallel_utils import shard_transformer_attn, shard_transformer_feedforward
+from neuron_parallel_utils import shard_transformer_attn, shard_transformer3d_attn, shard_transformer_feedforward
 
 from diffusers.models.transformers.transformer_wan import WanTransformer3DModel
 # torch.nn.functional.scaled_dot_product_attention = attention_wrapper_for_transformer
 
+from typing import Optional
 from diffusers.models.attention_processor import Attention
-try:
-    from neuronxcc.nki._private_kernels.attention import attention_isa_kernel  # noqa: E402
-except ImportError:
-    from neuronxcc.nki.kernels.attention import attention_isa_kernel  # noqa: E402
-from torch_neuronx.xla_impl.ops import nki_jit  # noqa: E402
+
+# from diffusers.models.attention_processor import Attention
+# try:
+#     from neuronxcc.nki._private_kernels.attention import attention_isa_kernel  # noqa: E402
+# except ImportError:
+#     from neuronxcc.nki.kernels.attention import attention_isa_kernel  # noqa: E402
+# from torch_neuronx.xla_impl.ops import nki_jit  # noqa: E402
 
 class TracingTransformerWrapper(nn.Module):
     def __init__(self, transformer):
@@ -52,75 +52,79 @@ class TracingTransformerWrapper(nn.Module):
         # added_cond_kwargs={"resolution": None, "aspect_ratio": None},
         return_dict=False)
 
-class WanSelfAttentionProcessorSharded:
-    """自定义的 attention processor，支持分片的 RMSNorm"""
-    
-    def __init__(self, tp_degree=1):
-        self.tp_degree = tp_degree
-    
+class WanAttnProcessor2_0_Sharded:
+    """自定义的分片注意力处理器"""
+    def __init__(self):
+        if not hasattr(F, "scaled_dot_product_attention"):
+            raise ImportError("WanAttnProcessor2_0_Sharded requires PyTorch 2.0")
+
     def __call__(
         self,
-        attn,
-        hidden_states,
-        encoder_hidden_states=None,
-        attention_mask=None,
-        **kwargs,
-    ):
-        rotary_emb = kwargs.get("rotary_emb", None)
-        
-        input_hidden_states = hidden_states
-        
-        batch_size, sequence_length, _ = hidden_states.shape
-        
-        # 获取 query, key, value
+        attn: Attention,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        rotary_emb: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        encoder_hidden_states_img = None
+        if hasattr(attn, 'add_k_proj') and attn.add_k_proj is not None:
+            # 512 is the context length of the text encoder
+            image_context_length = encoder_hidden_states.shape[1] - 512
+            encoder_hidden_states_img = encoder_hidden_states[:, :image_context_length]
+            encoder_hidden_states = encoder_hidden_states[:, image_context_length:]
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+
         query = attn.to_q(hidden_states)
-        key = attn.to_k(hidden_states)
-        value = attn.to_v(hidden_states)
+        key = attn.to_k(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states)
+
+        # 跳过norm_q和norm_k的处理，因为在分片情况下会有维度问题
+        # 或者，我们可以在这里手动处理归一化
         
-        # 应用 RMSNorm，但跳过维度检查
-        if hasattr(attn, 'norm_q'):
-            # 直接应用 norm，不检查维度
-            query = query.float()
-            variance = query.pow(2).mean(-1, keepdim=True)
-            query = query * torch.rsqrt(variance + attn.norm_q.eps)
-            if hasattr(attn.norm_q, 'weight'):
-                query = query * attn.norm_q.weight
-            query = query.to(hidden_states.dtype)
-        
-        if hasattr(attn, 'norm_k'):
-            key = key.float()
-            variance = key.pow(2).mean(-1, keepdim=True)
-            key = key * torch.rsqrt(variance + attn.norm_k.eps)
-            if hasattr(attn.norm_k, 'weight'):
-                key = key * attn.norm_k.weight
-            key = key.to(hidden_states.dtype)
-        
-        # Reshape for attention
-        inner_dim = key.shape[-1]
-        head_dim = inner_dim // attn.heads
-        
-        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-        
-        # Apply rotary embeddings if provided
-        if rotary_emb is not None:
-            query = apply_rotary_pos_emb(query, rotary_emb)
-            key = apply_rotary_pos_emb(key, rotary_emb)
-        
-        # Compute attention
+        query = query.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+        key = key.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+        value = value.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+
+        # TODO：暂时注释掉，报错：RuntimeError: The operator aten::view_as_complex appears to be a view operator, but it has no implementation for the backend "xla:0". View operators don't support since the tensor's storage cannot be shared across devices.
+        # if rotary_emb is not None:
+        #     def apply_rotary_emb(hidden_states: torch.Tensor, freqs: torch.Tensor):
+        #         dtype = torch.float32 if hidden_states.device.type == "mps" else torch.float64
+        #         x_rotated = torch.view_as_complex(hidden_states.to(dtype).unflatten(3, (-1, 2)))
+        #         x_out = torch.view_as_real(x_rotated * freqs).flatten(3, 4)
+        #         return x_out.type_as(hidden_states)
+
+        #     query = apply_rotary_emb(query, rotary_emb)
+        #     key = apply_rotary_emb(key, rotary_emb)
+
+        # I2V task
+        hidden_states_img = None
+        if encoder_hidden_states_img is not None:
+            key_img = attn.add_k_proj(encoder_hidden_states_img)
+            # 跳过 norm_added_k
+            value_img = attn.add_v_proj(encoder_hidden_states_img)
+
+            key_img = key_img.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+            value_img = value_img.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+
+            hidden_states_img = F.scaled_dot_product_attention(
+                query, key_img, value_img, attn_mask=None, dropout_p=0.0, is_causal=False
+            )
+            hidden_states_img = hidden_states_img.transpose(1, 2).flatten(2, 3)
+            hidden_states_img = hidden_states_img.type_as(query)
+
         hidden_states = F.scaled_dot_product_attention(
-            query, key, value, 
-            attn_mask=attention_mask, 
-            dropout_p=0.0, 
-            is_causal=False
+            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
         )
-        
-        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, inner_dim)
+        hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
+        hidden_states = hidden_states.type_as(query)
+
+        if hidden_states_img is not None:
+            hidden_states = hidden_states + hidden_states_img
+
         hidden_states = attn.to_out[0](hidden_states)
         hidden_states = attn.to_out[1](hidden_states)
-        
-        return hidden_states + input_hidden_states
+        return hidden_states
 
 def get_transformer_model(tp_degree: int):
     DTYPE = torch.bfloat16
@@ -128,8 +132,8 @@ def get_transformer_model(tp_degree: int):
     vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32, cache_dir="wan2.1_t2v_hf_cache_dir")
     pipe = WanPipeline.from_pretrained(model_id, vae=vae, torch_dtype=DTYPE, cache_dir="wan2.1_t2v_hf_cache_dir")
     
-    # 创建自定义 processor
-    sharded_processor = WanSelfAttentionProcessorSharded(tp_degree)
+    # 创建自定义的分片processor
+    sharded_processor = WanAttnProcessor2_0_Sharded()
     
     # 分片所有30个blocks
     for block_idx, block in enumerate(pipe.transformer.blocks):
@@ -139,19 +143,9 @@ def get_transformer_model(tp_degree: int):
         block.attn1 = shard_transformer_attn(tp_degree, block.attn1)
         block.attn2 = shard_transformer_attn(tp_degree, block.attn2)
         
-        # 设置自定义 processor
+        # 设置自定义processor
         block.attn1.processor = sharded_processor
         block.attn2.processor = sharded_processor
-        
-        # 如果需要，手动处理 norm 层权重（简单删除或设置为 None）
-        if tp_degree > 1:
-            if hasattr(block.attn1, 'norm_q'):
-                # 可以选择删除 norm 层或设置权重为合适的值
-                delattr(block.attn1, 'norm_q')
-                delattr(block.attn1, 'norm_k')
-            if hasattr(block.attn2, 'norm_q'):
-                delattr(block.attn2, 'norm_q')
-                delattr(block.attn2, 'norm_k')
 
         # 分片feedforward层
         block.ffn = shard_transformer_feedforward(block.ffn)

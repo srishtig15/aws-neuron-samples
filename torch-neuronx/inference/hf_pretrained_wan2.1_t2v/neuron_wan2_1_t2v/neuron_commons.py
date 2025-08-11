@@ -15,7 +15,7 @@ class InferenceTextEncoderWrapper(nn.Module):
         # print('self.t:', self.t)
         # print('text_input_ids:', text_input_ids)
         # print('attention_mask:', attention_mask)
-        result = self.t(text_input_ids)  # , attention_mask
+        result = self.t(text_input_ids, attention_mask)  # , attention_mask
         # print('result:', type(result), result)
         # return [result['last_hidden_state'].to(self.dtype)]
         return SimpleNamespace(last_hidden_state=result['last_hidden_state'].to(self.dtype))

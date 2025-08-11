@@ -41,7 +41,7 @@ def compile_decoder(args):
     compiled_models_dir = args.compiled_models_dir
     
     batch_size = 1
-    frames = 4  # default: 16
+    frames = 4  # default: 21
     # height, width = 32,32  # default: 96, 96
     in_channels = 16
     

@@ -28,7 +28,7 @@ if __name__ == "__main__":
     decoder_model_path = f"{COMPILED_MODELS_DIR}/decoder/model.pt"
     post_quant_conv_model_path = f"{COMPILED_MODELS_DIR}/post_quant_conv/model.pt"
     
-    seqlen=77  # default: 300
+    seqlen=512  # default: 512
     text_encoder_wrapper = InferenceTextEncoderWrapper(
         torch.bfloat16, pipe.text_encoder, seqlen
     )
