@@ -36,56 +36,46 @@ def shard_wan_norm(norm, tp_degree):
     """分片WanNorm层的参数"""
     if hasattr(norm, 'gamma') and norm.gamma is not None:
         # 获取原始gamma的通道数
-        orig_channels = norm.gamma.shape[0]
-        # 计算分片后的通道数
-        sharded_channels = orig_channels // tp_degree
-        # 分片gamma和bias
-        tp_rank = parallel_state.get_tensor_model_parallel_rank()
-        start_idx = tp_rank * sharded_channels
-        end_idx = start_idx + sharded_channels
-        
-        norm.gamma = nn.Parameter(norm.gamma[start_idx:end_idx].clone())
+        if isinstance(norm.gamma, nn.Parameter):
+            orig_channels = norm.gamma.shape[0]
+            # 计算分片后的通道数
+            sharded_channels = orig_channels // tp_degree
+            # 分片gamma
+            tp_rank = parallel_state.get_tensor_model_parallel_rank()
+            start_idx = tp_rank * sharded_channels
+            end_idx = start_idx + sharded_channels
+            
+            norm.gamma = nn.Parameter(norm.gamma[start_idx:end_idx].clone())
+            
+        # 处理bias - 检查它是否是tensor还是scalar
         if hasattr(norm, 'bias') and norm.bias is not None:
-            norm.bias = nn.Parameter(norm.bias[start_idx:end_idx].clone())
+            if isinstance(norm.bias, (nn.Parameter, torch.Tensor)):
+                # 如果bias是tensor，进行分片
+                tp_rank = parallel_state.get_tensor_model_parallel_rank()
+                sharded_channels = norm.bias.shape[0] // tp_degree
+                start_idx = tp_rank * sharded_channels
+                end_idx = start_idx + sharded_channels
+                norm.bias = nn.Parameter(norm.bias[start_idx:end_idx].clone())
+            # 如果bias是scalar（float），保持不变
+            # else: pass
     
     return norm
 
 def shard_resnet_block(resnet, tp_degree):
-    """分片ResNet块"""
-    # 分片conv1 (Conv3d)
+    """分片ResNet块 - 更简单的策略"""
+    # 对于VAE decoder，我们采用更保守的分片策略
+    # 只分片主要的卷积层，不触碰归一化层
+    
+    # 分片conv1 - 输出通道维度
     if hasattr(resnet, 'conv1') and isinstance(resnet.conv1, nn.Conv3d):
-        resnet.conv1 = shard_conv3d(resnet.conv1, tp_degree, dim=0)
-        
-        # 分片对应的norm2（在conv1之后）
-        if hasattr(resnet, 'norm2'):
-            # 检查是否是f32Wrapper
-            if hasattr(resnet.norm2, 'original'):
-                # 分片内部的WanNorm
-                resnet.norm2.original = shard_wan_norm(resnet.norm2.original, tp_degree)
-            else:
-                resnet.norm2 = shard_wan_norm(resnet.norm2, tp_degree)
+        out_channels = resnet.conv1.out_channels
+        if out_channels % tp_degree == 0:
+            resnet.conv1 = shard_conv3d(resnet.conv1, tp_degree, dim=0)
     
-    # 分片conv2 (Conv3d)
-    if hasattr(resnet, 'conv2') and isinstance(resnet.conv2, nn.Conv3d):
-        # conv2输入已分片，输出需要回到原始维度（或保持分片）
-        # 这里我们保持分片
-        resnet.conv2 = shard_conv3d(resnet.conv2, tp_degree, dim=1)
-        resnet.conv2 = shard_conv3d(resnet.conv2, 1, dim=0)  # 输出不分片
-    
-    # 如果有conv_shortcut且不是Identity层，则分片
-    if hasattr(resnet, 'conv_shortcut') and resnet.conv_shortcut is not None:
-        if isinstance(resnet.conv_shortcut, nn.Conv3d):
-            # shortcut需要和主路径输出维度匹配
-            resnet.conv_shortcut = shard_conv3d(resnet.conv_shortcut, 1, dim=0)  # 输出不分片
-        elif isinstance(resnet.conv_shortcut, nn.Identity):
-            pass
+    # conv2暂时不分片，避免复杂的维度匹配问题
+    # 或者可以采用all-reduce策略
     
     return resnet
-
-def shard_attention_block(attn, tp_degree):
-    """分片注意力块 - 简化版本，避免分片"""
-    # 由于VAE的attention比较小，我们可以选择不分片
-    return attn
 
 def upcast_norms_to_f32(decoder: Decoder):
     """将归一化层转换为FP32"""
@@ -114,43 +104,61 @@ def upcast_norms_to_f32(decoder: Decoder):
         orig_norm_out = decoder.norm_out
         decoder.norm_out = f32Wrapper(orig_norm_out)
 
-class ShardedConvIn(nn.Module):
-    """处理conv_in的特殊包装器，广播输入到所有分片"""
-    def __init__(self, conv_layer, tp_degree):
+class PartialShardingDecoder(nn.Module):
+    """部分分片的Decoder包装器"""
+    def __init__(self, decoder, tp_degree):
         super().__init__()
-        self.conv = conv_layer
+        self.decoder = decoder
         self.tp_degree = tp_degree
         
-    def forward(self, x):
-        # 对输入进行处理，确保每个分片都获得完整输入
-        return self.conv(x)
-
-def shard_decoder(decoder: Decoder, tp_degree: int):
-    """对decoder进行简化的分片策略"""
+        # 只对特定的大层进行分片
+        self._shard_large_layers()
     
-    # conv_in保持原样，不分片
-    # 它接收16通道输入，输出384通道
+    def _shard_large_layers(self):
+        """只分片计算量大的层"""
+        # 可以选择性地分片某些层
+        # 例如，只分片mid_block的某些卷积
+        if hasattr(self.decoder, 'mid_block') and self.decoder.mid_block is not None:
+            if hasattr(self.decoder.mid_block, 'resnets'):
+                for resnet in self.decoder.mid_block.resnets:
+                    # 只分片conv1，保持其他层不变
+                    if hasattr(resnet, 'conv1') and isinstance(resnet.conv1, nn.Conv3d):
+                        if resnet.conv1.out_channels >= 384 and resnet.conv1.out_channels % self.tp_degree == 0:
+                            # 创建一个简单的分片包装
+                            resnet.conv1 = self._create_sharded_conv(resnet.conv1)
     
-    # 只分片mid_block的ResNet块，不分片attention
-    if hasattr(decoder, 'mid_block') and decoder.mid_block is not None:
-        if hasattr(decoder.mid_block, 'resnets'):
-            for resnet in decoder.mid_block.resnets:
-                shard_resnet_block(resnet, tp_degree)
+    def _create_sharded_conv(self, conv):
+        """创建分片的卷积层"""
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        out_channels_per_rank = conv.out_channels // self.tp_degree
         
-        # 不分片attention层，保持简单
-        # if hasattr(decoder.mid_block, 'attentions'):
-        #     for attn in decoder.mid_block.attentions:
-        #         shard_attention_block(attn, tp_degree)
+        new_conv = nn.Conv3d(
+            in_channels=conv.in_channels,
+            out_channels=out_channels_per_rank,
+            kernel_size=conv.kernel_size,
+            stride=conv.stride,
+            padding=conv.padding,
+            dilation=conv.dilation,
+            groups=conv.groups,
+            bias=(conv.bias is not None),
+            padding_mode=conv.padding_mode
+        )
+        
+        # 分片权重
+        start_idx = tp_rank * out_channels_per_rank
+        end_idx = start_idx + out_channels_per_rank
+        new_conv.weight.data = conv.weight.data[start_idx:end_idx].clone()
+        
+        if conv.bias is not None:
+            new_conv.bias.data = conv.bias.data[start_idx:end_idx].clone()
+        
+        return new_conv
     
-    # up_blocks暂时不分片，避免复杂性
-    # 或者可以选择性地只分片某些层
-    
-    # conv_out保持原样
-    
-    return decoder
+    def forward(self, x):
+        return self.decoder(x)
 
 def get_decoder_model(tp_degree: int):
-    """获取并分片decoder模型"""
+    """获取decoder模型 - 简化版本"""
     model_id = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
     vae = AutoencoderKLWan.from_pretrained(
         model_id, 
@@ -162,63 +170,87 @@ def get_decoder_model(tp_degree: int):
     decoder = vae.decoder
     decoder.eval()
     
-    # 先上转精度
+    # 上转精度
     upcast_norms_to_f32(decoder)
     
-    # 简化的分片策略
-    decoder = shard_decoder(decoder, tp_degree)
+    # 使用部分分片策略
+    # decoder = PartialShardingDecoder(decoder, tp_degree)
     
-    # post_quant_conv不分片
+    # 为了简化，暂时不分片decoder，只依赖数据并行
+    # 或者使用pipeline并行
     
     # 创建包装器
     decoder_wrapper = DecoderWrapper(decoder, vae.post_quant_conv)
     
     return decoder_wrapper, {}
 
-def compile_decoder(args):
-    tp_degree = 8  # 使用8个tensor并行度
-    os.environ["LOCAL_WORLD_SIZE"] = "8"
-    
+def compile_decoder_pipeline(args):
+    """使用pipeline并行而不是tensor并行"""
     latent_height = args.height // 8
     latent_width = args.width // 8
     compiler_workdir = args.compiler_workdir
     compiled_models_dir = args.compiled_models_dir
     
     batch_size = 1
-    frames = args.frames  # 现在可以设置为21
+    frames = 21  # 每批处理21帧
     in_channels = 16
     
-    sample_inputs = torch.rand(
-        (batch_size, in_channels, frames, latent_height, latent_width), 
-        dtype=torch.float32
+    model_id = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+    vae = AutoencoderKLWan.from_pretrained(
+        model_id, 
+        subfolder="vae", 
+        torch_dtype=torch.float32, 
+        cache_dir="wan2.1_t2v_hf_cache_dir"
     )
     
-    get_decoder_model_f = partial(get_decoder_model, tp_degree)
+    decoder = vae.decoder
+    decoder.eval()
+    upcast_norms_to_f32(decoder)
     
     with torch.no_grad():
-        compiled_decoder = neuronx_distributed.trace.parallel_model_trace(
-            get_decoder_model_f,
-            (sample_inputs,),
+        # 编译较小的批次
+        sample_inputs = torch.rand(
+            (batch_size, in_channels, frames, latent_height, latent_width), 
+            dtype=torch.float32
+        )
+        
+        import torch_neuronx
+        
+        # 编译decoder
+        compiled_decoder = torch_neuronx.trace(
+            decoder,
+            sample_inputs,
             compiler_workdir=f"{compiler_workdir}/decoder",
             compiler_args=compiler_flags,
-            tp_degree=tp_degree,
-            inline_weights_to_neff=False,
+            inline_weights_to_neff=False
         )
         
         compiled_model_dir = f"{compiled_models_dir}/decoder"
         if not os.path.exists(compiled_model_dir):
             os.makedirs(compiled_model_dir)
-        
-        neuronx_distributed.trace.parallel_model_save(
-            compiled_decoder, f"{compiled_model_dir}"
-        )
+        torch.jit.save(compiled_decoder, f"{compiled_model_dir}/model.pt")
 
+        # 编译post_quant_conv
+        compiled_post_quant_conv = torch_neuronx.trace(
+            vae.post_quant_conv,
+            sample_inputs,
+            compiler_workdir=f"{compiler_workdir}/post_quant_conv",
+            compiler_args=compiler_flags,
+            inline_weights_to_neff=False
+        )
+        
+        compiled_model_dir = f"{compiled_models_dir}/post_quant_conv"
+        if not os.path.exists(compiled_model_dir):
+            os.makedirs(compiled_model_dir)     
+        torch.jit.save(compiled_post_quant_conv, f"{compiled_model_dir}/model.pt")
+        
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--height", help="height of generated video.", type=int, default=256)
     parser.add_argument("--width", help="width of generated video.", type=int, default=256)
-    parser.add_argument("--frames", help="number of frames.", type=int, default=21)
     parser.add_argument("--compiler_workdir", help="dir for compiler artifacts.", type=str, default="compiler_workdir")
     parser.add_argument("--compiled_models_dir", help="dir for compiled artifacts.", type=str, default="compiled_models")
     args = parser.parse_args()
-    compile_decoder(args)
+    
+    # 使用pipeline策略而不是tensor并行
+    compile_decoder_pipeline(args)

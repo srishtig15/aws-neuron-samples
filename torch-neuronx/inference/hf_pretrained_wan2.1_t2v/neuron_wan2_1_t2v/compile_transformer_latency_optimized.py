@@ -20,20 +20,13 @@ import torch.nn.functional as F
 from functools import partial
 
 from neuron_commons import attention_wrapper_for_transformer
-from neuron_parallel_utils import shard_transformer_attn, shard_transformer3d_attn, shard_transformer_feedforward
+from neuron_parallel_utils import shard_transformer_attn, shard_transformer_feedforward
 
 from diffusers.models.transformers.transformer_wan import WanTransformer3DModel
-# torch.nn.functional.scaled_dot_product_attention = attention_wrapper_for_transformer
+# torch.nn.functional.scaled_dot_product_attention = attention_wrapper_for_transformer  # TODO may raise error
 
 from typing import Optional
 from diffusers.models.attention_processor import Attention
-
-# from diffusers.models.attention_processor import Attention
-# try:
-#     from neuronxcc.nki._private_kernels.attention import attention_isa_kernel  # noqa: E402
-# except ImportError:
-#     from neuronxcc.nki.kernels.attention import attention_isa_kernel  # noqa: E402
-# from torch_neuronx.xla_impl.ops import nki_jit  # noqa: E402
 
 class TracingTransformerWrapper(nn.Module):
     def __init__(self, transformer):
@@ -79,8 +72,12 @@ class WanAttnProcessor2_0_Sharded:
         key = attn.to_k(encoder_hidden_states)
         value = attn.to_v(encoder_hidden_states)
 
-        # 跳过norm_q和norm_k的处理，因为在分片情况下会有维度问题
+        # TODO: 跳过norm_q和norm_k的处理，因为在分片情况下会有维度问题
         # 或者，我们可以在这里手动处理归一化
+        # if attn.norm_q is not None:
+        #     query = attn.norm_q(query)
+        # if attn.norm_k is not None:
+        #     key = attn.norm_k(key)
         
         query = query.unflatten(2, (attn.heads, -1)).transpose(1, 2)
         key = key.unflatten(2, (attn.heads, -1)).transpose(1, 2)
@@ -101,7 +98,8 @@ class WanAttnProcessor2_0_Sharded:
         hidden_states_img = None
         if encoder_hidden_states_img is not None:
             key_img = attn.add_k_proj(encoder_hidden_states_img)
-            # 跳过 norm_added_k
+            # TODO: 跳过 norm_added_k
+            # key_img = attn.norm_added_k(key_img)
             value_img = attn.add_v_proj(encoder_hidden_states_img)
 
             key_img = key_img.unflatten(2, (attn.heads, -1)).transpose(1, 2)
