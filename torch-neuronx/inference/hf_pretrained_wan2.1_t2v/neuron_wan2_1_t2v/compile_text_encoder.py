@@ -9,6 +9,7 @@ os.environ["NEURON_CC_FLAGS"] = os.environ.get("NEURON_CC_FLAGS", "") + compiler
 
 import torch
 import argparse
+import torch_neuronx
 import neuronx_distributed
 from transformers.models.umt5 import UMT5EncoderModel
 from torch import nn
@@ -72,9 +73,14 @@ class TracingUMT5WrapperTP(nn.Module):
         )
 
 def get_text_encoder(tp_degree: int, sequence_length: int):
-    model_id = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+    # model_id = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+    # DTYPE = torch.bfloat16
+    # text_encoder = UMT5EncoderModel.from_pretrained(model_id, subfolder="text_encoder", torch_dtype=DTYPE, cache_dir="wan2.1_t2v_hf_cache_dir")
+    # text_encoder.eval()
+    
+    model_id = "Wan-AI/Wan2.1-T2V-14B-Diffusers"
     DTYPE = torch.bfloat16
-    text_encoder = UMT5EncoderModel.from_pretrained(model_id, subfolder="text_encoder", torch_dtype=DTYPE, cache_dir="wan2.1_t2v_hf_cache_dir")
+    text_encoder = UMT5EncoderModel.from_pretrained(model_id, subfolder="text_encoder", torch_dtype=DTYPE, cache_dir="wan2.1_t2v_14b_hf_cache_dir")
     text_encoder.eval()
     
     for idx, block in enumerate(text_encoder.encoder.block):
@@ -133,42 +139,25 @@ if __name__ == "__main__":
     compile_text_encoder(args)
 
 
-# class NeuronTextEncoder(nn.Module):
-#     def __init__(self, text_encoder):
-#         super().__init__()
-#         self.neuron_text_encoder = text_encoder
-#         self.config = text_encoder.config
-#         self.dtype = text_encoder.dtype
-#         self.device = text_encoder.device
-
-#     def forward(self, emb, attention_mask = None):
-#         return [self.neuron_text_encoder(emb)['last_hidden_state']]
-
 # DTYPE = torch.bfloat16
-# model_id = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+# # model_id = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+# model_id = "Wan-AI/Wan2.1-T2V-14B-Diffusers"
 # COMPILER_WORKDIR_ROOT = "compile_workdir_latency_optimized"
 
 # # --- Compile CLIP text encoder and save [PASS] ---
 
-# text_encoder = UMT5EncoderModel.from_pretrained(model_id, subfolder="text_encoder", torch_dtype=DTYPE, cache_dir="wan2.1_t2v_hf_cache_dir")
-
-# # Apply the wrapper to deal with custom return type
-# text_encoder = NeuronTextEncoder(text_encoder)
+# # text_encoder = UMT5EncoderModel.from_pretrained(model_id, subfolder="text_encoder", torch_dtype=DTYPE, cache_dir="wan2.1_t2v_hf_cache_dir")
+# text_encoder = UMT5EncoderModel.from_pretrained(model_id, subfolder="text_encoder", torch_dtype=DTYPE, cache_dir="wan2.1_t2v_14b_hf_cache_dir")
+# text_encoder.eval()
 
 # # Compile text encoder
-# # This is used for indexing a lookup table in torch.nn.Embedding,
-# # so using random numbers may give errors (out of range).
-# emb = torch.tensor([[49406, 18376,   525,  7496, 49407,     0,     0,     0,     0,     0,
-#         0,     0,     0,     0,     0,     0,     0,     0,     0,     0,
-#         0,     0,     0,     0,     0,     0,     0,     0,     0,     0,
-#         0,     0,     0,     0,     0,     0,     0,     0,     0,     0,
-#         0,     0,     0,     0,     0,     0,     0,     0,     0,     0,
-#         0,     0,     0,     0,     0,     0,     0,     0,     0,     0,
-#         0,     0,     0,     0,     0,     0,     0,     0,     0,     0,
-#         0,     0,     0,     0,     0,     0,     0]])
+# batch_size = 1
+# sequence_length = 512
+# sample_inputs = torch.ones((batch_size, sequence_length), dtype=torch.int64), \
+#             torch.ones((batch_size, sequence_length), dtype=torch.int64)   
 # text_encoder_neuron = torch_neuronx.trace(
-#         text_encoder.neuron_text_encoder, 
-#         emb, 
+#         text_encoder, 
+#         sample_inputs,  # emb
 #         compiler_workdir=os.path.join(COMPILER_WORKDIR_ROOT, 'text_encoder'),
 #         compiler_args=compiler_flags
 #         )

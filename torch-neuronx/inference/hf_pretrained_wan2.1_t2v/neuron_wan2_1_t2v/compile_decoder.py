@@ -45,8 +45,11 @@ def compile_decoder(args):
     # height, width = 32,32  # default: 96, 96
     in_channels = 16
     
-    model_id = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
-    vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32, cache_dir="wan2.1_t2v_hf_cache_dir")
+    # model_id = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+    # vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32, cache_dir="wan2.1_t2v_hf_cache_dir")
+    
+    model_id = "Wan-AI/Wan2.1-T2V-14B-Diffusers"
+    vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32, cache_dir="wan2.1_t2v_14b_hf_cache_dir")
     
     decoder: Decoder = vae.decoder
     decoder.eval()
