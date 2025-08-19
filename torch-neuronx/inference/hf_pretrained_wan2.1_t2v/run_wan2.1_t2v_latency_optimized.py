@@ -14,13 +14,13 @@ from neuron_wan2_1_t2v.neuron_commons import InferenceTransformerWrapper
 from neuron_wan2_1_t2v.neuron_commons import SimpleWrapper
 
 COMPILED_MODELS_DIR = "compile_workdir_latency_optimized"
-# HUGGINGFACE_CACHE_DIR = "wan2.1_t2v_hf_cache_dir"
-HUGGINGFACE_CACHE_DIR = "wan2.1_t2v_14b_hf_cache_dir"
+HUGGINGFACE_CACHE_DIR = "wan2.1_t2v_hf_cache_dir"
+# HUGGINGFACE_CACHE_DIR = "wan2.1_t2v_14b_hf_cache_dir"
 
 if __name__ == "__main__":    
     DTYPE=torch.bfloat16
-    # model_id = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
-    model_id = "Wan-AI/Wan2.1-T2V-14B-Diffusers"
+    model_id = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+    # model_id = "Wan-AI/Wan2.1-T2V-14B-Diffusers"
     
     vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32, cache_dir=HUGGINGFACE_CACHE_DIR)
     pipe = WanPipeline.from_pretrained(model_id, vae=vae, torch_dtype=DTYPE, cache_dir=HUGGINGFACE_CACHE_DIR)

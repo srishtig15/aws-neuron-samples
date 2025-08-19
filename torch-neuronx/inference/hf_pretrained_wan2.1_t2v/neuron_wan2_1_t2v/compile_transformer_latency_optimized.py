@@ -78,11 +78,11 @@ class WanAttnProcessor2_0_Sharded:
         query = query.unflatten(2, (attn.heads, -1)).transpose(1, 2)
         key = key.unflatten(2, (attn.heads, -1)).transpose(1, 2)
         value = value.unflatten(2, (attn.heads, -1)).transpose(1, 2)
-        print('query:', query.shape, query.dtype, 'key:', key.shape, key.dtype, 'value:', value.shape, value.dtype)
+        # print('query:', query.shape, query.dtype, 'key:', key.shape, key.dtype, 'value:', value.shape, value.dtype)
 
-        # TODO：暂时注释掉，报错：RuntimeError: The operator aten::view_as_complex appears to be a view operator, but it has no implementation for the backend "xla:0". View operators don't support since the tensor's storage cannot be shared across devices.
+        # # TODO：暂时注释掉，报错：RuntimeError: The operator aten::view_as_complex appears to be a view operator, but it has no implementation for the backend "xla:0". View operators don't support since the tensor's storage cannot be shared across devices.
         # if rotary_emb is not None:
-        
+        #     # print('rotary_emb:', rotary_emb.shape, rotary_emb.dtype)
         #     def apply_rotary_emb(hidden_states: torch.Tensor, freqs: torch.Tensor):
         #         dtype = torch.float32 if hidden_states.device.type == "mps" else torch.float64
         #         x_rotated = torch.view_as_complex(hidden_states.to(dtype).unflatten(3, (-1, 2)))
@@ -123,13 +123,14 @@ class WanAttnProcessor2_0_Sharded:
 
 def get_transformer_model(tp_degree: int):
     DTYPE = torch.bfloat16
-    # model_id = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
-    # vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32, cache_dir="wan2.1_t2v_hf_cache_dir")
-    # pipe = WanPipeline.from_pretrained(model_id, vae=vae, torch_dtype=DTYPE, cache_dir="wan2.1_t2v_hf_cache_dir")
     
-    model_id = "Wan-AI/Wan2.1-T2V-14B-Diffusers"
-    vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32, cache_dir="wan2.1_t2v_14b_hf_cache_dir")
-    pipe = WanPipeline.from_pretrained(model_id, vae=vae, torch_dtype=DTYPE, cache_dir="wan2.1_t2v_14b_hf_cache_dir")
+    model_id = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+    vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32, cache_dir="wan2.1_t2v_hf_cache_dir")
+    pipe = WanPipeline.from_pretrained(model_id, vae=vae, torch_dtype=DTYPE, cache_dir="wan2.1_t2v_hf_cache_dir")
+    
+    # model_id = "Wan-AI/Wan2.1-T2V-14B-Diffusers"
+    # vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32, cache_dir="wan2.1_t2v_14b_hf_cache_dir")
+    # pipe = WanPipeline.from_pretrained(model_id, vae=vae, torch_dtype=DTYPE, cache_dir="wan2.1_t2v_14b_hf_cache_dir")
     
     # 创建自定义的分片processor
     sharded_processor = WanAttnProcessor2_0_Sharded()

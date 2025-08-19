@@ -89,15 +89,15 @@ class TracingUMT5WrapperTP(nn.Module):
 #         )
 
 def get_text_encoder(tp_degree: int, sequence_length: int):
-    # model_id = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
-    # DTYPE = torch.bfloat16
-    # text_encoder = UMT5EncoderModel.from_pretrained(model_id, subfolder="text_encoder", torch_dtype=DTYPE, cache_dir="wan2.1_t2v_hf_cache_dir")
-    # text_encoder.eval()
-    
-    model_id = "Wan-AI/Wan2.1-T2V-14B-Diffusers"
+    model_id = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
     DTYPE = torch.bfloat16
-    text_encoder = UMT5EncoderModel.from_pretrained(model_id, subfolder="text_encoder", torch_dtype=DTYPE, cache_dir="wan2.1_t2v_14b_hf_cache_dir")
+    text_encoder = UMT5EncoderModel.from_pretrained(model_id, subfolder="text_encoder", torch_dtype=DTYPE, cache_dir="wan2.1_t2v_hf_cache_dir")
     text_encoder.eval()
+    
+    # model_id = "Wan-AI/Wan2.1-T2V-14B-Diffusers"
+    # DTYPE = torch.bfloat16
+    # text_encoder = UMT5EncoderModel.from_pretrained(model_id, subfolder="text_encoder", torch_dtype=DTYPE, cache_dir="wan2.1_t2v_14b_hf_cache_dir")
+    # text_encoder.eval()
     
     for idx, block in enumerate(text_encoder.encoder.block):
         block: UMT5Block = block
