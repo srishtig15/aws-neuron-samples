@@ -92,20 +92,52 @@ def neuron_scaled_dot_product_attention(query, key, value, attn_mask=None, dropo
     return attn_out
 
 
+# def attention_wrapper_sharded_without_swap(query, key, value):
+#     bs, n_head, q_len, d_head = query.shape
+#     q = query.clone().permute(0, 1, 3, 2).reshape((bs*n_head, d_head, q_len))
+#     k = key.clone().permute(0, 1, 3, 2).reshape((bs*n_head, d_head, q_len))
+#     v = value.clone().reshape((bs*n_head, q_len, d_head))
+#     attn_output = torch.zeros((bs*n_head, q_len, d_head), dtype=torch.bfloat16, device=q.device)
+#     # use_sharded_attention_kernel = True # Use "need use_sharded_attention_kernel = True" in case of trn2
+#     use_sharded_attention_kernel = False # We do not "need use_sharded_attention_kernel" in case of trn1/inf2, so we could make it false
+#     if use_sharded_attention_kernel:
+#         # grid = (vnc(2),)
+#         grid = (2,)
+#         _flash_fwd_call[grid](q, k, v, 0.117, attn_output, kernel_name="AttentionMMSoftmaxMMWithoutSwap")
+#     else:
+#         _flash_fwd_call(q, k, v, 0.117, attn_output, kernel_name="AttentionMMSoftmaxMMWithoutSwap")
+#     attn_output = attn_output.reshape((bs, n_head, q_len, d_head))
+#     return attn_output
+
+
+# 问题出在attention_wrapper_sharded_without_swap函数中。错误发生在尝试reshape key tensor时，维度不匹配。
+# 从错误信息和debug输出可以看到：
+#     自注意力（attn1）: query, key, value 都是 [1, 5, 5376, 128]
+#     交叉注意力（attn2）: query 是 [1, 5, 5376, 128]，但 key 和 value 是 [1, 5, 512, 128]
+# 问题在于attention_wrapper_sharded_without_swap函数假设query和key的序列长度相同（都用q_len），但在交叉注意力中，key的序列长度是512，不是5376。
+# 这里是修正后的attention_wrapper_sharded_without_swap函数：
 def attention_wrapper_sharded_without_swap(query, key, value):
     bs, n_head, q_len, d_head = query.shape
+    k_len = key.shape[2]  # key的序列长度可能与query不同
+    v_len = value.shape[2]  # value的序列长度
+    
+    # 调整reshape以适应不同的序列长度
     q = query.clone().permute(0, 1, 3, 2).reshape((bs*n_head, d_head, q_len))
-    k = key.clone().permute(0, 1, 3, 2).reshape((bs*n_head, d_head, q_len))
-    v = value.clone().reshape((bs*n_head, q_len, d_head))
+    k = key.clone().permute(0, 1, 3, 2).reshape((bs*n_head, d_head, k_len))  # 使用k_len而不是q_len
+    v = value.clone().reshape((bs*n_head, v_len, d_head))  # 使用v_len
+    
     attn_output = torch.zeros((bs*n_head, q_len, d_head), dtype=torch.bfloat16, device=q.device)
-    use_sharded_attention_kernel = True # Use "need use_sharded_attention_kernel = True" in case of trn2
-    # use_sharded_attention_kernel = False # We do not "need use_sharded_attention_kernel" in case of trn1/inf2, so we could make it false
+    
+    # use_sharded_attention_kernel = True # Use "need use_sharded_attention_kernel = True" in case of trn2
+    use_sharded_attention_kernel = False # We do not "need use_sharded_attention_kernel" in case of trn1/inf2
+    
     if use_sharded_attention_kernel:
         # grid = (vnc(2),)
         grid = (2,)
         _flash_fwd_call[grid](q, k, v, 0.117, attn_output, kernel_name="AttentionMMSoftmaxMMWithoutSwap")
     else:
         _flash_fwd_call(q, k, v, 0.117, attn_output, kernel_name="AttentionMMSoftmaxMMWithoutSwap")
+    
     attn_output = attn_output.reshape((bs, n_head, q_len, d_head))
     return attn_output
 

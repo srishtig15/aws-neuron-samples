@@ -8,8 +8,6 @@ compiler_flags = """ --verbose=INFO --target=trn1 --model-type=unet-inference --
 # compiler_flags = """ --verbose=INFO --target=trn1 --model-type=transformer --enable-fast-loading-neuron-binaries """ # Use these compiler flags for trn1/inf2
 os.environ["NEURON_CC_FLAGS"] = os.environ.get("NEURON_CC_FLAGS", "") + compiler_flags
 
-import copy
-
 from diffusers import AutoencoderKLWan, WanPipeline
 import torch
 import argparse
@@ -20,10 +18,10 @@ import torch.nn.functional as F
 from functools import partial
 
 from neuron_commons import attention_wrapper_for_transformer
-from neuron_parallel_utils import shard_transformer_attn, shard_transformer_feedforward
+from neuron_parallel_utils import shard_transformer_attn, shard_transformer_feedforward, shard_transformer3d_attn
 
 from diffusers.models.transformers.transformer_wan import WanTransformer3DModel
-# torch.nn.functional.scaled_dot_product_attention = attention_wrapper_for_transformer  # TODO may raise error
+torch.nn.functional.scaled_dot_product_attention = attention_wrapper_for_transformer
 
 from typing import Optional
 from diffusers.models.attention_processor import Attention
@@ -72,19 +70,19 @@ class WanAttnProcessor2_0_Sharded:
         key = attn.to_k(encoder_hidden_states)
         value = attn.to_v(encoder_hidden_states)
 
-        # TODO: 跳过norm_q和norm_k的处理，因为在分片情况下会有维度问题
-        # 或者，我们可以在这里手动处理归一化
-        # if attn.norm_q is not None:
-        #     query = attn.norm_q(query)
-        # if attn.norm_k is not None:
-        #     key = attn.norm_k(key)
+        if attn.norm_q is not None:
+            query = attn.norm_q(query)
+        if attn.norm_k is not None:
+            key = attn.norm_k(key)
         
         query = query.unflatten(2, (attn.heads, -1)).transpose(1, 2)
         key = key.unflatten(2, (attn.heads, -1)).transpose(1, 2)
         value = value.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+        print('query:', query.shape, query.dtype, 'key:', key.shape, key.dtype, 'value:', value.shape, value.dtype)
 
         # TODO：暂时注释掉，报错：RuntimeError: The operator aten::view_as_complex appears to be a view operator, but it has no implementation for the backend "xla:0". View operators don't support since the tensor's storage cannot be shared across devices.
         # if rotary_emb is not None:
+        
         #     def apply_rotary_emb(hidden_states: torch.Tensor, freqs: torch.Tensor):
         #         dtype = torch.float32 if hidden_states.device.type == "mps" else torch.float64
         #         x_rotated = torch.view_as_complex(hidden_states.to(dtype).unflatten(3, (-1, 2)))
@@ -98,8 +96,7 @@ class WanAttnProcessor2_0_Sharded:
         hidden_states_img = None
         if encoder_hidden_states_img is not None:
             key_img = attn.add_k_proj(encoder_hidden_states_img)
-            # TODO: 跳过 norm_added_k
-            # key_img = attn.norm_added_k(key_img)
+            key_img = attn.norm_added_k(key_img)
             value_img = attn.add_v_proj(encoder_hidden_states_img)
 
             key_img = key_img.unflatten(2, (attn.heads, -1)).transpose(1, 2)
@@ -137,13 +134,15 @@ def get_transformer_model(tp_degree: int):
     # 创建自定义的分片processor
     sharded_processor = WanAttnProcessor2_0_Sharded()
     
-    # 分片所有30个blocks
+    # 分片所有blocks
     for block_idx, block in enumerate(pipe.transformer.blocks):
-        print(f"Processing block {block_idx}/29")
+        print(f"Processing block {block_idx+1}/{len(pipe.transformer.blocks)}")
         
         # 分片attention层
-        block.attn1 = shard_transformer_attn(tp_degree, block.attn1)
-        block.attn2 = shard_transformer_attn(tp_degree, block.attn2)
+        # block.attn1 = shard_transformer_attn(tp_degree, block.attn1)
+        # block.attn2 = shard_transformer_attn(tp_degree, block.attn2)
+        block.attn1 = shard_transformer3d_attn(tp_degree, block.attn1)
+        block.attn2 = shard_transformer3d_attn(tp_degree, block.attn2)
         
         # 设置自定义processor
         block.attn1.processor = sharded_processor

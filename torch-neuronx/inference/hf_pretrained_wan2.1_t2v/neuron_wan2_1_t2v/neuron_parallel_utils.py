@@ -230,141 +230,116 @@ def shard_transformer_feedforward(ff: FeedForward) -> FeedForward:
     del(orig_linear)
     return ff
 
-# 新增：卷积层分片函数
-def shard_conv2d(conv_layer, tp_degree, dim=0):
-    """
-    分片 Conv2d 层
-    dim=0: 沿输出通道分片 (out_channels)
-    dim=1: 沿输入通道分片 (in_channels)
-    """
-    if tp_degree == 1:
-        return conv_layer
-    
-    tp_rank = parallel_state.get_tensor_model_parallel_rank()
-    
-    if dim == 0:  # 沿输出通道分片
-        out_channels_per_rank = conv_layer.out_channels // tp_degree
-        new_conv = nn.Conv2d(
-            in_channels=conv_layer.in_channels,
-            out_channels=out_channels_per_rank,
-            kernel_size=conv_layer.kernel_size,
-            stride=conv_layer.stride,
-            padding=conv_layer.padding,
-            dilation=conv_layer.dilation,
-            groups=conv_layer.groups,
-            bias=(conv_layer.bias is not None),
-            padding_mode=conv_layer.padding_mode
-        )
-        
-        # 分片权重
-        start_idx = tp_rank * out_channels_per_rank
-        end_idx = start_idx + out_channels_per_rank
-        new_conv.weight.data = conv_layer.weight.data[start_idx:end_idx].clone()
-        
-        if conv_layer.bias is not None:
-            new_conv.bias.data = conv_layer.bias.data[start_idx:end_idx].clone()
-            
-    elif dim == 1:  # 沿输入通道分片
-        in_channels_per_rank = conv_layer.in_channels // tp_degree
-        new_conv = nn.Conv2d(
-            in_channels=in_channels_per_rank,
-            out_channels=conv_layer.out_channels,
-            kernel_size=conv_layer.kernel_size,
-            stride=conv_layer.stride,
-            padding=conv_layer.padding,
-            dilation=conv_layer.dilation,
-            groups=conv_layer.groups // tp_degree if conv_layer.groups > 1 else 1,
-            bias=(conv_layer.bias is not None),
-            padding_mode=conv_layer.padding_mode
-        )
-        
-        # 分片权重
-        start_idx = tp_rank * in_channels_per_rank
-        end_idx = start_idx + in_channels_per_rank
-        new_conv.weight.data = conv_layer.weight.data[:, start_idx:end_idx].clone()
-        
-        if conv_layer.bias is not None:
-            new_conv.bias.data = conv_layer.bias.data.clone()
-    
-    return new_conv
+def shard_transformer3d_attn(tp_degree: int, attn: Attention):
+    orig_inner_dim = attn.to_q.out_features
+    dim_head = orig_inner_dim // attn.heads
+    assert orig_inner_dim % attn.heads == 0
+    orig_num_heads = attn.heads
+    total_padded_heads = attn.heads + get_number_of_extra_heads(attn.heads, tp_degree)
+    attn.heads = neuronx_dist_utils.divide(total_padded_heads, tp_degree)
+    attn.sliceable_head_dim = attn.heads
+    new_inner_dim = dim_head * attn.heads
+    attn.inner_dim = new_inner_dim
+    assert attn.to_q.out_features == attn.to_k.out_features and attn.to_q.out_features == attn.to_v.out_features
 
-def shard_conv3d(conv_layer, tp_degree, dim=0):
-    """
-    分片 Conv3d 层
-    dim=0: 沿输出通道分片 (out_channels)
-    dim=1: 沿输入通道分片 (in_channels)
-    """
-    if tp_degree == 1:
-        return conv_layer
-    
-    tp_rank = parallel_state.get_tensor_model_parallel_rank()
-    
-    if dim == 0:  # 沿输出通道分片
-        out_channels_per_rank = conv_layer.out_channels // tp_degree
-        new_conv = nn.Conv3d(
-            in_channels=conv_layer.in_channels,
-            out_channels=out_channels_per_rank,
-            kernel_size=conv_layer.kernel_size,
-            stride=conv_layer.stride,
-            padding=conv_layer.padding,
-            dilation=conv_layer.dilation,
-            groups=conv_layer.groups,
-            bias=(conv_layer.bias is not None),
-            padding_mode=conv_layer.padding_mode
-        )
-        
-        # 分片权重
-        start_idx = tp_rank * out_channels_per_rank
-        end_idx = start_idx + out_channels_per_rank
-        new_conv.weight.data = conv_layer.weight.data[start_idx:end_idx].clone()
-        
-        if conv_layer.bias is not None:
-            new_conv.bias.data = conv_layer.bias.data[start_idx:end_idx].clone()
-            
-    elif dim == 1:  # 沿输入通道分片
-        in_channels_per_rank = conv_layer.in_channels // tp_degree
-        new_conv = nn.Conv3d(
-            in_channels=in_channels_per_rank,
-            out_channels=conv_layer.out_channels,
-            kernel_size=conv_layer.kernel_size,
-            stride=conv_layer.stride,
-            padding=conv_layer.padding,
-            dilation=conv_layer.dilation,
-            groups=conv_layer.groups // tp_degree if conv_layer.groups > 1 else 1,
-            bias=(conv_layer.bias is not None),
-            padding_mode=conv_layer.padding_mode
-        )
-        
-        # 分片权重
-        start_idx = tp_rank * in_channels_per_rank
-        end_idx = start_idx + in_channels_per_rank
-        new_conv.weight.data = conv_layer.weight.data[:, start_idx:end_idx].clone()
-        
-        if conv_layer.bias is not None:
-            new_conv.bias.data = conv_layer.bias.data.clone()
-    
-    return new_conv
+    # 分片 to_q
+    orig_q = attn.to_q
+    attn.to_q = ColumnParallelLinear(
+        attn.to_q.in_features,
+        attn.to_q.out_features,
+        bias=(attn.to_q.bias is not None),
+        gather_output=False)
+    attn.to_q.weight.data = get_sharded_data(orig_q.weight.data, 0)
+    if attn.to_q.bias is not None:
+        attn.to_q.bias.data = get_sharded_data(orig_q.bias.data, 0)
+    del(orig_q)
 
-def shard_linear(linear_layer, tp_degree, dim=0):
-    """
-    分片 Linear 层
-    dim=0: 沿输出维度分片 (out_features)
-    dim=1: 沿输入维度分片 (in_features)
-    """
-    if tp_degree == 1:
-        return linear_layer
+    # 分片 to_k
+    orig_k = attn.to_k
+    attn.to_k = ColumnParallelLinear(
+        attn.to_k.in_features,
+        attn.to_k.out_features,
+        bias=(attn.to_k.bias is not None),
+        gather_output=False)
+    attn.to_k.weight.data = get_sharded_data(orig_k.weight.data, 0)
+    if attn.to_k.bias is not None:
+        attn.to_k.bias.data = get_sharded_data(orig_k.bias.data, 0)
+    del(orig_k)
+
+    # 分片 to_v
+    orig_v = attn.to_v
+    attn.to_v = ColumnParallelLinear(
+        attn.to_v.in_features,
+        attn.to_v.out_features,
+        bias=(attn.to_v.bias is not None),
+        gather_output=False)
+    attn.to_v.weight.data = get_sharded_data(orig_v.weight.data, 0)
+    if attn.to_v.bias is not None:
+        attn.to_v.bias.data = get_sharded_data(orig_v.bias.data, 0)
+    del(orig_v)
+
+    # 处理 norm_q 和 norm_k（如果存在）
+    # 这些是 RMSNorm 层，它们对每个头的特征进行归一化
+    # 分片后，每个设备处理部分头，但归一化仍然是独立的
+    if hasattr(attn, 'norm_q') and attn.norm_q is not None:
+        # norm_q 应该调整为新的内部维度
+        # RMSNorm 通常没有可学习参数，或者参数是按特征维度的
+        # 我们需要根据实际的 norm 类型来处理
+        if hasattr(attn.norm_q, 'weight') and attn.norm_q.weight is not None:
+            # 如果有权重，需要分片
+            orig_norm_q_weight = attn.norm_q.weight.data
+            attn.norm_q.weight.data = get_sharded_data(orig_norm_q_weight, 0)
+            attn.norm_q.normalized_shape = (new_inner_dim,)
     
-    if dim == 0:  # 沿输出维度分片
-        return ColumnParallelLinear(
-            linear_layer.in_features,
-            linear_layer.out_features,
-            bias=(linear_layer.bias is not None),
-            gather_output=False
-        )
-    elif dim == 1:  # 沿输入维度分片
-        return RowParallelLinear(
-            linear_layer.in_features,
-            linear_layer.out_features,
-            bias=(linear_layer.bias is not None),
-            input_is_parallel=True
-        )
+    if hasattr(attn, 'norm_k') and attn.norm_k is not None:
+        if hasattr(attn.norm_k, 'weight') and attn.norm_k.weight is not None:
+            orig_norm_k_weight = attn.norm_k.weight.data
+            attn.norm_k.weight.data = get_sharded_data(orig_norm_k_weight, 0)
+            attn.norm_k.normalized_shape = (new_inner_dim,)
+
+    # 处理额外的 I2V 相关层（如果存在）
+    if hasattr(attn, 'add_k_proj') and attn.add_k_proj is not None:
+        orig_add_k = attn.add_k_proj
+        attn.add_k_proj = ColumnParallelLinear(
+            orig_add_k.in_features,
+            orig_add_k.out_features,
+            bias=(orig_add_k.bias is not None),
+            gather_output=False)
+        attn.add_k_proj.weight.data = get_sharded_data(orig_add_k.weight.data, 0)
+        if orig_add_k.bias is not None:
+            attn.add_k_proj.bias.data = get_sharded_data(orig_add_k.bias.data, 0)
+        del(orig_add_k)
+    
+    if hasattr(attn, 'add_v_proj') and attn.add_v_proj is not None:
+        orig_add_v = attn.add_v_proj
+        attn.add_v_proj = ColumnParallelLinear(
+            orig_add_v.in_features,
+            orig_add_v.out_features,
+            bias=(orig_add_v.bias is not None),
+            gather_output=False)
+        attn.add_v_proj.weight.data = get_sharded_data(orig_add_v.weight.data, 0)
+        if orig_add_v.bias is not None:
+            attn.add_v_proj.bias.data = get_sharded_data(orig_add_v.bias.data, 0)
+        del(orig_add_v)
+    
+    # 处理 norm_added_k（如果存在）
+    if hasattr(attn, 'norm_added_k') and attn.norm_added_k is not None:
+        if hasattr(attn.norm_added_k, 'weight') and attn.norm_added_k.weight is not None:
+            orig_norm_added_k_weight = attn.norm_added_k.weight.data
+            attn.norm_added_k.weight.data = get_sharded_data(orig_norm_added_k_weight, 0)
+            attn.norm_added_k.normalized_shape = (new_inner_dim,)
+
+    # 分片 to_out
+    orig_out = attn.to_out[0]
+    attn.to_out[0] = RowParallelLinear(
+        attn.to_out[0].in_features,
+        attn.to_out[0].out_features,
+        bias=(attn.to_out[0].bias is not None),
+        input_is_parallel=True)
+    attn.to_out[0].weight.data = get_sharded_data(orig_out.weight.data, 1)
+    if attn.to_out[0].bias is not None: 
+        attn.to_out[0].bias.data = orig_out.bias.data.detach()
+    del(orig_out)
+    
+    pad_model(attn, tp_degree, orig_num_heads, wrapped_classes=(Attention,))
+    return attn

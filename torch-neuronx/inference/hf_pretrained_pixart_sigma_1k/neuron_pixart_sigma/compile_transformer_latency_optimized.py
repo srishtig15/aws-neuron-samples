@@ -55,8 +55,9 @@ def get_transformer_model(tp_degree: int):
 
 def compile_transformer(args):
     tp_degree = 4
-    # tp_degree = 8 # Use tensor parallel degree as 8 for trn1/inf2
     os.environ["LOCAL_WORLD_SIZE"] = "4" # Use tensor parallel degree as 4 for trn2
+    # tp_degree = 8 # Use tensor parallel degree as 8 for trn1/inf2
+    # os.environ["LOCAL_WORLD_SIZE"] = "8" # Use tensor parallel degree as 4 for trn2
     latent_height = args.height//8
     latent_width = args.width//8
     num_prompts = 1

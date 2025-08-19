@@ -23,9 +23,9 @@ def upcast_norms_to_f32(decoder: Decoder):
             orig_resnet_norm2 = resnet.norm2
             resnet.norm1 = f32Wrapper(orig_resnet_norm1)
             resnet.norm2 = f32Wrapper(orig_resnet_norm2)
-    # for attn in decoder.mid_block.attentions:
-    #     orig_group_norm = attn.group_norm
-    #     attn.group_norm = f32Wrapper(orig_group_norm)
+    for attn in decoder.mid_block.attentions:
+        orig_norm = attn.norm
+        attn.norm = f32Wrapper(orig_norm)
     for resnet in decoder.mid_block.resnets:
         orig_resnet_norm1 = resnet.norm1
         orig_resnet_norm2 = resnet.norm2
