@@ -48,7 +48,7 @@ class WanAttnProcessor2_0_Sharded:
     def __init__(self):
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("WanAttnProcessor2_0_Sharded requires PyTorch 2.0")
-
+        
     def __call__(
         self,
         attn: Attention,
@@ -80,17 +80,45 @@ class WanAttnProcessor2_0_Sharded:
         value = value.unflatten(2, (attn.heads, -1)).transpose(1, 2)
         # print('query:', query.shape, query.dtype, 'key:', key.shape, key.dtype, 'value:', value.shape, value.dtype)
 
-        # # TODO：暂时注释掉，报错：RuntimeError: The operator aten::view_as_complex appears to be a view operator, but it has no implementation for the backend "xla:0". View operators don't support since the tensor's storage cannot be shared across devices.
-        # if rotary_emb is not None:
-        #     # print('rotary_emb:', rotary_emb.shape, rotary_emb.dtype)
-        #     def apply_rotary_emb(hidden_states: torch.Tensor, freqs: torch.Tensor):
-        #         dtype = torch.float32 if hidden_states.device.type == "mps" else torch.float64
-        #         x_rotated = torch.view_as_complex(hidden_states.to(dtype).unflatten(3, (-1, 2)))
-        #         x_out = torch.view_as_real(x_rotated * freqs).flatten(3, 4)
-        #         return x_out.type_as(hidden_states)
+        # TODO：暂时注释掉，报错：RuntimeError: The operator aten::view_as_complex appears to be a view operator, but it has no implementation for the backend "xla:0". View operators don't support since the tensor's storage cannot be shared across devices.
+        if rotary_emb is not None:
+            # print('rotary_emb:', rotary_emb.shape, rotary_emb.dtype)
+            # def apply_rotary_emb(hidden_states: torch.Tensor, freqs: torch.Tensor):
+            #     dtype = torch.float32 if hidden_states.device.type == "mps" else torch.float64
+            #     x_rotated = torch.view_as_complex(hidden_states.to(dtype).unflatten(3, (-1, 2)))
+            #     x_out = torch.view_as_real(x_rotated * freqs).flatten(3, 4)
+            #     return x_out.type_as(hidden_states)
+            
+            def apply_rotary_emb(hidden_states, freqs):
+                dtype = torch.float32 if hidden_states.device.type == "mps" else torch.float64
+                
+                cos, sin = freqs
+                batch, heads, seq_len, head_dim = hidden_states.shape
+                # print('hidden_states:', hidden_states.shape, hidden_states.dtype)
+                # print('cos:', cos.shape, cos.dtype, 'sin:', sin.shape, sin.dtype)
+                
+                # 重组为分离实部和虚部 (matching unflatten(3, (-1, 2)))
+                x = hidden_states.to(dtype).reshape(batch, heads, seq_len, head_dim // 2, 2)
+                x_real = x[..., 0]
+                x_imag = x[..., 1]
+                # print('x_real:', x_real.shape, x_real.dtype, 'x_imag:', x_imag.shape, x_imag.dtype)
+                
+                # 使用前半部分的 cos/sin（因为后半部分是重复的）
+                cos_half = cos[..., :head_dim // 2]
+                sin_half = sin[..., :head_dim // 2]
+                
+                # 复数乘法
+                out_real = x_real * cos_half - x_imag * sin_half
+                out_imag = x_real * sin_half + x_imag * cos_half
+                
+                # 重新 interleave
+                out = torch.stack([out_real, out_imag], dim=-1).flatten(-2)
+                # print('out:', out.shape, out.dtype)
+                
+                return out.type_as(hidden_states)
 
-        #     query = apply_rotary_emb(query, rotary_emb)
-        #     key = apply_rotary_emb(key, rotary_emb)
+            query = apply_rotary_emb(query, rotary_emb)
+            key = apply_rotary_emb(key, rotary_emb)
 
         # I2V task
         hidden_states_img = None

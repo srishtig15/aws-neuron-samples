@@ -56,11 +56,18 @@ def compile_decoder(args):
     upcast_norms_to_f32(decoder)
     
     with torch.no_grad():
-        sample_inputs = torch.rand((batch_size, in_channels, frames, latent_height, latent_width), dtype=torch.float32)
+        sample_inputs_1 = torch.rand((batch_size, in_channels, 2, latent_height, latent_width), dtype=torch.float32)  # 这里第3维用frames（或者2即可）是因为静态编译的原因，实际上用1就可以
+        # feat_cache = [torch.rand((batch_size, 16, 2, latent_height, latent_width), dtype=torch.float32)] + \
+        #             [torch.rand((batch_size, 384, 2, latent_height, latent_width), dtype=torch.float32)] * 11 + \
+        #             [torch.rand((batch_size, 192, 2, latent_height*2, latent_width*2), dtype=torch.float32)] + \
+        #             [torch.rand((batch_size, 384, 2, latent_height*2, latent_width*2), dtype=torch.float32)] * 6 + \
+        #             [torch.rand((batch_size, 192, 2, latent_height*4, latent_width*4), dtype=torch.float32)] * 6 + \
+        #             [torch.rand((batch_size, 96, 2, latent_height*8, latent_width*8), dtype=torch.float32)] * 7 + \
+        #             [torch.rand((batch_size, 1, 1, latent_height, latent_width), dtype=torch.float32)]
         
         compiled_decoder = torch_neuronx.trace(
             decoder,
-            sample_inputs,
+            sample_inputs_1,  # (sample_inputs_1, feat_cache), 
             compiler_workdir=f"{compiler_workdir}/decoder",
             compiler_args=compiler_flags,
             inline_weights_to_neff=False)
@@ -70,6 +77,8 @@ def compile_decoder(args):
             os.makedirs(compiled_model_dir)
         torch.jit.save(compiled_decoder, f"{compiled_model_dir}/model.pt")
 
+        sample_inputs = torch.rand((batch_size, in_channels, frames, latent_height, latent_width), dtype=torch.float32)
+        
         compiled_post_quant_conv = torch_neuronx.trace(
             vae.post_quant_conv,
             sample_inputs,

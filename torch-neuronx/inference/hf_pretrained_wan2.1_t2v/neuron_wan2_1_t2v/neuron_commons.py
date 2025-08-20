@@ -51,11 +51,16 @@ class SimpleWrapper(nn.Module):
         self.model = model
     def forward(self, x, **kwargs):
         # print('self.model:', self.model)
-        # print('x:', x.shape, x)
-        # print('kwargs:', kwargs)
-        output = self.model(x)
-        # print('output:', output.shape, output)
+        print('x:', x.shape)  # , x
+        print('kwargs:', kwargs)
+        if 'feat_cache' in kwargs:  # For WanDecoder3d
+            output = self.model(x, feat_cache=kwargs['feat_cache'])
+        else:
+            output = self.model(x)
+        print('output:', output.shape)  # , output
         return output
+    def clear_cache(self):
+        self.model.clear_cache()
 
 import torch
 import math
