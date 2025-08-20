@@ -43,103 +43,103 @@ class TracingTransformerWrapper(nn.Module):
         # added_cond_kwargs={"resolution": None, "aspect_ratio": None},
         return_dict=False)
 
-class WanAttnProcessor2_0_Sharded:
-    """自定义的分片注意力处理器"""
-    def __init__(self):
-        if not hasattr(F, "scaled_dot_product_attention"):
-            raise ImportError("WanAttnProcessor2_0_Sharded requires PyTorch 2.0")
+# class WanAttnProcessor2_0_Sharded:
+#     """自定义的分片注意力处理器"""
+#     def __init__(self):
+#         if not hasattr(F, "scaled_dot_product_attention"):
+#             raise ImportError("WanAttnProcessor2_0_Sharded requires PyTorch 2.0")
         
-    def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        rotary_emb: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        encoder_hidden_states_img = None
-        if hasattr(attn, 'add_k_proj') and attn.add_k_proj is not None:
-            # 512 is the context length of the text encoder
-            image_context_length = encoder_hidden_states.shape[1] - 512
-            encoder_hidden_states_img = encoder_hidden_states[:, :image_context_length]
-            encoder_hidden_states = encoder_hidden_states[:, image_context_length:]
-        if encoder_hidden_states is None:
-            encoder_hidden_states = hidden_states
+#     def __call__(
+#         self,
+#         attn: Attention,
+#         hidden_states: torch.Tensor,
+#         encoder_hidden_states: Optional[torch.Tensor] = None,
+#         attention_mask: Optional[torch.Tensor] = None,
+#         rotary_emb: Optional[torch.Tensor] = None,
+#     ) -> torch.Tensor:
+#         encoder_hidden_states_img = None
+#         if hasattr(attn, 'add_k_proj') and attn.add_k_proj is not None:
+#             # 512 is the context length of the text encoder
+#             image_context_length = encoder_hidden_states.shape[1] - 512
+#             encoder_hidden_states_img = encoder_hidden_states[:, :image_context_length]
+#             encoder_hidden_states = encoder_hidden_states[:, image_context_length:]
+#         if encoder_hidden_states is None:
+#             encoder_hidden_states = hidden_states
 
-        query = attn.to_q(hidden_states)
-        key = attn.to_k(encoder_hidden_states)
-        value = attn.to_v(encoder_hidden_states)
+#         query = attn.to_q(hidden_states)
+#         key = attn.to_k(encoder_hidden_states)
+#         value = attn.to_v(encoder_hidden_states)
 
-        if attn.norm_q is not None:
-            query = attn.norm_q(query)
-        if attn.norm_k is not None:
-            key = attn.norm_k(key)
+#         if attn.norm_q is not None:
+#             query = attn.norm_q(query)
+#         if attn.norm_k is not None:
+#             key = attn.norm_k(key)
         
-        query = query.unflatten(2, (attn.heads, -1)).transpose(1, 2)
-        key = key.unflatten(2, (attn.heads, -1)).transpose(1, 2)
-        value = value.unflatten(2, (attn.heads, -1)).transpose(1, 2)
-        # print('query:', query.shape, query.dtype, 'key:', key.shape, key.dtype, 'value:', value.shape, value.dtype)
+#         query = query.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+#         key = key.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+#         value = value.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+#         # print('query:', query.shape, query.dtype, 'key:', key.shape, key.dtype, 'value:', value.shape, value.dtype)
 
-        # TODO：暂时注释掉，报错：RuntimeError: The operator aten::view_as_complex appears to be a view operator, but it has no implementation for the backend "xla:0". View operators don't support since the tensor's storage cannot be shared across devices.
-        if rotary_emb is not None:
-            # print('rotary_emb:', rotary_emb.shape, rotary_emb.dtype)
-            # def apply_rotary_emb(hidden_states: torch.Tensor, freqs: torch.Tensor):
-            #     dtype = torch.float32 if hidden_states.device.type == "mps" else torch.float64
-            #     x_rotated = torch.view_as_complex(hidden_states.to(dtype).unflatten(3, (-1, 2)))
-            #     x_out = torch.view_as_real(x_rotated * freqs).flatten(3, 4)
-            #     return x_out.type_as(hidden_states)
+#         # TODO：暂时注释掉，报错：RuntimeError: The operator aten::view_as_complex appears to be a view operator, but it has no implementation for the backend "xla:0". View operators don't support since the tensor's storage cannot be shared across devices.
+#         if rotary_emb is not None:
+#             # print('rotary_emb:', rotary_emb.shape, rotary_emb.dtype)
+#             # def apply_rotary_emb(hidden_states: torch.Tensor, freqs: torch.Tensor):
+#             #     dtype = torch.float32 if hidden_states.device.type == "mps" else torch.float64
+#             #     x_rotated = torch.view_as_complex(hidden_states.to(dtype).unflatten(3, (-1, 2)))
+#             #     x_out = torch.view_as_real(x_rotated * freqs).flatten(3, 4)
+#             #     return x_out.type_as(hidden_states)
             
-            def apply_rotary_emb(hidden_states, freqs):
-                dtype = torch.float32 if hidden_states.device.type == "mps" else torch.float64
+#             def apply_rotary_emb(hidden_states, freqs):
+#                 dtype = torch.float32 if hidden_states.device.type == "mps" else torch.float64
                 
-                cos, sin = freqs
-                batch, heads, seq_len, head_dim = hidden_states.shape
+#                 cos, sin = freqs
+#                 batch, heads, seq_len, head_dim = hidden_states.shape
                 
-                # 重组为分离实部和虚部 (matching unflatten(3, (-1, 2)))
-                x = hidden_states.to(dtype).reshape(batch, heads, seq_len, head_dim // 2, 2)
-                x_real = x[..., 0]
-                x_imag = x[..., 1]
+#                 # 重组为分离实部和虚部 (matching unflatten(3, (-1, 2)))
+#                 x = hidden_states.to(dtype).reshape(batch, heads, seq_len, head_dim // 2, 2)
+#                 x_real = x[..., 0]
+#                 x_imag = x[..., 1]
                 
-                # 复数乘法
-                out_real = x_real * cos - x_imag * sin
-                out_imag = x_real * sin + x_imag * cos
+#                 # 复数乘法
+#                 out_real = x_real * cos - x_imag * sin
+#                 out_imag = x_real * sin + x_imag * cos
                 
-                # 重新 interleave
-                out = torch.stack([out_real, out_imag], dim=-1).flatten(-2)
+#                 # 重新 interleave
+#                 out = torch.stack([out_real, out_imag], dim=-1).flatten(-2)
                 
-                return out.type_as(hidden_states)
+#                 return out.type_as(hidden_states)
 
-            query = apply_rotary_emb(query, rotary_emb)
-            key = apply_rotary_emb(key, rotary_emb)
+#             query = apply_rotary_emb(query, rotary_emb)
+#             key = apply_rotary_emb(key, rotary_emb)
 
-        # I2V task
-        hidden_states_img = None
-        if encoder_hidden_states_img is not None:
-            key_img = attn.add_k_proj(encoder_hidden_states_img)
-            key_img = attn.norm_added_k(key_img)
-            value_img = attn.add_v_proj(encoder_hidden_states_img)
+#         # I2V task
+#         hidden_states_img = None
+#         if encoder_hidden_states_img is not None:
+#             key_img = attn.add_k_proj(encoder_hidden_states_img)
+#             key_img = attn.norm_added_k(key_img)
+#             value_img = attn.add_v_proj(encoder_hidden_states_img)
 
-            key_img = key_img.unflatten(2, (attn.heads, -1)).transpose(1, 2)
-            value_img = value_img.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+#             key_img = key_img.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+#             value_img = value_img.unflatten(2, (attn.heads, -1)).transpose(1, 2)
 
-            hidden_states_img = F.scaled_dot_product_attention(
-                query, key_img, value_img, attn_mask=None, dropout_p=0.0, is_causal=False
-            )
-            hidden_states_img = hidden_states_img.transpose(1, 2).flatten(2, 3)
-            hidden_states_img = hidden_states_img.type_as(query)
+#             hidden_states_img = F.scaled_dot_product_attention(
+#                 query, key_img, value_img, attn_mask=None, dropout_p=0.0, is_causal=False
+#             )
+#             hidden_states_img = hidden_states_img.transpose(1, 2).flatten(2, 3)
+#             hidden_states_img = hidden_states_img.type_as(query)
 
-        hidden_states = F.scaled_dot_product_attention(
-            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
-        )
-        hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
-        hidden_states = hidden_states.type_as(query)
+#         hidden_states = F.scaled_dot_product_attention(
+#             query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+#         )
+#         hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
+#         hidden_states = hidden_states.type_as(query)
 
-        if hidden_states_img is not None:
-            hidden_states = hidden_states + hidden_states_img
+#         if hidden_states_img is not None:
+#             hidden_states = hidden_states + hidden_states_img
 
-        hidden_states = attn.to_out[0](hidden_states)
-        hidden_states = attn.to_out[1](hidden_states)
-        return hidden_states
+#         hidden_states = attn.to_out[0](hidden_states)
+#         hidden_states = attn.to_out[1](hidden_states)
+#         return hidden_states
 
 def get_transformer_model(tp_degree: int):
     DTYPE = torch.bfloat16
@@ -152,8 +152,8 @@ def get_transformer_model(tp_degree: int):
     # vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32, cache_dir="wan2.1_t2v_14b_hf_cache_dir")
     # pipe = WanPipeline.from_pretrained(model_id, vae=vae, torch_dtype=DTYPE, cache_dir="wan2.1_t2v_14b_hf_cache_dir")
     
-    # 创建自定义的分片processor
-    sharded_processor = WanAttnProcessor2_0_Sharded()
+    # # 创建自定义的分片processor
+    # sharded_processor = WanAttnProcessor2_0_Sharded()
     
     # 分片所有blocks
     for block_idx, block in enumerate(pipe.transformer.blocks):
@@ -165,9 +165,9 @@ def get_transformer_model(tp_degree: int):
         block.attn1 = shard_transformer3d_attn(tp_degree, block.attn1)
         block.attn2 = shard_transformer3d_attn(tp_degree, block.attn2)
         
-        # 设置自定义processor
-        block.attn1.processor = sharded_processor
-        block.attn2.processor = sharded_processor
+        # # 设置自定义processor
+        # block.attn1.processor = sharded_processor
+        # block.attn2.processor = sharded_processor
 
         # 分片feedforward层
         block.ffn = shard_transformer_feedforward(block.ffn)
