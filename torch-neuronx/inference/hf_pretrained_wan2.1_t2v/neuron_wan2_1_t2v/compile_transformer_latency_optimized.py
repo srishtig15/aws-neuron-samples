@@ -94,26 +94,18 @@ class WanAttnProcessor2_0_Sharded:
                 
                 cos, sin = freqs
                 batch, heads, seq_len, head_dim = hidden_states.shape
-                # print('hidden_states:', hidden_states.shape, hidden_states.dtype)
-                # print('cos:', cos.shape, cos.dtype, 'sin:', sin.shape, sin.dtype)
                 
                 # 重组为分离实部和虚部 (matching unflatten(3, (-1, 2)))
                 x = hidden_states.to(dtype).reshape(batch, heads, seq_len, head_dim // 2, 2)
                 x_real = x[..., 0]
                 x_imag = x[..., 1]
-                # print('x_real:', x_real.shape, x_real.dtype, 'x_imag:', x_imag.shape, x_imag.dtype)
-                
-                # 使用前半部分的 cos/sin（因为后半部分是重复的）
-                cos_half = cos[..., :head_dim // 2]
-                sin_half = sin[..., :head_dim // 2]
                 
                 # 复数乘法
-                out_real = x_real * cos_half - x_imag * sin_half
-                out_imag = x_real * sin_half + x_imag * cos_half
+                out_real = x_real * cos - x_imag * sin
+                out_imag = x_real * sin + x_imag * cos
                 
                 # 重新 interleave
                 out = torch.stack([out_real, out_imag], dim=-1).flatten(-2)
-                # print('out:', out.shape, out.dtype)
                 
                 return out.type_as(hidden_states)
 
