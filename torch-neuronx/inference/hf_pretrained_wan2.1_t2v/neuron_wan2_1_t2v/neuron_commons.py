@@ -39,8 +39,7 @@ class InferenceTransformerWrapper(nn.Module):
         output = self.transformer(
             hidden_states, 
             timestep,
-            encoder_hidden_states, 
-            # encoder_attention_mask
+            encoder_hidden_states
         )
         # print('output:', output.shape, output)
         return output
@@ -51,13 +50,13 @@ class SimpleWrapper(nn.Module):
         self.model = model
     def forward(self, x, **kwargs):
         # print('self.model:', self.model)
-        print('x:', x.shape)  # , x
-        print('kwargs:', kwargs)
+        # print('x:', x.shape)  # , x
+        # print('kwargs:', kwargs)
         if 'feat_cache' in kwargs:  # For WanDecoder3d
             output = self.model(x, feat_cache=kwargs['feat_cache'])
         else:
             output = self.model(x)
-        print('output:', output.shape)  # , output
+        # print('output:', output.shape)  # , output
         return output
     def clear_cache(self):
         self.model.clear_cache()
@@ -148,9 +147,9 @@ def attention_wrapper_sharded_without_swap(query, key, value):
 
 
 sdpa_original = torch.nn.functional.scaled_dot_product_attention
-def attention_wrapper(query, key, value, attn_mask=None, dropout_p=None, is_causal=None):
+def attention_wrapper(query, key, value, attn_mask=None, dropout_p=None, is_causal=None, scale=None, enable_gqa=False):
     if attn_mask is not None:
-        return sdpa_original(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal)
+        return sdpa_original(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale, enable_gqa=enable_gqa)
     else:
         return neuron_scaled_dot_product_attention(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal)
         

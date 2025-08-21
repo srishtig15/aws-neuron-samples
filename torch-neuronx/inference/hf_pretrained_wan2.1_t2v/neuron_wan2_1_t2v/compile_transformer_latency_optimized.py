@@ -3,7 +3,7 @@ os.environ["NEURON_FUSE_SOFTMAX"] = "1"
 os.environ["NEURON_CUSTOM_SILU"] = "1"
 os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "2" # Comment this line out if using trn1/inf2
 os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2" # Comment this line out if using trn1/inf2
-compiler_flags = """ --verbose=INFO --target=trn2 --lnc=2 --internal-hlo2tensorizer-options='--fuse-dot-logistic=false' --model-type=transformer --enable-fast-loading-neuron-binaries """ # Use these compiler flags for trn2
+compiler_flags = """ --verbose=INFO --target=trn2 --lnc=2 --model-type=transformer --enable-fast-loading-neuron-binaries """ # Use these compiler flags for trn2. --internal-hlo2tensorizer-options='--fuse-dot-logistic=false' 
 # compiler_flags = """ --verbose=INFO --target=trn1 --model-type=transformer --enable-fast-loading-neuron-binaries """ # Use these compiler flags for trn1/inf2
 os.environ["NEURON_CC_FLAGS"] = os.environ.get("NEURON_CC_FLAGS", "") + compiler_flags
 
@@ -18,11 +18,12 @@ from torch import nn
 import torch.nn.functional as F
 from functools import partial
 
-from neuron_commons import attention_wrapper_for_transformer
+from neuron_commons import attention_wrapper, attention_wrapper_for_transformer
 from neuron_parallel_utils import shard_transformer_attn, shard_transformer_feedforward, shard_transformer3d_attn
 
 from diffusers.models.transformers.transformer_wan import WanTransformer3DModel
-torch.nn.functional.scaled_dot_product_attention = attention_wrapper_for_transformer
+torch.nn.functional.scaled_dot_product_attention = attention_wrapper  # TODO use attention_wrapper instead of attention_wrapper_for_transformer
+# torch.nn.functional.scaled_dot_product_attention = attention_wrapper_for_transformer
 
 from typing import Optional
 from diffusers.models.attention_processor import Attention
