@@ -1,0 +1,158 @@
+# imports
+from diffusers import AutoencoderKLWan, WanPipeline
+from diffusers.utils import export_to_video
+
+import neuronx_distributed
+import numpy as npy
+import os
+import time
+import torch
+import torch_neuronx
+
+from neuron_wan2_1_t2v.neuron_commons import InferenceTextEncoderWrapper
+from neuron_wan2_1_t2v.neuron_commons import InferenceTransformerWrapper
+from neuron_wan2_1_t2v.neuron_commons import SimpleWrapper
+
+COMPILED_MODELS_DIR = "compile_workdir_latency_optimized"
+# HUGGINGFACE_CACHE_DIR = "wan2.1_t2v_hf_cache_dir"
+HUGGINGFACE_CACHE_DIR = "wan2.1_t2v_14b_hf_cache_dir"
+
+if __name__ == "__main__":    
+    DTYPE=torch.bfloat16
+    # model_id = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+    model_id = "Wan-AI/Wan2.1-T2V-14B-Diffusers"
+    
+    vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32, cache_dir=HUGGINGFACE_CACHE_DIR)
+    pipe = WanPipeline.from_pretrained(model_id, vae=vae, torch_dtype=DTYPE, cache_dir=HUGGINGFACE_CACHE_DIR)
+    
+    text_encoder_model_path = f"{COMPILED_MODELS_DIR}/text_encoder"
+    transformer_model_path = f"{COMPILED_MODELS_DIR}/transformer" 
+    decoder_model_path = f"{COMPILED_MODELS_DIR}/decoder/model.pt"
+    post_quant_conv_model_path = f"{COMPILED_MODELS_DIR}/post_quant_conv/model.pt"
+    
+    seqlen=512  # default: 512
+    text_encoder_wrapper = InferenceTextEncoderWrapper(
+        torch.bfloat16, pipe.text_encoder, seqlen
+    )
+    
+    print('text_encoder_wrapper.t start ****************')
+    text_encoder_wrapper.t = neuronx_distributed.trace.parallel_model_load(
+        text_encoder_model_path
+    )
+    # text_encoder_wrapper.t = torch_neuronx.DataParallel( 
+    #     # torch.jit.load(os.path.join(text_encoder_model_path, 'model.pt')), [0, 1, 2, 3], False  # Use for trn2
+    #     torch.jit.load(os.path.join(text_encoder_model_path, 'model.pt')), [0, 1, 2, 3, 4, 5, 6, 7], False # Use for trn1/inf2
+    # )
+    print('text_encoder_wrapper.t end ****************')
+
+    # transformer_wrapper = InferenceTransformerWrapper(pipe.transformer)
+    # print('transformer_wrapper.transformer start ****************')
+    # transformer_wrapper.transformer = neuronx_distributed.trace.parallel_model_load(
+    #     transformer_model_path
+    # )
+    # # transformer_wrapper.transformer = torch_neuronx.DataParallel( 
+    # #     # torch.jit.load(os.path.join(transformer_model_path, 'model.pt')), [0, 1, 2, 3], False  # Use for trn2
+    # #     # torch.jit.load(os.path.join(transformer_model_path, 'model.pt')), [0, 1, 2, 3, 4, 5, 6, 7], False # Use for trn1/inf2
+    # #     torch.jit.load(os.path.join(transformer_model_path, 'model.pt'))
+    # # )
+    # print('transformer_wrapper.transformer end ****************')
+
+    # vae_decoder_wrapper = SimpleWrapper(pipe.vae.decoder)
+    # print('vae_decoder_wrapper.model start ****************')
+    # vae_decoder_wrapper.model = torch_neuronx.DataParallel( 
+    #     # torch.jit.load(decoder_model_path), [0, 1, 2, 3], False  # Use for trn2
+    #     torch.jit.load(decoder_model_path), [0, 1, 2, 3, 4, 5, 6, 7], False # Use for trn1/inf2
+    #     # torch.jit.load(decoder_model_path),
+    # )
+    # print('vae_decoder_wrapper.model end ****************')
+    
+    # vae_post_quant_conv_wrapper = SimpleWrapper(pipe.vae.post_quant_conv)
+    # print('vae_post_quant_conv_wrapper.model start ****************')
+    # vae_post_quant_conv_wrapper.model = torch_neuronx.DataParallel(
+    #     # torch.jit.load(post_quant_conv_model_path), [0, 1, 2, 3], False # Use for trn2
+    #     torch.jit.load(post_quant_conv_model_path), [0, 1, 2, 3, 4, 5, 6, 7], False # Use for trn1/inf2
+    #     # torch.jit.load(post_quant_conv_model_path),
+    # )
+    # print('vae_post_quant_conv_wrapper.model end ****************')
+    
+    pipe.text_encoder = text_encoder_wrapper
+    # pipe.transformer = transformer_wrapper
+    # pipe.vae.decoder = vae_decoder_wrapper
+    # pipe.vae.post_quant_conv = vae_post_quant_conv_wrapper
+    
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_id, subfolder="tokenizer", cache_dir=HUGGINGFACE_CACHE_DIR)
+    article = "UN Offizier sagt, dass weiter verhandelt werden muss in Syrien."
+    input_ids = tokenizer(article, 
+                    return_tensors="pt",
+                    max_length=seqlen,        # 最大长度
+                    padding="max_length",  # 填充到最大长度
+                    truncation=True        # 如果超过最大长度则截断
+                    ).input_ids
+    # 创建 attention mask（如果需要）
+    attention_mask = (input_ids != tokenizer.pad_token_id).long()
+    outputs = pipe.text_encoder(input_ids, attention_mask)
+    hidden_state = outputs.last_hidden_state
+    print('hidden_state:', hidden_state.shape, hidden_state)
+    print('attention_mask:', attention_mask.shape, attention_mask)
+        
+    # prompt = "A cat walks on the grass, realistic"
+    # negative_prompt = "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
+
+    # start = time.time()
+    # output_warmup = pipe(
+    #     prompt=prompt,
+    #     negative_prompt=negative_prompt,
+    #     height=256,  # default: 480
+    #     width=256,  # default: 832
+    #     num_frames=13,  # default: 81
+    #     guidance_scale=5.0,
+    #     max_sequence_length=seqlen  # default: 512
+    # ).frames[0]
+    # end = time.time()
+    # print('warmup time:', end-start)
+
+    # start = time.time()
+    # output = pipe(
+    #     prompt=prompt,
+    #     negative_prompt=negative_prompt,
+    #     height=256,  # default: 480
+    #     width=256,  # default: 832
+    #     num_frames=13,  # default: 81
+    #     guidance_scale=5.0,
+    #     max_sequence_length=seqlen  # default: 512
+    # ).frames[0]
+    # end = time.time()
+    # print('time:', end-start)
+    # export_to_video(output, "output.mp4", fps=15)
+    
+# hidden_state: torch.Size([1, 512, 4096]) tensor([[[ 0.0013,  0.0271,  0.0253,  ..., -0.0012,  0.0270, -0.0806],
+#          [ 0.0009, -0.0170,  0.0618,  ..., -0.0013,  0.0508,  0.0503],
+#          [ 0.0004,  0.1738, -0.0540,  ..., -0.0015, -0.1045,  0.0142],
+#          ...,
+#          [ 0.0006, -0.0190, -0.1123,  ..., -0.0006,  0.1123, -0.1260],
+#          [ 0.0006, -0.0190, -0.1123,  ..., -0.0006,  0.1123, -0.1260],
+#          [ 0.0006, -0.0190, -0.1123,  ..., -0.0006,  0.1123, -0.1260]]],
+#        dtype=torch.bfloat16)
+# attention_mask: torch.Size([1, 512]) tensor([[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+#          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+#          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+#          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+#          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+#          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+#          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+#          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+#          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+#          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+#          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+#          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+#          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+#          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+#          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+#          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+#          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+#          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+#          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+#          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+#          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+#          0, 0, 0, 0, 0, 0, 0, 0]])
