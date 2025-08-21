@@ -47,13 +47,13 @@ if __name__ == "__main__":
 
     transformer_wrapper = InferenceTransformerWrapper(pipe.transformer)
     print('transformer_wrapper.transformer start ****************')
-    transformer_wrapper.transformer = neuronx_distributed.trace.parallel_model_load(
-        transformer_model_path
-    )
-    # transformer_wrapper.transformer = torch_neuronx.DataParallel( 
-    #     # torch.jit.load(os.path.join(transformer_model_path, 'model.pt')), [0, 1, 2, 3], False  # Use for trn2
-    #     torch.jit.load(os.path.join(transformer_model_path, 'model.pt')), [0, 1, 2, 3, 4, 5, 6, 7], False # Use for trn1/inf2
+    # transformer_wrapper.transformer = neuronx_distributed.trace.parallel_model_load(
+    #     transformer_model_path
     # )
+    transformer_wrapper.transformer = torch_neuronx.DataParallel( 
+        torch.jit.load(os.path.join(transformer_model_path, 'model.pt')), [0, 1, 2, 3], False  # Use for trn2
+        # torch.jit.load(os.path.join(transformer_model_path, 'model.pt')), [0, 1, 2, 3, 4, 5, 6, 7], False # Use for trn1/inf2
+    )
     print('transformer_wrapper.transformer end ****************')
 
     # vae_decoder_wrapper = SimpleWrapper(pipe.vae.decoder)
@@ -68,8 +68,8 @@ if __name__ == "__main__":
     vae_post_quant_conv_wrapper = SimpleWrapper(pipe.vae.post_quant_conv)
     print('vae_post_quant_conv_wrapper.model start ****************')
     vae_post_quant_conv_wrapper.model = torch_neuronx.DataParallel(
-        # torch.jit.load(post_quant_conv_model_path), [0, 1, 2, 3], False # Use for trn2
-        torch.jit.load(post_quant_conv_model_path), [0, 1, 2, 3, 4, 5, 6, 7], False # Use for trn1/inf2
+        torch.jit.load(post_quant_conv_model_path), [0, 1, 2, 3], False # Use for trn2
+        # torch.jit.load(post_quant_conv_model_path), [0, 1, 2, 3, 4, 5, 6, 7], False # Use for trn1/inf2
     )
     print('vae_post_quant_conv_wrapper.model end ****************')
     

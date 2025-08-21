@@ -1,8 +1,4 @@
 import os
-
-os.environ["NEURON_FUSE_SOFTMAX"] = "1"
-os.environ["NEURON_CUSTOM_SILU"] = "1"
-
 import copy
 import diffusers
 import math
@@ -154,7 +150,7 @@ _neuronTextEncoder.t = torch.jit.load(text_encoder_filename)
 pipe.text_encoder = _neuronTextEncoder
 assert pipe._execution_device is not None
 
-device_ids = [0, 1]
+device_ids = [0, 1]  # [0, 1, 2, 3] for trn2, [0, 1] for inf2
 _neuronTransformer = InferenceTransformerWrapper(pipe.transformer)
 _neuronTransformer.transformer = torch_neuronx.DataParallel(torch.jit.load(transformer_filename), device_ids, set_dynamic_batching=False)
 pipe.transformer = _neuronTransformer

@@ -154,9 +154,9 @@ def attention_wrapper(query, key, value, attn_mask=None, dropout_p=None, is_caus
     else:
         return neuron_scaled_dot_product_attention(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal)
         
-def attention_wrapper_for_transformer(query, key, value, attn_mask=None, dropout_p=None, is_causal=None):
+def attention_wrapper_for_transformer(query, key, value, attn_mask=None, dropout_p=None, is_causal=None, scale=None, enable_gqa=False):
     if attn_mask is not None:
-        return sdpa_original(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal)
+        return sdpa_original(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale, enable_gqa=enable_gqa)
     else:
         return attention_wrapper_sharded_without_swap(query, key, value)
         
