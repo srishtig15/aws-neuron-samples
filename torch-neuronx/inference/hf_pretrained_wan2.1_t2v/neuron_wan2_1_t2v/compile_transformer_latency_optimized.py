@@ -89,11 +89,10 @@ def compile_transformer(args):
     sample_hidden_states = torch.ones((batch_size, in_channels, frames, latent_height, latent_width), dtype=torch.bfloat16)
     sample_encoder_hidden_states = torch.ones((batch_size, max_sequence_length, hidden_size), dtype=torch.bfloat16)
     sample_timestep = torch.ones((batch_size), dtype=torch.int64)
-    # sample_encoder_attention_mask = torch.ones((batch_size, max_sequence_length), dtype=torch.int64)
 
     get_transformer_model_f = partial(get_transformer_model, tp_degree)
     with torch.no_grad():
-        sample_inputs = sample_hidden_states, sample_timestep, sample_encoder_hidden_states  # , sample_encoder_attention_mask
+        sample_inputs = sample_hidden_states, sample_timestep, sample_encoder_hidden_states
         compiled_transformer = neuronx_distributed.trace.parallel_model_trace(
             get_transformer_model_f,
             sample_inputs,
@@ -120,43 +119,6 @@ def compile_transformer(args):
 #     compile_transformer(args)
 
 
-# class NeuronTransformer(nn.Module):
-#     def __init__(self, transformer_wrap):
-#         super().__init__()
-#         self.transformer_wrap = transformer_wrap
-#         self.config = transformer_wrap.transformer.config
-#         if hasattr(transformer_wrap.transformer, 'in_channels'):
-#             self.in_channels = transformer_wrap.transformer.in_channels
-#         self.device = transformer_wrap.transformer.device
-
-#     def forward(self, hidden_states, timestep, encoder_hidden_states, encoder_hidden_states_image=None, 
-#                 timestep_cond=None, added_cond_kwargs=None, cross_attention_kwargs=None, return_dict=False):
-#         sample = self.transformer_wrap(
-#             hidden_states, 
-#             timestep.to(dtype=DTYPE).expand((hidden_states.shape[0],)), 
-#             encoder_hidden_states,
-#             encoder_hidden_states_image
-#         )[0]
-        
-#         if return_dict:
-#             return type('TransformerOutput', (), {'sample': sample})()
-#         return sample
-
-# class TransformerWrap(nn.Module):
-#     def __init__(self, transformer):
-#         super().__init__()
-#         self.transformer = transformer
-
-#     def forward(self, hidden_states, timestep, encoder_hidden_states, encoder_hidden_states_image=None):
-#         # WanTransformer3DModel的forward方法签名
-#         return self.transformer(
-#             hidden_states=hidden_states,
-#             timestep=timestep,
-#             encoder_hidden_states=encoder_hidden_states,
-#             encoder_hidden_states_image=encoder_hidden_states_image,
-#             return_dict=False
-#         )
-
 DTYPE=torch.bfloat16
 model_id = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
 # model_id = "Wan-AI/Wan2.1-T2V-14B-Diffusers"
@@ -175,11 +137,10 @@ vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=to
 pipe = WanPipeline.from_pretrained(model_id, vae=vae, torch_dtype=DTYPE, cache_dir="wan2.1_t2v_hf_cache_dir")
 
 # # Apply double wrapper to deal with custom return type
-# pipe.transformer = NeuronTransformer(TransformerWrap(pipe.transformer))
 pipe.transformer = TracingTransformerWrapper(pipe.transformer)
 
 # Only keep the model being compiled in RAM to minimze memory pressure
-transformer = copy.deepcopy(pipe.transformer)  # .transformer_wrap
+transformer = copy.deepcopy(pipe.transformer)
 del pipe
 
 # Compile transformer - adjust input shapes for 3D video
