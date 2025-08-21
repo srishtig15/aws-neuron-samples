@@ -41,8 +41,7 @@ if __name__ == "__main__":
     )
     # text_encoder_wrapper.t = torch_neuronx.DataParallel( 
     #     # torch.jit.load(os.path.join(text_encoder_model_path, 'model.pt')), [0, 1, 2, 3], False  # Use for trn2
-    #     # torch.jit.load(os.path.join(text_encoder_model_path, 'model.pt')), [0, 1, 2, 3, 4, 5, 6, 7], False # Use for trn1/inf2
-    #     torch.jit.load(os.path.join(text_encoder_model_path, 'model.pt'), [1])  # model.pt
+    #     torch.jit.load(os.path.join(text_encoder_model_path, 'model.pt')), [0, 1, 2, 3, 4, 5, 6, 7], False # Use for trn1/inf2
     # )
     print('text_encoder_wrapper.t end ****************')
 
@@ -53,8 +52,7 @@ if __name__ == "__main__":
     )
     # transformer_wrapper.transformer = torch_neuronx.DataParallel( 
     #     # torch.jit.load(os.path.join(transformer_model_path, 'model.pt')), [0, 1, 2, 3], False  # Use for trn2
-    #     # torch.jit.load(os.path.join(transformer_model_path, 'model.pt')), [0, 1, 2, 3, 4, 5, 6, 7], False # Use for trn1/inf2
-    #     torch.jit.load(os.path.join(transformer_model_path, 'model.pt'))
+    #     torch.jit.load(os.path.join(transformer_model_path, 'model.pt')), [0, 1, 2, 3, 4, 5, 6, 7], False # Use for trn1/inf2
     # )
     print('transformer_wrapper.transformer end ****************')
 
@@ -63,7 +61,6 @@ if __name__ == "__main__":
     # vae_decoder_wrapper.model = torch_neuronx.DataParallel( 
     #     # torch.jit.load(decoder_model_path), [0, 1, 2, 3], False  # Use for trn2
     #     torch.jit.load(decoder_model_path), [0, 1, 2, 3, 4, 5, 6, 7], False # Use for trn1/inf2
-    #     # torch.jit.load(decoder_model_path),
     # )
     # print('vae_decoder_wrapper.model:', vae_decoder_wrapper.model)
     # print('vae_decoder_wrapper.model end ****************')
@@ -73,7 +70,6 @@ if __name__ == "__main__":
     vae_post_quant_conv_wrapper.model = torch_neuronx.DataParallel(
         # torch.jit.load(post_quant_conv_model_path), [0, 1, 2, 3], False # Use for trn2
         torch.jit.load(post_quant_conv_model_path), [0, 1, 2, 3, 4, 5, 6, 7], False # Use for trn1/inf2
-        # torch.jit.load(post_quant_conv_model_path),
     )
     print('vae_post_quant_conv_wrapper.model end ****************')
     

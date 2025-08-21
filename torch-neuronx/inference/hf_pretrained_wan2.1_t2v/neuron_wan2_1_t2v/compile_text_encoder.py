@@ -22,22 +22,6 @@ from neuron_parallel_utils import get_sharded_data, shard_umt5_self_attention, s
 
 torch.nn.functional.scaled_dot_product_attention = attention_wrapper
 
-
-# class TracingUMT5WrapperTP(nn.Module):
-#     def __init__(self, t: UMT5EncoderModel, seqlen: int):
-#         super().__init__()
-#         self.t = t
-#         self.device = t.device
-#         precomputed_bias = self.t.encoder.block[0].layer[0].SelfAttention.compute_bias(seqlen, seqlen)
-#         precomputed_bias_tp = get_sharded_data(precomputed_bias, 1)
-#         self.t.encoder.block[0].layer[0].SelfAttention.compute_bias = lambda *args, **kwargs: precomputed_bias_tp
-    
-#     def forward(self, text_input_ids, prompt_attention_mask=None):
-#         return self.t(
-#             text_input_ids, 
-#             attention_mask=prompt_attention_mask
-#         )
-        
 class TracingUMT5WrapperTP(nn.Module):
     def __init__(self, t: UMT5EncoderModel, seqlen: int):
         super().__init__()
@@ -53,40 +37,6 @@ class TracingUMT5WrapperTP(nn.Module):
             text_input_ids, 
             attention_mask=attention_mask
         )
-        
-# class TracingUMT5WrapperTP(nn.Module):
-#     def __init__(self, t: UMT5EncoderModel, seqlen: int, tp_degree: int):
-#         super().__init__()
-#         self.t = t
-#         self.device = t.device
-#         self.tp_degree = tp_degree
-        
-#         # 为每个 block 预计算并分片 position bias
-#         for block_idx, block in enumerate(self.t.encoder.block):
-#             original_compute_bias = block.layer[0].SelfAttention.compute_bias
-#             precomputed_bias = original_compute_bias(seqlen, seqlen)
-            
-#             # 根据注意力头的分片方式来分片 position_bias
-#             # position_bias shape: [1, num_heads, seq_len, seq_len]
-#             if tp_degree > 1:
-#                 # 沿着 num_heads 维度分片
-#                 num_heads = precomputed_bias.shape[1]
-#                 heads_per_rank = num_heads // tp_degree
-#                 rank = neuronx_distributed.parallel_layers.parallel_state.get_tensor_model_parallel_rank()
-#                 start_idx = rank * heads_per_rank
-#                 end_idx = start_idx + heads_per_rank
-#                 precomputed_bias_tp = precomputed_bias[:, start_idx:end_idx, :, :]
-#             else:
-#                 precomputed_bias_tp = precomputed_bias
-            
-#             # 替换 compute_bias 函数
-#             block.layer[0].SelfAttention.compute_bias = lambda *args, **kwargs: precomputed_bias_tp
-    
-#     def forward(self, text_input_ids, attention_mask=None):
-#         return self.t(
-#             text_input_ids, 
-#             attention_mask=attention_mask
-#         )
 
 def get_text_encoder(tp_degree: int, sequence_length: int):
     model_id = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
@@ -114,7 +64,6 @@ def get_text_encoder(tp_degree: int, sequence_length: int):
     final_layer_norm = text_encoder.encoder.final_layer_norm.to(torch.float32)
     text_encoder.encoder.final_layer_norm = f32Wrapper(final_layer_norm)
     
-    # 传递 tp_degree 参数
     return TracingUMT5WrapperTP(text_encoder, sequence_length), {}
 
 def compile_text_encoder(args):
@@ -173,7 +122,7 @@ if __name__ == "__main__":
 #             torch.ones((batch_size, sequence_length), dtype=torch.int64)   
 # text_encoder_neuron = torch_neuronx.trace(
 #         text_encoder, 
-#         sample_inputs,  # emb
+#         sample_inputs,
 #         compiler_workdir=os.path.join(COMPILER_WORKDIR_ROOT, 'text_encoder'),
 #         compiler_args=compiler_flags
 #         )
@@ -188,3 +137,4 @@ if __name__ == "__main__":
 # # delete unused objects
 # del text_encoder
 # del text_encoder_neuron
+
