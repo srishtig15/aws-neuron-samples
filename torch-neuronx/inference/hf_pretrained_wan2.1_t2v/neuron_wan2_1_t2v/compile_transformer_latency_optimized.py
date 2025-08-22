@@ -3,7 +3,7 @@ os.environ["NEURON_FUSE_SOFTMAX"] = "1"
 os.environ["NEURON_CUSTOM_SILU"] = "1"
 os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "2" # Comment this line out if using trn1/inf2
 os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2" # Comment this line out if using trn1/inf2
-compiler_flags = """ --verbose=INFO --target=trn2 --lnc=2 --model-type=transformer --enable-fast-loading-neuron-binaries """ # Use these compiler flags for trn2. --internal-hlo2tensorizer-options='--fuse-dot-logistic=false' 
+compiler_flags = """ --verbose=INFO --target=trn2 --lnc=2 --internal-hlo2tensorizer-options='--fuse-dot-logistic=false' --model-type=transformer --enable-fast-loading-neuron-binaries """ # Use these compiler flags for trn2
 # compiler_flags = """ --verbose=INFO --target=trn1 --model-type=transformer --enable-fast-loading-neuron-binaries """ # Use these compiler flags for trn1/inf2
 os.environ["NEURON_CC_FLAGS"] = os.environ.get("NEURON_CC_FLAGS", "") + compiler_flags
 
@@ -18,16 +18,25 @@ from torch import nn
 import torch.nn.functional as F
 from functools import partial
 
-from neuron_commons import attention_wrapper, attention_wrapper_for_transformer
+from neuron_commons import attention_wrapper, attention_wrapper_for_transformer, f32Wrapper
 from neuron_parallel_utils import shard_transformer_attn, shard_transformer_feedforward, shard_transformer3d_attn
 
-from diffusers.models.transformers.transformer_wan import WanTransformer3DModel
-torch.nn.functional.scaled_dot_product_attention = attention_wrapper  # TODO use attention_wrapper instead of attention_wrapper_for_transformer
+# torch.nn.functional.scaled_dot_product_attention = attention_wrapper  # TODO use attention_wrapper instead of attention_wrapper_for_transformer
 # torch.nn.functional.scaled_dot_product_attention = attention_wrapper_for_transformer
 
-from typing import Optional
-from diffusers.models.attention_processor import Attention
 
+def upcast_norms_to_f32(transformer):
+    transformer.condition_embedder.time_embedder = f32Wrapper(transformer.condition_embedder.time_embedder)
+    for block in transformer.blocks:
+        orig_norm1 = block.norm1
+        orig_norm2 = block.norm2
+        orig_norm3 = block.norm3
+        block.norm1 = f32Wrapper(orig_norm1)
+        block.norm2 = f32Wrapper(orig_norm2)
+        block.norm3 = f32Wrapper(orig_norm3)
+    orig_norm_out = transformer.norm_out
+    transformer.norm_out = f32Wrapper(orig_norm_out)
+    
 class TracingTransformerWrapper(nn.Module):
     def __init__(self, transformer):
         super().__init__()
@@ -53,6 +62,8 @@ def get_transformer_model(tp_degree: int):
     # model_id = "Wan-AI/Wan2.1-T2V-14B-Diffusers"
     # vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32, cache_dir="wan2.1_t2v_14b_hf_cache_dir")
     # pipe = WanPipeline.from_pretrained(model_id, vae=vae, torch_dtype=DTYPE, cache_dir="wan2.1_t2v_14b_hf_cache_dir")
+    
+    upcast_norms_to_f32(pipe.transformer)
     
     # 分片所有blocks
     for block_idx, block in enumerate(pipe.transformer.blocks):
@@ -137,18 +148,21 @@ hidden_size = 4096
 vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32, cache_dir="wan2.1_t2v_hf_cache_dir")
 pipe = WanPipeline.from_pretrained(model_id, vae=vae, torch_dtype=DTYPE, cache_dir="wan2.1_t2v_hf_cache_dir")
 
+upcast_norms_to_f32(pipe.transformer)
+
 # # Apply double wrapper to deal with custom return type
 pipe.transformer = TracingTransformerWrapper(pipe.transformer)
 
 # Only keep the model being compiled in RAM to minimze memory pressure
 transformer = copy.deepcopy(pipe.transformer)
+
 del pipe
 
 # Compile transformer - adjust input shapes for 3D video
 
 # 3D input for video: (batch, channels, frames, height, width)
 hidden_states_1b = torch.randn([batch_size, in_channels, frames, height, width], dtype=DTYPE)
-timestep_1b = torch.tensor(999, dtype=torch.int64).expand((batch_size,))
+timestep_1b = torch.tensor([999], dtype=torch.int64)
 # Text encoder output dimension for Wan (might be different from SD)
 encoder_hidden_states_1b = torch.randn([batch_size, max_sequence_length, hidden_size], dtype=DTYPE)  # Wan uses 4096 dim
 
@@ -158,7 +172,8 @@ transformer_neuron = torch_neuronx.trace(
     transformer,
     example_inputs,
     compiler_workdir=os.path.join(COMPILER_WORKDIR_ROOT, 'transformer'),
-    compiler_args=compiler_flags
+    compiler_args=compiler_flags,
+    inline_weights_to_neff=False
 )
 
 # Enable asynchronous and lazy loading to speed up model load

@@ -24,7 +24,7 @@ if __name__ == "__main__":
     
     vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32, cache_dir=HUGGINGFACE_CACHE_DIR)
     pipe = WanPipeline.from_pretrained(model_id, vae=vae, torch_dtype=DTYPE, cache_dir=HUGGINGFACE_CACHE_DIR)
-    
+        
     text_encoder_model_path = f"{COMPILED_MODELS_DIR}/text_encoder"
     transformer_model_path = f"{COMPILED_MODELS_DIR}/transformer" 
     decoder_model_path = f"{COMPILED_MODELS_DIR}/decoder/model.pt"

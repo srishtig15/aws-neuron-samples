@@ -53,7 +53,7 @@ def compile_decoder(args):
     
     decoder: Decoder = vae.decoder
     decoder.eval()
-    upcast_norms_to_f32(decoder)
+    # upcast_norms_to_f32(decoder)  # TODO maybe we don't need to call upcast_norms_to_f32
     
     with torch.no_grad():
         # sample_inputs_1 = torch.rand((batch_size, in_channels, 2, latent_height, latent_width), dtype=torch.float32)  # 这里第3维用frames（或者2即可）是因为静态编译的原因，实际上用1就可以
