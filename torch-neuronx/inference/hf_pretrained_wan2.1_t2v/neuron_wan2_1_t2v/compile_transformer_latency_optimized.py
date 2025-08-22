@@ -25,17 +25,17 @@ from neuron_parallel_utils import shard_transformer_attn, shard_transformer_feed
 # torch.nn.functional.scaled_dot_product_attention = attention_wrapper_for_transformer
 
 
-def upcast_norms_to_f32(transformer):
-    transformer.condition_embedder.time_embedder = f32Wrapper(transformer.condition_embedder.time_embedder)
-    for block in transformer.blocks:
-        orig_norm1 = block.norm1
-        orig_norm2 = block.norm2
-        orig_norm3 = block.norm3
-        block.norm1 = f32Wrapper(orig_norm1)
-        block.norm2 = f32Wrapper(orig_norm2)
-        block.norm3 = f32Wrapper(orig_norm3)
-    orig_norm_out = transformer.norm_out
-    transformer.norm_out = f32Wrapper(orig_norm_out)
+# def upcast_norms_to_f32(transformer):
+#     transformer.condition_embedder.time_embedder = f32Wrapper(transformer.condition_embedder.time_embedder)
+#     for block in transformer.blocks:
+#         orig_norm1 = block.norm1
+#         orig_norm2 = block.norm2
+#         orig_norm3 = block.norm3
+#         block.norm1 = f32Wrapper(orig_norm1)
+#         block.norm2 = f32Wrapper(orig_norm2)
+#         block.norm3 = f32Wrapper(orig_norm3)
+#     orig_norm_out = transformer.norm_out
+#     transformer.norm_out = f32Wrapper(orig_norm_out)
     
 class TracingTransformerWrapper(nn.Module):
     def __init__(self, transformer):
@@ -63,7 +63,7 @@ def get_transformer_model(tp_degree: int):
     # vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32, cache_dir="wan2.1_t2v_14b_hf_cache_dir")
     # pipe = WanPipeline.from_pretrained(model_id, vae=vae, torch_dtype=DTYPE, cache_dir="wan2.1_t2v_14b_hf_cache_dir")
     
-    upcast_norms_to_f32(pipe.transformer)
+    # upcast_norms_to_f32(pipe.transformer)
     
     # 分片所有blocks
     for block_idx, block in enumerate(pipe.transformer.blocks):
@@ -148,7 +148,7 @@ hidden_size = 4096
 vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32, cache_dir="wan2.1_t2v_hf_cache_dir")
 pipe = WanPipeline.from_pretrained(model_id, vae=vae, torch_dtype=DTYPE, cache_dir="wan2.1_t2v_hf_cache_dir")
 
-upcast_norms_to_f32(pipe.transformer)
+# upcast_norms_to_f32(pipe.transformer)
 
 # # Apply double wrapper to deal with custom return type
 pipe.transformer = TracingTransformerWrapper(pipe.transformer)
