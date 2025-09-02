@@ -27,6 +27,7 @@ class InferenceTransformerWrapper(nn.Module):
         self.config = transformer.config
         self.dtype = transformer.dtype
         self.device = transformer.device
+        self.cache_context = transformer.cache_context
     def forward(self, hidden_states, timestep=None, encoder_hidden_states=None, return_dict=False, **kwargs):  # encoder_attention_mask=None, added_cond_kwargs=None,
         # print('self.config:', self.config)
         # print('self.dtype:', self.dtype)
