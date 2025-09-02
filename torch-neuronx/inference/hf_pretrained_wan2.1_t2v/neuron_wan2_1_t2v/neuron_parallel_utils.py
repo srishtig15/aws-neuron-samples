@@ -300,9 +300,11 @@ def shard_transformer3d_attn(tp_degree: int, attn: Attention):
             if orig_weight.shape[0] == orig_inner_dim:
                 # 分片原始weight并padding
                 sharded_weight = get_sharded_data(orig_weight, 0)  # 得到192维
-                # Padding到256维
-                padded_weight = torch.ones(new_inner_dim, dtype=sharded_weight.dtype, device=sharded_weight.device)
+                # Padding到256维 - 使用0而不是1来避免影响归一化
+                padded_weight = torch.zeros(new_inner_dim, dtype=sharded_weight.dtype, device=sharded_weight.device)
                 padded_weight[:actual_output_dim] = sharded_weight[:actual_output_dim]
+                # 对padding部分使用1来避免除零错误
+                padded_weight[actual_output_dim:] = 1.0
                 attn.norm_q.weight.data = padded_weight
             else:
                 # 默认值
@@ -322,8 +324,10 @@ def shard_transformer3d_attn(tp_degree: int, attn: Attention):
         if orig_weight is not None and old_elementwise_affine:
             if orig_weight.shape[0] == orig_inner_dim:
                 sharded_weight = get_sharded_data(orig_weight, 0)
-                padded_weight = torch.ones(new_inner_dim, dtype=sharded_weight.dtype, device=sharded_weight.device)
+                padded_weight = torch.zeros(new_inner_dim, dtype=sharded_weight.dtype, device=sharded_weight.device)
                 padded_weight[:actual_output_dim] = sharded_weight[:actual_output_dim]
+                # 对padding部分使用1来避免除零错误
+                padded_weight[actual_output_dim:] = 1.0
                 attn.norm_k.weight.data = padded_weight
 
     # 处理I2V相关层
@@ -365,8 +369,10 @@ def shard_transformer3d_attn(tp_degree: int, attn: Attention):
         if orig_weight is not None and old_elementwise_affine:
             if orig_weight.shape[0] == orig_inner_dim:
                 sharded_weight = get_sharded_data(orig_weight, 0)
-                padded_weight = torch.ones(new_inner_dim, dtype=sharded_weight.dtype, device=sharded_weight.device)
+                padded_weight = torch.zeros(new_inner_dim, dtype=sharded_weight.dtype, device=sharded_weight.device)
                 padded_weight[:actual_output_dim] = sharded_weight[:actual_output_dim]
+                # 对padding部分使用1来避免除零错误  
+                padded_weight[actual_output_dim:] = 1.0
                 attn.norm_added_k.weight.data = padded_weight
 
     # 分片 to_out
