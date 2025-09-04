@@ -9,9 +9,9 @@ import time
 import torch
 import torch_neuronx
 
-from neuron_wan2_1_t2v.neuron_commons import InferenceTextEncoderWrapper
-from neuron_wan2_1_t2v.neuron_commons import InferenceTransformerWrapper
-from neuron_wan2_1_t2v.neuron_commons import SimpleWrapper
+from neuron_wan2_2_ti2v.neuron_commons import InferenceTextEncoderWrapper
+from neuron_wan2_2_ti2v.neuron_commons import InferenceTransformerWrapper
+from neuron_wan2_2_ti2v.neuron_commons import SimpleWrapper
 
 COMPILED_MODELS_DIR = "compile_workdir_latency_optimized"
 HUGGINGFACE_CACHE_DIR = "wan2.2_ti2v_hf_cache_dir"
