@@ -74,6 +74,10 @@ def get_transformer_model(tp_degree: int):
         # 分片feedforward层
         block.ffn = shard_transformer_feedforward(block.ffn)
         
+        # 分片scale_shift_table - 这个表需要与hidden_states的channel维度匹配
+        # scale_shift_table原始形状: [1, 6, 3072]
+        # 不分片scale_shift_table，因为hidden_states本身没有被分片
+        
     mod_pipe_transformer_f = TracingTransformerWrapper(pipe.transformer)
     return mod_pipe_transformer_f, {}
 
@@ -82,8 +86,8 @@ def compile_transformer(args):
     # os.environ["LOCAL_WORLD_SIZE"] = "4" # Use tensor parallel degree as 4 for trn2
     tp_degree = 8 # Use tensor parallel degree as 8 for trn1/inf2, default: 8
     os.environ["LOCAL_WORLD_SIZE"] = "8" # Use tensor parallel degree as 4 for trn2
-    latent_height = args.height//8
-    latent_width = args.width//8
+    latent_height = args.height//16
+    latent_width = args.width//16
     num_prompts = 1
     num_images_per_prompt = args.num_images_per_prompt
     max_sequence_length = args.max_sequence_length
@@ -91,12 +95,12 @@ def compile_transformer(args):
     compiler_workdir = args.compiler_workdir
     compiled_models_dir = args.compiled_models_dir
     batch_size = 1
-    frames = 4  # default: 21
+    frames = 8  # default: 21
     # height, width = 32, 32  # default: 96, 96
     in_channels = 48
     sample_hidden_states = torch.ones((batch_size, in_channels, frames, latent_height, latent_width), dtype=torch.bfloat16)
     sample_encoder_hidden_states = torch.ones((batch_size, max_sequence_length, hidden_size), dtype=torch.bfloat16)
-    sample_timestep = torch.ones((batch_size, 1024), dtype=torch.float32)
+    sample_timestep = torch.ones((batch_size, 256*frames), dtype=torch.float32)
 
     get_transformer_model_f = partial(get_transformer_model, tp_degree)
     with torch.no_grad():
@@ -117,10 +121,10 @@ def compile_transformer(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--height", help="height of generated video.", type=int, default=256)
-    parser.add_argument("--width", help="width of generated video.", type=int, default=256)
+    parser.add_argument("--height", help="height of generated video.", type=int, default=512)
+    parser.add_argument("--width", help="width of generated video.", type=int, default=512)
     parser.add_argument("--num_images_per_prompt", help="number of images per prompt.", type=int, default=1)
-    parser.add_argument("--max_sequence_length", help="max sequence length.", type=int, default=300)
+    parser.add_argument("--max_sequence_length", help="max sequence length.", type=int, default=512)
     parser.add_argument("--compiler_workdir", help="dir for compiler artifacts.", type=str, default="compiler_workdir")
     parser.add_argument("--compiled_models_dir", help="dir for compiled artifacts.", type=str, default="compiled_models")
     args = parser.parse_args()
