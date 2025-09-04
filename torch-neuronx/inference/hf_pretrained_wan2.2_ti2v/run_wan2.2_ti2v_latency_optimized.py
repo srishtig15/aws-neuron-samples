@@ -22,6 +22,9 @@ if __name__ == "__main__":
     
     vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32, cache_dir=HUGGINGFACE_CACHE_DIR)
     pipe = WanPipeline.from_pretrained(model_id, vae=vae, torch_dtype=DTYPE, cache_dir=HUGGINGFACE_CACHE_DIR)
+    # print(pipe.text_encoder)
+    # print(pipe.transformer)
+    # print(pipe.vae)
         
     text_encoder_model_path = f"{COMPILED_MODELS_DIR}/text_encoder"
     transformer_model_path = f"{COMPILED_MODELS_DIR}/transformer" 
@@ -45,13 +48,13 @@ if __name__ == "__main__":
 
     transformer_wrapper = InferenceTransformerWrapper(pipe.transformer)
     print('transformer_wrapper.transformer start ****************')
-    # transformer_wrapper.transformer = neuronx_distributed.trace.parallel_model_load(
-    #     transformer_model_path
-    # )
-    transformer_wrapper.transformer = torch_neuronx.DataParallel( 
-        torch.jit.load(os.path.join(transformer_model_path, 'model.pt')), [0, 1, 2, 3], False  # Use for trn2
-        # torch.jit.load(os.path.join(transformer_model_path, 'model.pt')), [0, 1, 2, 3, 4, 5, 6, 7], False # Use for trn1/inf2
+    transformer_wrapper.transformer = neuronx_distributed.trace.parallel_model_load(
+        transformer_model_path
     )
+    # transformer_wrapper.transformer = torch_neuronx.DataParallel( 
+    #     torch.jit.load(os.path.join(transformer_model_path, 'model.pt')), [0, 1, 2, 3], False  # Use for trn2
+    #     # torch.jit.load(os.path.join(transformer_model_path, 'model.pt')), [0, 1, 2, 3, 4, 5, 6, 7], False # Use for trn1/inf2
+    # )
     print('transformer_wrapper.transformer end ****************')
 
     # vae_decoder_wrapper = SimpleWrapper(pipe.vae.decoder)
@@ -83,8 +86,8 @@ if __name__ == "__main__":
     # output_warmup = pipe(
     #     prompt=prompt,
     #     negative_prompt=negative_prompt,
-    #     height=256,  # default: 480
-    #     width=256,  # default: 832
+    #     height=512,  # default: 480
+    #     width=512,  # default: 832
     #     num_frames=13,  # default: 81
     #     guidance_scale=5.0,
     #     max_sequence_length=seqlen  # default: 512
@@ -96,8 +99,8 @@ if __name__ == "__main__":
     output = pipe(
         prompt=prompt,
         negative_prompt=negative_prompt,
-        height=256,  # default: 480
-        width=256,  # default: 832
+        height=512,  # default: 480
+        width=512,  # default: 832
         num_frames=13,  # default: 81
         guidance_scale=5.0,
         num_inference_steps=50,  # default: 50

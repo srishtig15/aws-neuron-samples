@@ -24,6 +24,6 @@ python neuron_wan2_2_ti2v/compile_decoder.py \
 --compiled_models_dir "compile_workdir_latency_optimized"
 
 echo "run wan2.2 ti2v latency optimized"
-export NEURON_RT_NUM_CORES=4
-# export NEURON_RT_NUM_CORES=8
+# export NEURON_RT_NUM_CORES=4
+export NEURON_RT_NUM_CORES=8
 python run_wan2.2_ti2v_latency_optimized.py

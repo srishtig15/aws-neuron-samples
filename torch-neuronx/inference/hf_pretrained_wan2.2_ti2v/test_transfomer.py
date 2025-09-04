@@ -104,18 +104,18 @@ with torch.no_grad():
 
 transformer_wrapper = InferenceTransformerWrapper(pipe.transformer)
 print('transformer_wrapper.transformer start ****************')
-# transformer_wrapper.transformer = neuronx_distributed.trace.parallel_model_load(
-#     transformer_model_path
-# )
-# 加载模型
-jit_model = torch.jit.load(os.path.join(transformer_model_path, 'model.pt'))
-# # 关键步骤：将权重移动到 NeuronCore
-# torch_neuronx.move_trace_to_device(jit_model, 0)  # 0 是设备 ID
-# transformer_wrapper.transformer = jit_model
-transformer_wrapper.transformer = torch_neuronx.DataParallel( 
-    jit_model, [0, 1, 2, 3], False  # Use for trn2
-    # jit_model, [0, 1, 2, 3, 4, 5, 6, 7], False # Use for trn1/inf2
+transformer_wrapper.transformer = neuronx_distributed.trace.parallel_model_load(
+    transformer_model_path
 )
+# # 加载模型
+# jit_model = torch.jit.load(os.path.join(transformer_model_path, 'model.pt'))
+# # # 关键步骤：将权重移动到 NeuronCore
+# # torch_neuronx.move_trace_to_device(jit_model, 0)  # 0 是设备 ID
+# # transformer_wrapper.transformer = jit_model
+# transformer_wrapper.transformer = torch_neuronx.DataParallel( 
+#     jit_model, [0, 1, 2, 3], False  # Use for trn2
+#     # jit_model, [0, 1, 2, 3, 4, 5, 6, 7], False # Use for trn1/inf2
+# )
 print('transformer_wrapper.transformer end ****************')
 
 output_neuron = transformer_wrapper(hidden_states_1b.clone(), timestep_1b.clone(), encoder_hidden_states_1b.clone())[0]
