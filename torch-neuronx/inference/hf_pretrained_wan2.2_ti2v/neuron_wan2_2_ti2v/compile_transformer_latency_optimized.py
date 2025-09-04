@@ -134,7 +134,7 @@ COMPILER_WORKDIR_ROOT = 'compile_workdir_latency_optimized'
 batch_size = 1
 frames = 4  # default: 16  # typical frame count for video generation
 height, width = 32, 32  # default: 32, 32  # spatial dimensions
-in_channels = 16  # 根据配置，Wan使用16个输入通道
+in_channels = 48  # 根据配置，Wan使用16个输入通道
 max_sequence_length = 512
 hidden_size = 4096
 
