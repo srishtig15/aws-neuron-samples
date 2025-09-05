@@ -100,7 +100,7 @@ def compile_transformer(args):
     in_channels = 48
     sample_hidden_states = torch.ones((batch_size, in_channels, frames, latent_height, latent_width), dtype=torch.bfloat16)
     sample_encoder_hidden_states = torch.ones((batch_size, max_sequence_length, hidden_size), dtype=torch.bfloat16)
-    sample_timestep = torch.ones((batch_size, 256*frames), dtype=torch.float32)  # 256*frames where frames=6
+    sample_timestep = torch.ones((batch_size, 256*frames), dtype=torch.float32)
 
     get_transformer_model_f = partial(get_transformer_model, tp_degree)
     with torch.no_grad():
