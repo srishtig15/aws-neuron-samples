@@ -235,9 +235,9 @@ def shard_transformer3d_attn_no_padding(tp_degree: int, attn: Attention, orig_nu
     """当不需要padding时的简化版本（如TP=4时）"""
     
     # 获取维度信息
-    orig_inner_dim = attn.to_q.out_features  # 1536
+    orig_inner_dim = attn.to_q.out_features  # 1536/3072
     dim_head = orig_inner_dim // orig_num_heads  # 128
-    new_inner_dim = attn.inner_dim  # 已经被更新为384 (1536/4)
+    new_inner_dim = attn.inner_dim  # 已经被更新为384 (1536/4, 3072/8)
     
     print(f"In no_padding: orig_inner_dim={orig_inner_dim}, new_inner_dim={new_inner_dim}, dim_head={dim_head}")
     
@@ -247,40 +247,53 @@ def shard_transformer3d_attn_no_padding(tp_degree: int, attn: Attention, orig_nu
     # 方案1：使用gather_output=True（会增加通信开销）
     use_gather = False  # 可以根据需要调整
     
+    # 当使用gather时，需要保存原始的heads数量用于unflatten
+    if use_gather:
+        attn._orig_heads = orig_num_heads  # 保存原始heads数量
+    
     if use_gather:
         # 使用gather_output=True，这样norm看到的是完整维度
         orig_q = attn.to_q
+        print('orig_q.in_features:', orig_q.in_features, 'orig_q.out_features:', orig_q.out_features)
+        # 注意：ColumnParallelLinear不支持同时使用bias和gather_output=True
+        # 所以我们禁用bias，稍后手动添加
         attn.to_q = ColumnParallelLinear(
             orig_q.in_features,
             orig_q.out_features,
-            bias=(orig_q.bias is not None),
+            bias=False,  # 禁用bias以避免维度不匹配
             gather_output=True)  # 注意这里改为True
         attn.to_q.weight.data = get_sharded_data(orig_q.weight.data, 0)
+        # 保存原始bias以便后续使用
         if orig_q.bias is not None:
-            attn.to_q.bias.data = get_sharded_data(orig_q.bias.data, 0)
+            attn.to_q._orig_bias = orig_q.bias.data.detach()
+        print('attn.to_q.weight.data:', attn.to_q.weight.data.shape)
         del(orig_q)
         
         # 类似处理K和V
         orig_k = attn.to_k
+        print('orig_k.in_features:', orig_k.in_features, 'orig_k.out_features:', orig_k.out_features)
         attn.to_k = ColumnParallelLinear(
             orig_k.in_features,
             orig_k.out_features,
-            bias=(orig_k.bias is not None),
+            bias=False,  # 禁用bias
             gather_output=True)
         attn.to_k.weight.data = get_sharded_data(orig_k.weight.data, 0)
         if orig_k.bias is not None:
-            attn.to_k.bias.data = get_sharded_data(orig_k.bias.data, 0)
+            attn.to_k._orig_bias = orig_k.bias.data.detach()
+        print('attn.to_k.weight.data:', attn.to_k.weight.data.shape)
         del(orig_k)
         
         orig_v = attn.to_v
+        print('orig_v.in_features:', orig_v.in_features, 'orig_v.out_features:', orig_v.out_features)
         attn.to_v = ColumnParallelLinear(
             orig_v.in_features,
             orig_v.out_features,
-            bias=(orig_v.bias is not None),
+            bias=False,  # 禁用bias
             gather_output=True)
         attn.to_v.weight.data = get_sharded_data(orig_v.weight.data, 0)
         if orig_v.bias is not None:
-            attn.to_v.bias.data = get_sharded_data(orig_v.bias.data, 0)
+            attn.to_v._orig_bias = orig_v.bias.data.detach()
+        print('attn.to_v.weight.data:', attn.to_v.weight.data.shape)
         del(orig_v)
         
         # norm保持原始维度（因为gather_output=True）
@@ -405,7 +418,7 @@ def shard_transformer3d_attn(tp_degree: int, attn: Attention):
     print(f"Original heads: {orig_num_heads}, Extra heads needed: {extra_heads}")
     print(f"Original inner_dim: {orig_inner_dim}, dim_head: {dim_head}")
     
-    # 如果不需要padding（如TP=4, heads=24时），使用简化版本
+    # 如果不需要padding（如TP=4, heads=12时），使用简化版本
     if extra_heads == 0:
         print(f"No padding needed for {orig_num_heads} heads with TP={tp_degree}")
         
@@ -546,49 +559,49 @@ def shard_transformer3d_attn(tp_degree: int, attn: Attention):
                 # 然后分片
                 attn.norm_k.weight.data = get_sharded_data(padded_norm_weight, 0)
 
-    # # 处理I2V相关层
-    # if hasattr(attn, 'add_k_proj') and attn.add_k_proj is not None:
-    #     orig_add_k = attn.add_k_proj
-    #     attn.add_k_proj = ColumnParallelLinear(
-    #         orig_add_k.in_features,
-    #         actual_output_dim,  # 使用实际分片后的维度
-    #         bias=(orig_add_k.bias is not None),
-    #         gather_output=False)
-    #     attn.add_k_proj.weight.data = get_sharded_data(orig_add_k.weight.data, 0)
-    #     if orig_add_k.bias is not None:
-    #         attn.add_k_proj.bias.data = get_sharded_data(orig_add_k.bias.data, 0)
-    #     del(orig_add_k)
+    # 处理I2V相关层
+    if hasattr(attn, 'add_k_proj') and attn.add_k_proj is not None:
+        orig_add_k = attn.add_k_proj
+        attn.add_k_proj = ColumnParallelLinear(
+            orig_add_k.in_features,
+            actual_output_dim,  # 使用实际分片后的维度
+            bias=(orig_add_k.bias is not None),
+            gather_output=False)
+        attn.add_k_proj.weight.data = get_sharded_data(orig_add_k.weight.data, 0)
+        if orig_add_k.bias is not None:
+            attn.add_k_proj.bias.data = get_sharded_data(orig_add_k.bias.data, 0)
+        del(orig_add_k)
     
-    # if hasattr(attn, 'add_v_proj') and attn.add_v_proj is not None:
-    #     orig_add_v = attn.add_v_proj
-    #     attn.add_v_proj = ColumnParallelLinear(
-    #         orig_add_v.in_features,
-    #         actual_output_dim,  # 使用实际分片后的维度
-    #         bias=(orig_add_v.bias is not None),
-    #         gather_output=False)
-    #     attn.add_v_proj.weight.data = get_sharded_data(orig_add_v.weight.data, 0)
-    #     if orig_add_v.bias is not None:
-    #         attn.add_v_proj.bias.data = get_sharded_data(orig_add_v.bias.data, 0)
-    #     del(orig_add_v)
+    if hasattr(attn, 'add_v_proj') and attn.add_v_proj is not None:
+        orig_add_v = attn.add_v_proj
+        attn.add_v_proj = ColumnParallelLinear(
+            orig_add_v.in_features,
+            actual_output_dim,  # 使用实际分片后的维度
+            bias=(orig_add_v.bias is not None),
+            gather_output=False)
+        attn.add_v_proj.weight.data = get_sharded_data(orig_add_v.weight.data, 0)
+        if orig_add_v.bias is not None:
+            attn.add_v_proj.bias.data = get_sharded_data(orig_add_v.bias.data, 0)
+        del(orig_add_v)
     
-    # # 处理norm_added_k
-    # if hasattr(attn, 'norm_added_k') and attn.norm_added_k is not None:
-    #     old_eps = attn.norm_added_k.eps if hasattr(attn.norm_added_k, 'eps') else 1e-5
-    #     old_elementwise_affine = attn.norm_added_k.elementwise_affine if hasattr(attn.norm_added_k, 'elementwise_affine') else True
+    # 处理norm_added_k
+    if hasattr(attn, 'norm_added_k') and attn.norm_added_k is not None:
+        old_eps = attn.norm_added_k.eps if hasattr(attn.norm_added_k, 'eps') else 1e-5
+        old_elementwise_affine = attn.norm_added_k.elementwise_affine if hasattr(attn.norm_added_k, 'elementwise_affine') else True
         
-    #     orig_weight = None
-    #     if hasattr(attn.norm_added_k, 'weight') and attn.norm_added_k.weight is not None:
-    #         orig_weight = attn.norm_added_k.weight.data
+        orig_weight = None
+        if hasattr(attn.norm_added_k, 'weight') and attn.norm_added_k.weight is not None:
+            orig_weight = attn.norm_added_k.weight.data
         
-    #     attn.norm_added_k = RMSNorm(new_inner_dim, eps=old_eps, elementwise_affine=old_elementwise_affine)  # 使用256
+        attn.norm_added_k = RMSNorm(new_inner_dim, eps=old_eps, elementwise_affine=old_elementwise_affine)  # 使用256
         
-    #     if orig_weight is not None and old_elementwise_affine:
-    #         if orig_weight.shape[0] == orig_inner_dim:
-    #             sharded_weight = get_sharded_data(orig_weight, 0)
-    #             # Padding到256维
-    #             padded_weight = torch.ones(new_inner_dim, dtype=sharded_weight.dtype, device=sharded_weight.device)
-    #             padded_weight[:actual_output_dim] = sharded_weight
-    #             attn.norm_added_k.weight.data = padded_weight
+        if orig_weight is not None and old_elementwise_affine:
+            if orig_weight.shape[0] == orig_inner_dim:
+                sharded_weight = get_sharded_data(orig_weight, 0)
+                # Padding到256维
+                padded_weight = torch.ones(new_inner_dim, dtype=sharded_weight.dtype, device=sharded_weight.device)
+                padded_weight[:actual_output_dim] = sharded_weight
+                attn.norm_added_k.weight.data = padded_weight
 
     # 分片 to_out
     # to_out的权重也需要先padding再分片

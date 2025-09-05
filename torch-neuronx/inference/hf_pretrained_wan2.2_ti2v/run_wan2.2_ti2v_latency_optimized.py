@@ -101,7 +101,7 @@ if __name__ == "__main__":
         negative_prompt=negative_prompt,
         height=512,  # default: 480
         width=512,  # default: 832
-        num_frames=29,  # default: 81
+        num_frames=61,  # default: 81
         guidance_scale=5.0,
         num_inference_steps=50,  # default: 50
         max_sequence_length=seqlen  # default: 512

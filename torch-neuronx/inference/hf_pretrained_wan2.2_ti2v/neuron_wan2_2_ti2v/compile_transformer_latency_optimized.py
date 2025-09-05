@@ -5,7 +5,7 @@ os.environ["XLA_DISABLE_FUNCTIONALIZATION"] = "0"
 # os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "2" # Comment this line out if using trn1/inf2
 # os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2" # Comment this line out if using trn1/inf2
 # compiler_flags = """ --verbose=INFO --target=trn2 --lnc=2 --internal-hlo2tensorizer-options='--fuse-dot-logistic=false' --model-type=transformer --enable-fast-loading-neuron-binaries """ # Use these compiler flags for trn2
-compiler_flags = """ --verbose=INFO --target=trn1 --model-type=transformer --enable-fast-loading-neuron-binaries """ # Use these compiler flags for trn1/inf2
+compiler_flags = """ --verbose=INFO --target=trn1 --model-type=transformer --enable-fast-loading-neuron-binaries --enable-experimental-O1 """ # Use these compiler flags for trn1/inf2
 os.environ["NEURON_CC_FLAGS"] = os.environ.get("NEURON_CC_FLAGS", "") + compiler_flags
 
 from diffusers import AutoencoderKLWan, WanPipeline
@@ -95,12 +95,12 @@ def compile_transformer(args):
     compiler_workdir = args.compiler_workdir
     compiled_models_dir = args.compiled_models_dir
     batch_size = 1
-    frames = 8  # default: 21
+    frames = 16  # default: 21, reduced from 8 due to compiler instruction limit
     # height, width = 32, 32  # default: 96, 96
     in_channels = 48
     sample_hidden_states = torch.ones((batch_size, in_channels, frames, latent_height, latent_width), dtype=torch.bfloat16)
     sample_encoder_hidden_states = torch.ones((batch_size, max_sequence_length, hidden_size), dtype=torch.bfloat16)
-    sample_timestep = torch.ones((batch_size, 256*frames), dtype=torch.float32)
+    sample_timestep = torch.ones((batch_size, 256*frames), dtype=torch.float32)  # 256*frames where frames=6
 
     get_transformer_model_f = partial(get_transformer_model, tp_degree)
     with torch.no_grad():

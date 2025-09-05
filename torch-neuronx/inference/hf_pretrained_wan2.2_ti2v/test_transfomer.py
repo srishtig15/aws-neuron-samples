@@ -92,9 +92,7 @@ hidden_size = 4096
 max_sequence_length = 512
 
 hidden_states_1b = torch.randn([batch_size, in_channels, frames, height, width], dtype=DTYPE)
-timestep_1b = torch.tensor([999], dtype=torch.int64)
-# timestep_1b = torch.tensor([500], dtype=torch.int64)
-# timestep_1b = torch.tensor([0], dtype=torch.int64)
+timestep_1b = torch.tensor([999]*256*frames, dtype=torch.float32)
 encoder_hidden_states_1b = torch.randn([batch_size, max_sequence_length, hidden_size], dtype=DTYPE)
 
 with torch.no_grad():
@@ -102,33 +100,33 @@ with torch.no_grad():
     print('output_cpu:', output_cpu.shape, output_cpu.dtype, output_cpu)  # , output_cpu
 
 
-transformer_wrapper = InferenceTransformerWrapper(pipe.transformer)
-print('transformer_wrapper.transformer start ****************')
-transformer_wrapper.transformer = neuronx_distributed.trace.parallel_model_load(
-    transformer_model_path
-)
-# # 加载模型
-# jit_model = torch.jit.load(os.path.join(transformer_model_path, 'model.pt'))
-# # # 关键步骤：将权重移动到 NeuronCore
-# # torch_neuronx.move_trace_to_device(jit_model, 0)  # 0 是设备 ID
-# # transformer_wrapper.transformer = jit_model
-# transformer_wrapper.transformer = torch_neuronx.DataParallel( 
-#     jit_model, [0, 1, 2, 3], False  # Use for trn2
-#     # jit_model, [0, 1, 2, 3, 4, 5, 6, 7], False # Use for trn1/inf2
+# transformer_wrapper = InferenceTransformerWrapper(pipe.transformer)
+# print('transformer_wrapper.transformer start ****************')
+# transformer_wrapper.transformer = neuronx_distributed.trace.parallel_model_load(
+#     transformer_model_path
 # )
-print('transformer_wrapper.transformer end ****************')
+# # # 加载模型
+# # jit_model = torch.jit.load(os.path.join(transformer_model_path, 'model.pt'))
+# # # # 关键步骤：将权重移动到 NeuronCore
+# # # torch_neuronx.move_trace_to_device(jit_model, 0)  # 0 是设备 ID
+# # # transformer_wrapper.transformer = jit_model
+# # transformer_wrapper.transformer = torch_neuronx.DataParallel( 
+# #     jit_model, [0, 1, 2, 3], False  # Use for trn2
+# #     # jit_model, [0, 1, 2, 3, 4, 5, 6, 7], False # Use for trn1/inf2
+# # )
+# print('transformer_wrapper.transformer end ****************')
 
-output_neuron = transformer_wrapper(hidden_states_1b.clone(), timestep_1b.clone(), encoder_hidden_states_1b.clone())[0]
-print('output_neuron:', output_neuron.shape, output_neuron.dtype, output_neuron)  # , output_neuron
+# output_neuron = transformer_wrapper(hidden_states_1b.clone(), timestep_1b.clone(), encoder_hidden_states_1b.clone())[0]
+# print('output_neuron:', output_neuron.shape, output_neuron.dtype, output_neuron)  # , output_neuron
 
-diff = (output_cpu - output_neuron).abs().max()
+# diff = (output_cpu - output_neuron).abs().max()
 
-# 建议添加更详细的数值比较
-print(f"CPU output - mean: {output_cpu.mean():.6f}, std: {output_cpu.std():.6f}")
-print(f"Neuron output - mean: {output_neuron.mean():.6f}, std: {output_neuron.std():.6f}")
-print(f"Max absolute difference: {diff:.6f}")
-print(f"Relative difference: {(diff / output_cpu.abs().max()):.6f}")
+# # 建议添加更详细的数值比较
+# print(f"CPU output - mean: {output_cpu.mean():.6f}, std: {output_cpu.std():.6f}")
+# print(f"Neuron output - mean: {output_neuron.mean():.6f}, std: {output_neuron.std():.6f}")
+# print(f"Max absolute difference: {diff:.6f}")
+# print(f"Relative difference: {(diff / output_cpu.abs().max()):.6f}")
 
-# 检查是否有NaN或Inf
-print(f"CPU has NaN: {torch.isnan(output_cpu).any()}")
-print(f"Neuron has NaN: {torch.isnan(output_neuron).any()}")
+# # 检查是否有NaN或Inf
+# print(f"CPU has NaN: {torch.isnan(output_cpu).any()}")
+# print(f"Neuron has NaN: {torch.isnan(output_neuron).any()}")
