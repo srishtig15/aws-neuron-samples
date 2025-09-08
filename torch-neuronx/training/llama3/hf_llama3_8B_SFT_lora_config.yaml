@@ -1,0 +1,24 @@
+exp_manager:
+    resume_from_checkpoint: ~/converted_hf_style_hf_to_nxdt_tp8pp4/model/
+
+data:
+    train_dir: ~/example_datasets/llama3_8b/training.jsonl
+    val_dir: ~/example_datasets/llama3_8b/validation.json
+    dev_choose_samples: 2250
+    seq_length: 4096
+    tokenizer:
+        type: ~/llama3_tokenizer
+
+model:
+    weight_init_only: True
+
+model_alignment_strategy:
+    sft:
+        packing: True
+    peft:
+        lora_rank: 16
+        lora_alpha: 32
+        lora_dropout: 0.05
+        lora_bias: "none"
+        lora_verbose: True
+        target_modules: ["qkv_proj"]

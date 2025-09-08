@@ -648,7 +648,7 @@ if __name__ == "__main__":
     # Lookup model name by model, resolution
     model_id_lookup = {
         "2.1": {
-            512: "stabilityai/stable-diffusion-2-1-base",
+            512: "stabilityai/stable-diffusion-2-1",
         },
         "1.5": {
             512: "runwayml/stable-diffusion-v1-5"
