@@ -27,3 +27,4 @@ echo "run wan2.2 ti2v latency optimized"
 # export NEURON_RT_NUM_CORES=4
 export NEURON_RT_NUM_CORES=8
 python run_wan2.2_ti2v_latency_optimized.py
+python run_wan2.2_i2v_latency_optimized.py

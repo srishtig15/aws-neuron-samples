@@ -10,6 +10,10 @@ import neuronx_distributed.parallel_layers.utils as neuronx_dist_utils
 import torch
 from torch import nn
 
+# 暂时禁用DistributedRMSNorm，因为all_reduce在编译时有问题
+from distributed_rmsnorm import DistributedRMSNorm
+# DistributedRMSNorm = RMSNorm  # 暂时使用标准RMSNorm
+
 def get_sharded_data(data, dim):
     tp_rank = parallel_state.get_tensor_model_parallel_rank()
     s = data.shape[dim] // parallel_state.get_tensor_model_parallel_size()
@@ -245,7 +249,7 @@ def shard_transformer3d_attn_no_padding(tp_degree: int, attn: Attention, orig_nu
     # 或者修改norm的处理方式
     
     # 方案1：使用gather_output=True（会增加通信开销）
-    use_gather = False  # 可以根据需要调整
+    use_gather = False  # 暂时禁用，因为与rotary embedding不兼容
     
     # 当使用gather时，需要保存原始的heads数量用于unflatten
     if use_gather:
@@ -340,8 +344,8 @@ def shard_transformer3d_attn_no_padding(tp_degree: int, attn: Attention, orig_nu
             old_eps = orig_norm_q.eps if hasattr(orig_norm_q, 'eps') else 1e-5
             old_elementwise_affine = orig_norm_q.elementwise_affine if hasattr(orig_norm_q, 'elementwise_affine') else True
             
-            # 创建新的RMSNorm，使用分片后的维度
-            attn.norm_q = RMSNorm(new_inner_dim, eps=old_eps, elementwise_affine=old_elementwise_affine)
+            # 创建新的DistributedRMSNorm，使用分片后的维度
+            attn.norm_q = DistributedRMSNorm(new_inner_dim, eps=old_eps, elementwise_affine=old_elementwise_affine)
             
             # 分片norm的weight
             if hasattr(orig_norm_q, 'weight') and orig_norm_q.weight is not None:
@@ -352,7 +356,7 @@ def shard_transformer3d_attn_no_padding(tp_degree: int, attn: Attention, orig_nu
             old_eps = orig_norm_k.eps if hasattr(orig_norm_k, 'eps') else 1e-5
             old_elementwise_affine = orig_norm_k.elementwise_affine if hasattr(orig_norm_k, 'elementwise_affine') else True
             
-            attn.norm_k = RMSNorm(new_inner_dim, eps=old_eps, elementwise_affine=old_elementwise_affine)
+            attn.norm_k = DistributedRMSNorm(new_inner_dim, eps=old_eps, elementwise_affine=old_elementwise_affine)
             
             if hasattr(orig_norm_k, 'weight') and orig_norm_k.weight is not None:
                 attn.norm_k.weight.data = get_sharded_data(orig_norm_k.weight.data, 0)
@@ -388,7 +392,7 @@ def shard_transformer3d_attn_no_padding(tp_degree: int, attn: Attention, orig_nu
             orig_norm_added_k = attn.norm_added_k
             old_eps = orig_norm_added_k.eps if hasattr(orig_norm_added_k, 'eps') else 1e-5
             
-            attn.norm_added_k = RMSNorm(new_inner_dim, eps=old_eps, elementwise_affine=False)
+            attn.norm_added_k = DistributedRMSNorm(new_inner_dim, eps=old_eps, elementwise_affine=False)
     
     # 分片to_out
     orig_out = attn.to_out[0]
@@ -525,8 +529,8 @@ def shard_transformer3d_attn(tp_degree: int, attn: Attention):
         if hasattr(attn.norm_q, 'weight') and attn.norm_q.weight is not None:
             orig_weight = attn.norm_q.weight.data
         
-        # 创建新的RMSNorm，使用padding后的维度
-        attn.norm_q = RMSNorm(new_inner_dim, eps=old_eps, elementwise_affine=old_elementwise_affine)  # 使用256
+        # 创建新的DistributedRMSNorm，使用padding后的维度
+        attn.norm_q = DistributedRMSNorm(new_inner_dim, eps=old_eps, elementwise_affine=old_elementwise_affine)  # 使用256
         
         # 设置weight - 先padding原始权重再分片
         if orig_weight is not None and old_elementwise_affine:
@@ -549,7 +553,7 @@ def shard_transformer3d_attn(tp_degree: int, attn: Attention):
         if hasattr(attn.norm_k, 'weight') and attn.norm_k.weight is not None:
             orig_weight = attn.norm_k.weight.data
         
-        attn.norm_k = RMSNorm(new_inner_dim, eps=old_eps, elementwise_affine=old_elementwise_affine)  # 使用256
+        attn.norm_k = DistributedRMSNorm(new_inner_dim, eps=old_eps, elementwise_affine=old_elementwise_affine)  # 使用256
         
         if orig_weight is not None and old_elementwise_affine:
             if orig_weight.shape[0] == orig_inner_dim:
@@ -593,7 +597,7 @@ def shard_transformer3d_attn(tp_degree: int, attn: Attention):
         if hasattr(attn.norm_added_k, 'weight') and attn.norm_added_k.weight is not None:
             orig_weight = attn.norm_added_k.weight.data
         
-        attn.norm_added_k = RMSNorm(new_inner_dim, eps=old_eps, elementwise_affine=old_elementwise_affine)  # 使用256
+        attn.norm_added_k = DistributedRMSNorm(new_inner_dim, eps=old_eps, elementwise_affine=old_elementwise_affine)  # 使用256
         
         if orig_weight is not None and old_elementwise_affine:
             if orig_weight.shape[0] == orig_inner_dim:
