@@ -7,7 +7,8 @@ import shlex
 import subprocess
 import time
 
-WORLD_SIZE=32
+# WORLD_SIZE=32
+WORLD_SIZE=64
 
 def parse_args():
     parser = argparse.ArgumentParser(
