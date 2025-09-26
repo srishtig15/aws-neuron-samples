@@ -1,0 +1,1 @@
+{"default": {"features": {"video": {"_type": "Value"}, "prompt": {"_type": "Value"}}, "splits": {"train": {"name": "train", "dataset_name": "example_video_dataset"}}}}
