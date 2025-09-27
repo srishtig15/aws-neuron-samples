@@ -396,54 +396,54 @@ def train(args):
 
     if not xm.is_master_ordinal(): xm.rendezvous('prepare')
 
-    model_id = args.model_id
-    vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32, low_cpu_mem_usage=True)
-    pipe = WanPipeline.from_pretrained(model_id, vae=vae, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True)
-    # noise_scheduler = UniPCMultistepScheduler.from_pretrained(model_id, subfolder="scheduler")
-    # tokenizer = T5Tokenizer.from_pretrained(model_id, subfolder="tokenizer")
-    # text_encoder = UMT5EncoderModel.from_pretrained(model_id, subfolder="text_encoder", torch_dtype=torch.bfloat16)
-    noise_scheduler = pipe.scheduler
-    tokenizer = pipe.tokenizer
-    text_encoder = pipe.text_encoder
+    # model_id = args.model_id
+    # vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32, low_cpu_mem_usage=True)
+    # pipe = WanPipeline.from_pretrained(model_id, vae=vae, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True)
+    # # noise_scheduler = UniPCMultistepScheduler.from_pretrained(model_id, subfolder="scheduler")
+    # # tokenizer = T5Tokenizer.from_pretrained(model_id, subfolder="tokenizer")
+    # # text_encoder = UMT5EncoderModel.from_pretrained(model_id, subfolder="text_encoder", torch_dtype=torch.bfloat16)
+    # noise_scheduler = pipe.scheduler
+    # tokenizer = pipe.tokenizer
+    # text_encoder = pipe.text_encoder
 
-    # unet = UNet2DConditionModel.from_pretrained(model_id, subfolder="unet")
-    unet = pipe.transformer
-    if os.getenv('NEURON_RT_STOCHASTIC_ROUNDING_EN', None):
-        text_encoder = text_encoder.to(torch.bfloat16)
-        # vae = vae.to(torch.bfloat16)
-        unet = unet.to(torch.bfloat16)
-    unet.requires_grad_(True)
+    # # unet = UNet2DConditionModel.from_pretrained(model_id, subfolder="unet")
+    # unet = pipe.transformer
+    # if os.getenv('NEURON_RT_STOCHASTIC_ROUNDING_EN', None):
+    #     text_encoder = text_encoder.to(torch.bfloat16)
+    #     # vae = vae.to(torch.bfloat16)
+    #     unet = unet.to(torch.bfloat16)
+    # unet.requires_grad_(True)
 
-    xm.master_print("Enabling gradient checkpointing")
-    unet.enable_gradient_checkpointing()
+    # xm.master_print("Enabling gradient checkpointing")
+    # unet.enable_gradient_checkpointing()
 
-    optim_params = unet.parameters()
+    # optim_params = unet.parameters()
 
-    # IMPORTANT: need to move unet to device before we create the optimizer for the optimizer to be training the right parameters (on-device)
-    unet.train()
-    unet.to(device)
+    # # IMPORTANT: need to move unet to device before we create the optimizer for the optimizer to be training the right parameters (on-device)
+    # unet.train()
+    # unet.to(device)
 
-    # Setup VAE and text encoder
-    text_encoder.requires_grad_(False)
-    text_encoder.eval()
-    text_encoder.to(device)
+    # # Setup VAE and text encoder
+    # text_encoder.requires_grad_(False)
+    # text_encoder.eval()
+    # text_encoder.to(device)
 
-    vae.requires_grad_(False)
-    vae.eval()
-    # Needed for vae encoder to not downcast to bf16 with XLA_DOWNCAST_BF16
-    if os.getenv('NEURON_RT_STOCHASTIC_ROUNDING_EN', None):
-        for attn in vae.encoder.mid_block.attentions:
-            # Intent of this is to upcast to fp32, but actual effect under XLA_DOWNCAST_BF16 is to force to bf16.
-            attn.upcast_softmax = False
-        # Set to float64 so that XLA_DOWNCAST_BF16 keeps as FP32
-        vae = vae.to(device=device, dtype=torch.float32)
+    # vae.requires_grad_(False)
+    # vae.eval()
+    # # Needed for vae encoder to not downcast to bf16 with XLA_DOWNCAST_BF16
+    # if os.getenv('NEURON_RT_STOCHASTIC_ROUNDING_EN', None):
+    #     for attn in vae.encoder.mid_block.attentions:
+    #         # Intent of this is to upcast to fp32, but actual effect under XLA_DOWNCAST_BF16 is to force to bf16.
+    #         attn.upcast_softmax = False
+    #     # Set to float64 so that XLA_DOWNCAST_BF16 keeps as FP32
+    #     vae = vae.to(device=device, dtype=torch.float32)
 
-    # TODO: parametrize optimizer parameters
-    if is_pt_2_x:
-        optimizer_class = AdamW_FP32OptimParams
-    else:
-        optimizer_class = AdamW
-    optimizer = ZeroRedundancyOptimizer(optim_params, optimizer_class, pin_layout=False, lr=1e-5, betas=(0.9, 0.999), weight_decay=1e-2, eps=1e-08, capturable=True, optimizer_dtype=torch.float32)
+    # # TODO: parametrize optimizer parameters
+    # if is_pt_2_x:
+    #     optimizer_class = AdamW_FP32OptimParams
+    # else:
+    #     optimizer_class = AdamW
+    # optimizer = ZeroRedundancyOptimizer(optim_params, optimizer_class, pin_layout=False, lr=1e-5, betas=(0.9, 0.999), weight_decay=1e-2, eps=1e-08, capturable=True, optimizer_dtype=torch.float32)
 
     # Download the dataset
     xm.master_print('Downloading dataset')
@@ -473,269 +473,273 @@ def train(args):
         ),
     )
     
-    # args.model_paths = None
-    # args.model_id_with_origin_paths = "Wan-AI/Wan2.1-T2V-1.3B:diffusion_pytorch_model*.safetensors,Wan-AI/Wan2.1-T2V-1.3B:models_t5_umt5-xxl-enc-bf16.pth,Wan-AI/Wan2.1-T2V-1.3B:Wan2.1_VAE.pth"
-    # args.trainable_models = "dit"
-    # args.learning_rate = 1e-4
-    # args.num_epochs = 5
-    # args.remove_prefix_in_ckpt = "pipe.dit."
-    # args.output_path = "./models/train/Wan2.1-T2V-1.3B_lora"
-    # args.lora_base_model = "dit"
-    # args.lora_target_modules = "q,k,v,o,ffn.0,ffn.2"
-    # args.lora_rank = 32
-    # args.lora_checkpoint = None
-    # args.use_gradient_checkpointing_offload = False
-    # args.extra_inputs = None
-    # args.max_timestep_boundary = 1.0
-    # args.min_timestep_boundary = 0.0
-    # model = WanTrainingModule(
-    #     model_paths=args.model_paths,
-    #     model_id_with_origin_paths=args.model_id_with_origin_paths,
-    #     trainable_models=args.trainable_models,
-    #     lora_base_model=args.lora_base_model,
-    #     lora_target_modules=args.lora_target_modules,
-    #     lora_rank=args.lora_rank,
-    #     lora_checkpoint=args.lora_checkpoint,
-    #     use_gradient_checkpointing_offload=args.use_gradient_checkpointing_offload,
-    #     extra_inputs=args.extra_inputs,
-    #     max_timestep_boundary=args.max_timestep_boundary,
-    #     min_timestep_boundary=args.min_timestep_boundary,
+    args.model_paths = None
+    args.model_id_with_origin_paths = "Wan-AI/Wan2.1-T2V-1.3B:diffusion_pytorch_model*.safetensors,Wan-AI/Wan2.1-T2V-1.3B:models_t5_umt5-xxl-enc-bf16.pth,Wan-AI/Wan2.1-T2V-1.3B:Wan2.1_VAE.pth"
+    args.trainable_models = "dit"
+    args.learning_rate = 1e-4
+    args.num_epochs = 5
+    args.remove_prefix_in_ckpt = "pipe.dit."
+    args.output_path = "./models/train/Wan2.1-T2V-1.3B_lora"
+    args.lora_base_model = "dit"
+    args.lora_target_modules = "q,k,v,o,ffn.0,ffn.2"
+    args.lora_rank = 32
+    args.lora_checkpoint = None
+    args.use_gradient_checkpointing_offload = False
+    args.extra_inputs = None
+    args.max_timestep_boundary = 1.0
+    args.min_timestep_boundary = 0.0
+    args.find_unused_parameters = False
+    args.save_steps = None
+    args.dataset_num_workers = 0
+    args.weight_decay = 0.01
+    model = WanTrainingModule(
+        model_paths=args.model_paths,
+        model_id_with_origin_paths=args.model_id_with_origin_paths,
+        trainable_models=args.trainable_models,
+        lora_base_model=args.lora_base_model,
+        lora_target_modules=args.lora_target_modules,
+        lora_rank=args.lora_rank,
+        lora_checkpoint=args.lora_checkpoint,
+        use_gradient_checkpointing_offload=args.use_gradient_checkpointing_offload,
+        extra_inputs=args.extra_inputs,
+        max_timestep_boundary=args.max_timestep_boundary,
+        min_timestep_boundary=args.min_timestep_boundary,
+    )
+    model_logger = ModelLogger(
+        args.output_path,
+        remove_prefix_in_ckpt=args.remove_prefix_in_ckpt
+    )
+    launch_training_task(dataset, model, model_logger, args=args)
+
+    # # Done anything that might trigger a download
+    # xm.master_print("Executing `if xm.is_master_ordinal(): xm.rendezvous('prepare')`")
+    # if xm.is_master_ordinal(): xm.rendezvous('prepare')
+
+    # def training_metrics_closure(epoch, global_step, loss):
+    #     loss_val = loss.detach().to('cpu').item()
+    #     loss_f.write(f"{LOCAL_RANK} {epoch} {global_step} {loss_val}\n")
+    #     loss_f.flush()
+
+    # xm.rendezvous('prepare-to-load-checkpoint')
+
+    # loss_filename = f"LOSSES-RANK-{LOCAL_RANK}.txt"
+
+    # if args.resume_from_checkpoint:
+    #     start_epoch, start_step, cumulative_train_step = load_checkpoint(args.results_dir, unet, optimizer, device, args.resume_checkpoint_step)
+    #     loss_f = open(loss_filename, 'a')
+    # else:
+    #     start_epoch = 0
+    #     start_step = 0
+    #     cumulative_train_step = 0
+
+    #     loss_f = open(loss_filename, 'w')
+    #     loss_f.write("RANK EPOCH STEP LOSS\n")
+
+    # xm.rendezvous('done-loading-checkpoint')
+
+    # lr_scheduler = get_scheduler(
+    #     "constant",
+    #     optimizer=optimizer
     # )
-    # model_logger = ModelLogger(
-    #     args.output_path,
-    #     remove_prefix_in_ckpt=args.remove_prefix_in_ckpt
+
+    # parameters = filter(lambda p: p.requires_grad, unet.parameters())
+    # parameters = sum([np.prod(p.size()) * p.element_size() for p in parameters]) / (1024 ** 2)
+    # xm.master_print('Trainable Parameters: %.3fMB' % parameters)
+    # total_parameters = 0
+    # components = [text_encoder, vae, unet]
+    # for component in components:
+    #     total_parameters += sum([np.prod(p.size()) * p.element_size() for p in component.parameters()]) / (1024 ** 2)
+    # xm.master_print('Total parameters: %.3fMB' % total_parameters)
+
+    # resolution = args.resolution
+    # training_transforms = transforms.Compose(
+    #     [
+    #         transforms.Resize(resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+    #         transforms.RandomCrop(resolution),
+    #         transforms.Lambda(lambda x: x),
+    #         transforms.ToTensor(),
+    #         transforms.Normalize([0.5], [0.5]),
+    #     ]
     # )
-    # launch_training_task(dataset, model, model_logger, args=args)
 
-    # Done anything that might trigger a download
-    xm.master_print("Executing `if xm.is_master_ordinal(): xm.rendezvous('prepare')`")
-    if xm.is_master_ordinal(): xm.rendezvous('prepare')
+    # def tokenize_captions(examples, is_train=True):
+    #     captions = []
+    #     for caption in examples[caption_column_name]:
+    #         if isinstance(caption, str):
+    #             captions.append(caption)
+    #         elif isinstance(caption, (list, np.ndarray)):
+    #             # take a random caption if there are multiple
+    #             captions.append(random.choice(caption) if is_train else caption[0])
+    #         else:
+    #             raise ValueError(
+    #                 f"Caption column `{caption_column_name}` should contain either strings or lists of strings."
+    #             )
+    #     inputs = tokenizer(
+    #         captions, max_length=512, padding="max_length", truncation=True, return_tensors="pt"  # TODO: tokenizer.model_max_length
+    #     )
+    #     return inputs.input_ids
 
-    def training_metrics_closure(epoch, global_step, loss):
-        loss_val = loss.detach().to('cpu').item()
-        loss_f.write(f"{LOCAL_RANK} {epoch} {global_step} {loss_val}\n")
-        loss_f.flush()
+    # train_dataset = dataset
+    # args.dataset_size = len(train_dataset)
 
-    xm.rendezvous('prepare-to-load-checkpoint')
+    # # Create dataloaders
+    # world_size = xr.world_size()
+    # train_sampler = None
+    # if world_size > 1:
+    #     train_sampler = DistributedSampler(train_dataset,
+    #                                        num_replicas=world_size,
+    #                                        rank=xr.global_ordinal(),
+    #                                        shuffle=True)
 
-    loss_filename = f"LOSSES-RANK-{LOCAL_RANK}.txt"
+    # # drop_last=True needed to avoid cases of an incomplete final batch, which would result in new graphs being cut and compiled
+    # train_dataloader = torch.utils.data.DataLoader(
+    #     train_dataset, shuffle=False if train_sampler else True, collate_fn=lambda x: x[0], batch_size=args.batch_size, sampler=train_sampler, drop_last=True
+    # )
 
-    if args.resume_from_checkpoint:
-        start_epoch, start_step, cumulative_train_step = load_checkpoint(args.results_dir, unet, optimizer, device, args.resume_checkpoint_step)
-        loss_f = open(loss_filename, 'a')
-    else:
-        start_epoch = 0
-        start_step = 0
-        cumulative_train_step = 0
+    # train_device_loader = xpl.MpDeviceLoader(train_dataloader, device, device_prefetch_size=2)
 
-        loss_f = open(loss_filename, 'w')
-        loss_f.write("RANK EPOCH STEP LOSS\n")
+    # xm.master_print('Entering training loop')
+    # xm.rendezvous('training-loop-start')
 
-    xm.rendezvous('done-loading-checkpoint')
+    # if not is_pt_2_x:
+    #     found_inf = torch.tensor(0, dtype=torch.double, device=device)
+    # checkpoints_saved = 0
 
-    lr_scheduler = get_scheduler(
-        "constant",
-        optimizer=optimizer
-    )
+    # # Use a moving average window size of 100 so we have a large sample at
+    # # the end of training
+    # throughput_helper = Throughput(args.batch_size, world_size, args.gradient_accumulation_steps, moving_avg_window_size=100)
 
-    parameters = filter(lambda p: p.requires_grad, unet.parameters())
-    parameters = sum([np.prod(p.size()) * p.element_size() for p in parameters]) / (1024 ** 2)
-    xm.master_print('Trainable Parameters: %.3fMB' % parameters)
-    total_parameters = 0
-    components = [text_encoder, vae, unet]
-    for component in components:
-        total_parameters += sum([np.prod(p.size()) * p.element_size() for p in component.parameters()]) / (1024 ** 2)
-    xm.master_print('Total parameters: %.3fMB' % total_parameters)
+    # for epoch in range(start_epoch, args.epochs):
+    #     start_epoch_time = time.perf_counter_ns()
+    #     before_batch_load_time = time.perf_counter_ns()
+    #     xm.master_print("####################################")
+    #     xm.master_print(f"###### Starting epoch {epoch} ######")
+    #     xm.master_print("####################################")
+    #     # Add 1 to the start_step so that we don't repeat the step we saved the checkpoint after
+    #     for step, batch in enumerate(train_device_loader, start=(start_step + 1 if epoch == start_epoch else 0)):
+    #         after_batch_load_time = time.perf_counter_ns()
 
-    resolution = args.resolution
-    training_transforms = transforms.Compose(
-        [
-            transforms.Resize(resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.RandomCrop(resolution),
-            transforms.Lambda(lambda x: x),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
-        ]
-    )
+    #         xm.master_print(f"*** Running epoch {epoch} step {step} (cumulative step {cumulative_train_step})", flush=True)
+    #         start_time = time.perf_counter_ns()
 
-    def tokenize_captions(examples, is_train=True):
-        captions = []
-        for caption in examples[caption_column_name]:
-            if isinstance(caption, str):
-                captions.append(caption)
-            elif isinstance(caption, (list, np.ndarray)):
-                # take a random caption if there are multiple
-                captions.append(random.choice(caption) if is_train else caption[0])
-            else:
-                raise ValueError(
-                    f"Caption column `{caption_column_name}` should contain either strings or lists of strings."
-                )
-        inputs = tokenizer(
-            captions, max_length=512, padding="max_length", truncation=True, return_tensors="pt"  # TODO: tokenizer.model_max_length
-        )
-        return inputs.input_ids
+    #         # Convert input image to latent space and add noise
+    #         with torch.no_grad():
+    #             print('batch:', batch)
+    #             vae_inputs_batched = batch['pixel_values']
+    #             vae_inputs_unbatched = torch.split(vae_inputs_batched, 1, dim=0)
 
-    train_dataset = dataset
-    args.dataset_size = len(train_dataset)
+    #             vae_outputs = []
+    #             # Intentionally unroll the VAE execution here. Compiler produces poor QoR for the VAE at batch > 1
+    #             for vae_input in vae_inputs_unbatched:
+    #                 vae_input = vae_input.unsqueeze(2).repeat(1, 1, 4, 1, 1)  # TODO: 在第2维增加一维（num_frame=4），然后复制num_frame次，之后需要改pixel_values
+    #                 print('vae_input:', vae_input.shape)
+    #                 these_latents = vae.encode(vae_input).latent_dist.sample()
+    #                 these_latents = these_latents * 0.18215
+    #                 if os.getenv('NEURON_RT_STOCHASTIC_ROUNDING_EN', None):
+    #                     these_latents = these_latents.to(torch.bfloat16)  # Cast latents to bf16 (under XLA_DOWNCAST_BF16)
 
-    # Create dataloaders
-    world_size = xr.world_size()
-    train_sampler = None
-    if world_size > 1:
-        train_sampler = DistributedSampler(train_dataset,
-                                           num_replicas=world_size,
-                                           rank=xr.global_ordinal(),
-                                           shuffle=True)
+    #                 vae_outputs.append(these_latents)
+    #             latents = torch.cat(vae_outputs, dim=0)
 
-    # drop_last=True needed to avoid cases of an incomplete final batch, which would result in new graphs being cut and compiled
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset, shuffle=False if train_sampler else True, collate_fn=lambda x: x[0], batch_size=args.batch_size, sampler=train_sampler, drop_last=True
-    )
+    #             del vae_inputs_batched
+    #             del vae_inputs_unbatched
+    #             del vae_input
+    #             del vae_outputs
+    #             del these_latents
 
-    train_device_loader = xpl.MpDeviceLoader(train_dataloader, device, device_prefetch_size=2)
+    #         gc.collect()
 
-    xm.master_print('Entering training loop')
-    xm.rendezvous('training-loop-start')
+    #         # mark_step here to separate VAE into its own graph. Results in better compiler QoR.
+    #         xm.mark_step()
 
-    if not is_pt_2_x:
-        found_inf = torch.tensor(0, dtype=torch.double, device=device)
-    checkpoints_saved = 0
+    #         with torch.no_grad():
+    #             noise = torch.randn(latents.size(), dtype=latents.dtype, layout=latents.layout, device='cpu')
+    #             noise = noise.to(device=device)
+    #             bsz = latents.shape[0]
 
-    # Use a moving average window size of 100 so we have a large sample at
-    # the end of training
-    throughput_helper = Throughput(args.batch_size, world_size, args.gradient_accumulation_steps, moving_avg_window_size=100)
+    #             timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,))
+    #             timesteps = timesteps.to(device=device)
 
-    for epoch in range(start_epoch, args.epochs):
-        start_epoch_time = time.perf_counter_ns()
-        before_batch_load_time = time.perf_counter_ns()
-        xm.master_print("####################################")
-        xm.master_print(f"###### Starting epoch {epoch} ######")
-        xm.master_print("####################################")
-        # Add 1 to the start_step so that we don't repeat the step we saved the checkpoint after
-        for step, batch in enumerate(train_device_loader, start=(start_step + 1 if epoch == start_epoch else 0)):
-            after_batch_load_time = time.perf_counter_ns()
+    #             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-            xm.master_print(f"*** Running epoch {epoch} step {step} (cumulative step {cumulative_train_step})", flush=True)
-            start_time = time.perf_counter_ns()
+    #             # Run text encoder on caption
+    #             encoder_hidden_states = text_encoder(batch["input_ids"])[0]
 
-            # Convert input image to latent space and add noise
-            with torch.no_grad():
-                print('batch:', batch)
-                vae_inputs_batched = batch['pixel_values']
-                vae_inputs_unbatched = torch.split(vae_inputs_batched, 1, dim=0)
+    #             target = noise
 
-                vae_outputs = []
-                # Intentionally unroll the VAE execution here. Compiler produces poor QoR for the VAE at batch > 1
-                for vae_input in vae_inputs_unbatched:
-                    vae_input = vae_input.unsqueeze(2).repeat(1, 1, 4, 1, 1)  # TODO: 在第2维增加一维（num_frame=4），然后复制num_frame次，之后需要改pixel_values
-                    print('vae_input:', vae_input.shape)
-                    these_latents = vae.encode(vae_input).latent_dist.sample()
-                    these_latents = these_latents * 0.18215
-                    if os.getenv('NEURON_RT_STOCHASTIC_ROUNDING_EN', None):
-                        these_latents = these_latents.to(torch.bfloat16)  # Cast latents to bf16 (under XLA_DOWNCAST_BF16)
+    #         # UNet forward pass
+    #         model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+    #         # Calculate loss
+    #         loss = functional.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
-                    vae_outputs.append(these_latents)
-                latents = torch.cat(vae_outputs, dim=0)
+    #         # Add in extra mark_steps to split the model into FWD / BWD / optimizer - helps with compiler QoR and thus
+    #         # model fit
+    #         # TODO: parametrize how the script splits the model
+    #         xm.mark_step()
 
-                del vae_inputs_batched
-                del vae_inputs_unbatched
-                del vae_input
-                del vae_outputs
-                del these_latents
+    #         # Backwards pass
+    #         loss.backward()
 
-            gc.collect()
-
-            # mark_step here to separate VAE into its own graph. Results in better compiler QoR.
-            xm.mark_step()
-
-            with torch.no_grad():
-                noise = torch.randn(latents.size(), dtype=latents.dtype, layout=latents.layout, device='cpu')
-                noise = noise.to(device=device)
-                bsz = latents.shape[0]
-
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,))
-                timesteps = timesteps.to(device=device)
-
-                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
-                # Run text encoder on caption
-                encoder_hidden_states = text_encoder(batch["input_ids"])[0]
-
-                target = noise
-
-            # UNet forward pass
-            model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
-            # Calculate loss
-            loss = functional.mse_loss(model_pred.float(), target.float(), reduction="mean")
-
-            # Add in extra mark_steps to split the model into FWD / BWD / optimizer - helps with compiler QoR and thus
-            # model fit
-            # TODO: parametrize how the script splits the model
-            xm.mark_step()
-
-            # Backwards pass
-            loss.backward()
-
-            xm.mark_step()
+    #         xm.mark_step()
 
 
-            with torch.no_grad():
-                # Optimizer
-                if (cumulative_train_step + 1) % args.gradient_accumulation_steps == 0:
-                    if is_pt_2_x:
-                        optimizer.step()
-                    else:
-                        optimizer.step(found_inf=found_inf)
-                    lr_scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
-                    xm.master_print("Finished weight update")
-                    throughput_helper.step()
-                else:
-                    xm.master_print("Accumulating gradients")
+    #         with torch.no_grad():
+    #             # Optimizer
+    #             if (cumulative_train_step + 1) % args.gradient_accumulation_steps == 0:
+    #                 if is_pt_2_x:
+    #                     optimizer.step()
+    #                 else:
+    #                     optimizer.step(found_inf=found_inf)
+    #                 lr_scheduler.step()
+    #                 optimizer.zero_grad(set_to_none=True)
+    #                 xm.master_print("Finished weight update")
+    #                 throughput_helper.step()
+    #             else:
+    #                 xm.master_print("Accumulating gradients")
 
-            xm.add_step_closure(training_metrics_closure, (epoch, step, loss.detach()), run_async=True)
+    #         xm.add_step_closure(training_metrics_closure, (epoch, step, loss.detach()), run_async=True)
 
-            xm.mark_step()
+    #         xm.mark_step()
 
-            xm.master_print(f"*** Finished epoch {epoch} step {step} (cumulative step {cumulative_train_step})")
-            e2e_time = time.perf_counter_ns()
-            xm.master_print(f" > E2E for epoch {epoch} step {step} took {e2e_time - before_batch_load_time} ns")
+    #         xm.master_print(f"*** Finished epoch {epoch} step {step} (cumulative step {cumulative_train_step})")
+    #         e2e_time = time.perf_counter_ns()
+    #         xm.master_print(f" > E2E for epoch {epoch} step {step} took {e2e_time - before_batch_load_time} ns")
 
-            cumulative_train_step += 1
+    #         cumulative_train_step += 1
 
-            # Checkpoint if needed
-            if args.checkpointing_steps is not None and cumulative_train_step % args.checkpointing_steps == 0 and cumulative_train_step != 0:
-                xm.rendezvous('prepare-to-save-checkpoint')
-                save_checkpoint(args.results_dir, unet, optimizer, epoch, step, cumulative_train_step)
-                checkpoints_saved += 1
-                xm.rendezvous('done-saving-checkpoint')
+    #         # Checkpoint if needed
+    #         if args.checkpointing_steps is not None and cumulative_train_step % args.checkpointing_steps == 0 and cumulative_train_step != 0:
+    #             xm.rendezvous('prepare-to-save-checkpoint')
+    #             save_checkpoint(args.results_dir, unet, optimizer, epoch, step, cumulative_train_step)
+    #             checkpoints_saved += 1
+    #             xm.rendezvous('done-saving-checkpoint')
 
-            before_batch_load_time = time.perf_counter_ns()
+    #         before_batch_load_time = time.perf_counter_ns()
 
-            # Only need a handful of training steps for graph extraction. Cut it off so we don't take forever when
-            # using a large dataset.
-            if os.environ.get("NEURON_EXTRACT_GRAPHS_ONLY", None) and cumulative_train_step > 5:
-                break
+    #         # Only need a handful of training steps for graph extraction. Cut it off so we don't take forever when
+    #         # using a large dataset.
+    #         if os.environ.get("NEURON_EXTRACT_GRAPHS_ONLY", None) and cumulative_train_step > 5:
+    #             break
 
-        if args.save_model_epochs is not None and epoch % args.save_model_epochs == 0 and not os.environ.get("NEURON_EXTRACT_GRAPHS_ONLY", None):
-            save_pipeline(args.results_dir + f"-EPOCH_{epoch}", args.model_id, unet, vae, text_encoder)
+    #     if args.save_model_epochs is not None and epoch % args.save_model_epochs == 0 and not os.environ.get("NEURON_EXTRACT_GRAPHS_ONLY", None):
+    #         save_pipeline(args.results_dir + f"-EPOCH_{epoch}", args.model_id, unet, vae, text_encoder)
 
-        end_epoch_time = time.perf_counter_ns()
-        xm.master_print(f" Entire epoch {epoch} took {(end_epoch_time - start_epoch_time) / (10 ** 9)} s")
-        xm.master_print(f" Given {step + 1} many steps, e2e per iteration is {(end_epoch_time - start_epoch_time) / (step + 1) / (10 ** 6)} ms")
-        xm.master_print(f"!!! Finished epoch {epoch}")
+    #     end_epoch_time = time.perf_counter_ns()
+    #     xm.master_print(f" Entire epoch {epoch} took {(end_epoch_time - start_epoch_time) / (10 ** 9)} s")
+    #     xm.master_print(f" Given {step + 1} many steps, e2e per iteration is {(end_epoch_time - start_epoch_time) / (step + 1) / (10 ** 6)} ms")
+    #     xm.master_print(f"!!! Finished epoch {epoch}")
 
-        # Only need a handful of training steps for graph extraction. Cut it off so we don't take forever when
-        # using a large dataset.
-        if os.environ.get("NEURON_EXTRACT_GRAPHS_ONLY", None) and cumulative_train_step > 5:
-            break
+    #     # Only need a handful of training steps for graph extraction. Cut it off so we don't take forever when
+    #     # using a large dataset.
+    #     if os.environ.get("NEURON_EXTRACT_GRAPHS_ONLY", None) and cumulative_train_step > 5:
+    #         break
 
-    # Save the trained model for use in inference
-    xm.rendezvous('finish-training')
-    if xm.is_master_ordinal() and not os.environ.get("NEURON_EXTRACT_GRAPHS_ONLY", None):
-        save_pipeline(os.path.join(args.results_dir, "wan_trained_model_neuron"), args.model_id, unet, vae, text_encoder)
+    # # Save the trained model for use in inference
+    # xm.rendezvous('finish-training')
+    # if xm.is_master_ordinal() and not os.environ.get("NEURON_EXTRACT_GRAPHS_ONLY", None):
+    #     save_pipeline(os.path.join(args.results_dir, "wan_trained_model_neuron"), args.model_id, unet, vae, text_encoder)
 
-    loss_f.close()
+    # loss_f.close()
 
     xm.master_print(f"!!! Finished all epochs")
 

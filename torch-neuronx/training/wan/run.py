@@ -16,7 +16,7 @@ def parse_args():
 
     parser.add_argument('--model', choices=['Wan-AI/Wan2.1-T2V-1.3B-Diffusers', 'Wan-AI/Wan2.2-TI2V-5B-Diffusers'], default='Wan-AI/Wan2.1-T2V-1.3B-Diffusers', help='Which model to train')
     parser.add_argument('--resolution', choices=[512], default=512, type=int, help='Which resolution of model to train')
-    parser.add_argument('--batch_size', type=int, default=2, help='What per-device microbatch size to use')
+    parser.add_argument('--batch_size', type=int, default=1, help='What per-device microbatch size to use')
     parser.add_argument('--gradient_accumulation_steps', type=int, default=2, help='How many gradient accumulation steps to do (1 for no gradient accumulation)')
     parser.add_argument('--epochs', type=int, default=6, help='How many epochs to train for')
 
@@ -51,7 +51,7 @@ def parse_args():
     parser.add_argument('--neuron_rt_stochastic_rounding_seed', type=int, default=0, help="The setting for the NEURON_RT_STOCHASTIC_ROUNDING_SEED, which controls the seed for stochastic rounding.")
 
     # Path to dir containing the training and inference scripts
-    parser.add_argument('--training_script_path', type=str, default="./wan_neuron.py", help="Path to the training script (wan_neuron.py)")
+    parser.add_argument('--training_script_path', type=str, default="./wan_neuron_origin.py", help="Path to the training script (wan_neuron.py)")
 
     args = parser.parse_args()
 
