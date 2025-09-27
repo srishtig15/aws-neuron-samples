@@ -275,7 +275,7 @@ def seed_rng(device):
 ###                                                                          ###
 ################################################################################
 
-def forward_preprocess(data, pipe, device, tokenizer, text_encoder, vae, use_gradient_checkpointing=True, max_frames=16):
+def forward_preprocess(data, pipe, device, tokenizer, text_encoder, vae, use_gradient_checkpointing=True, max_frames=4):
     """预处理UnifiedDataset的数据为WAN模型需要的格式"""
 
     # data["video"] is a list of batches, each batch is a list of PIL Images
@@ -325,6 +325,9 @@ def forward_preprocess(data, pipe, device, tokenizer, text_encoder, vae, use_gra
 
 def train(args):
     LOCAL_RANK = xr.global_ordinal()
+
+    # Get max_frames from args or use default
+    max_frames = getattr(args, 'max_frames', 4)
 
     # Create all the components of our model pipeline and training loop
     xm.master_print('Building training loop components')
@@ -544,7 +547,7 @@ def train(args):
 
             # Use forward_preprocess to prepare data for WAN model
             # Limit frames to reduce memory usage
-            inputs = forward_preprocess(batch, pipe, device, tokenizer, text_encoder, vae, use_gradient_checkpointing=True, max_frames=16)
+            inputs = forward_preprocess(batch, pipe, device, tokenizer, text_encoder, vae, use_gradient_checkpointing=True, max_frames=max_frames)
 
             # Since WanPipeline doesn't have training_loss, we need to implement the forward pass manually
             # This is a simplified training loop - you'll need to adjust based on WAN's actual training requirements
@@ -562,7 +565,7 @@ def train(args):
 
             # Process all video frames for each batch
             batch_video_tensors = []
-            max_frames = 16  # Limit frames to reduce memory usage
+            max_frames = 4  # Limit frames to reduce memory usage (set to 4 for safety)
             for batch_idx, batch_videos in enumerate(video_frames):
                 # Convert all frames in this batch to tensors
                 frame_tensors = []
@@ -792,6 +795,7 @@ def parse_args():
     parser.add_argument('--model', choices=['Wan-AI/Wan2.1-T2V-1.3B-Diffusers', 'Wan-AI/Wan2.2-TI2V-5B-Diffusers'], help='Which model to train')
     parser.add_argument('--resolution', choices=[512, 768], type=int, help='Which resolution of model to train')
     parser.add_argument('--batch_size', type=int, help='What per-device microbatch size to use')
+    parser.add_argument('--max_frames', type=int, default=4, help='Maximum number of video frames to process (default: 4, use lower values to save memory)')
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help='How many gradient accumulation steps to do (1 for no gradient accumulation)')
     parser.add_argument('--epochs', type=int, default=2000, help='How many epochs to train for')
 
