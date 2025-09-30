@@ -18,6 +18,10 @@ from typing import Union
 
 # Neuron
 from neuronx_distributed.utils.adamw_fp32_optim_params import AdamW_FP32OptimParams
+from neuronx_distributed.parallel_layers import parallel_state
+from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, RowParallelLinear
+from neuronx_distributed.parallel_layers.pad import get_number_of_extra_heads, pad_model
+import neuronx_distributed.parallel_layers.utils as neuronx_dist_utils
 import torch_xla.core.xla_model as xm
 
 # General ML stuff
@@ -96,6 +100,144 @@ LOSS_FILE_FSTRING = "LOSSES-RANK-{RANK}.txt"
 ###                           HELPER FUNCTIONS                               ###
 ###                                                                          ###
 ################################################################################
+
+# Tensor Parallel sharding functions
+def get_sharded_data(data, dim):
+    """Get sharded data based on tensor parallel rank"""
+    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    s = data.shape[dim] // parallel_state.get_tensor_model_parallel_size()
+    if dim == 0:
+        return data[s * tp_rank : s * (tp_rank + 1)].clone()
+    elif dim == 1:
+        return data[:, s * tp_rank : s * (tp_rank + 1)].clone()
+
+def shard_wan_transformer_attention(tp_degree: int, attn):
+    """Shard Wan transformer attention layers for tensor parallelism"""
+    from diffusers.models.attention_processor import Attention
+    from diffusers.models.normalization import RMSNorm
+
+    orig_inner_dim = attn.to_q.out_features
+    dim_head = orig_inner_dim // attn.heads
+    orig_num_heads = attn.heads
+
+    # Check if padding is needed
+    extra_heads = get_number_of_extra_heads(attn.heads, tp_degree)
+    xm.master_print(f"  Sharding attention: {orig_num_heads} heads, extra_heads={extra_heads}")
+
+    if extra_heads == 0:
+        # No padding needed
+        attn.heads = orig_num_heads // tp_degree
+        attn.sliceable_head_dim = attn.heads
+        attn.inner_dim = dim_head * attn.heads
+
+        # Shard Q/K/V
+        orig_q = attn.to_q
+        attn.to_q = ColumnParallelLinear(
+            orig_q.in_features, orig_q.out_features,
+            bias=(orig_q.bias is not None), gather_output=False)
+        attn.to_q.weight.data = get_sharded_data(orig_q.weight.data, 0)
+        if orig_q.bias is not None:
+            attn.to_q.bias.data = get_sharded_data(orig_q.bias.data, 0)
+        del orig_q
+
+        orig_k = attn.to_k
+        attn.to_k = ColumnParallelLinear(
+            orig_k.in_features, orig_k.out_features,
+            bias=(orig_k.bias is not None), gather_output=False)
+        attn.to_k.weight.data = get_sharded_data(orig_k.weight.data, 0)
+        if orig_k.bias is not None:
+            attn.to_k.bias.data = get_sharded_data(orig_k.bias.data, 0)
+        del orig_k
+
+        orig_v = attn.to_v
+        attn.to_v = ColumnParallelLinear(
+            orig_v.in_features, orig_v.out_features,
+            bias=(orig_v.bias is not None), gather_output=False)
+        attn.to_v.weight.data = get_sharded_data(orig_v.weight.data, 0)
+        if orig_v.bias is not None:
+            attn.to_v.bias.data = get_sharded_data(orig_v.bias.data, 0)
+        del orig_v
+
+        # Shard norm layers if present
+        if hasattr(attn, 'norm_q') and attn.norm_q is not None:
+            orig_norm_q = attn.norm_q
+            attn.norm_q = RMSNorm(
+                attn.inner_dim,
+                eps=orig_norm_q.eps if hasattr(orig_norm_q, 'eps') else 1e-5,
+                elementwise_affine=orig_norm_q.elementwise_affine if hasattr(orig_norm_q, 'elementwise_affine') else True
+            )
+            if hasattr(orig_norm_q, 'weight') and orig_norm_q.weight is not None:
+                attn.norm_q.weight.data = get_sharded_data(orig_norm_q.weight.data, 0)
+
+        if hasattr(attn, 'norm_k') and attn.norm_k is not None:
+            orig_norm_k = attn.norm_k
+            attn.norm_k = RMSNorm(
+                attn.inner_dim,
+                eps=orig_norm_k.eps if hasattr(orig_norm_k, 'eps') else 1e-5,
+                elementwise_affine=orig_norm_k.elementwise_affine if hasattr(orig_norm_k, 'elementwise_affine') else True
+            )
+            if hasattr(orig_norm_k, 'weight') and orig_norm_k.weight is not None:
+                attn.norm_k.weight.data = get_sharded_data(orig_norm_k.weight.data, 0)
+
+        # Shard output projection
+        orig_out = attn.to_out[0]
+        attn.to_out[0] = RowParallelLinear(
+            orig_out.in_features, orig_out.out_features,
+            bias=(orig_out.bias is not None), input_is_parallel=True)
+        attn.to_out[0].weight.data = get_sharded_data(orig_out.weight.data, 1)
+        if orig_out.bias is not None:
+            attn.to_out[0].bias.data = orig_out.bias.data.detach()
+        del orig_out
+
+        pad_model(attn, tp_degree, orig_num_heads, wrapped_classes=(Attention,))
+
+    return attn
+
+def shard_wan_transformer_feedforward(ff):
+    """Shard Wan transformer feedforward layers for tensor parallelism"""
+    # Shard the first linear layer (column parallel)
+    orig_proj = ff.net[0].proj
+    ff.net[0].proj = ColumnParallelLinear(
+        orig_proj.in_features, orig_proj.out_features,
+        bias=(orig_proj.bias is not None), gather_output=False)
+    ff.net[0].proj.weight.data = get_sharded_data(orig_proj.weight.data, 0)
+    if orig_proj.bias is not None:
+        ff.net[0].proj.bias.data = get_sharded_data(orig_proj.bias.data, 0)
+    del orig_proj
+
+    # Shard the second linear layer (row parallel)
+    orig_linear = ff.net[2]
+    ff.net[2] = RowParallelLinear(
+        orig_linear.in_features, orig_linear.out_features,
+        bias=(orig_linear.bias is not None), input_is_parallel=True)
+    ff.net[2].weight.data = get_sharded_data(orig_linear.weight.data, 1)
+    if orig_linear.bias is not None:
+        ff.net[2].bias.data = orig_linear.bias.data.detach()
+    del orig_linear
+
+    return ff
+
+def shard_wan_transformer(transformer, tp_degree):
+    """Apply tensor parallelism to Wan transformer model"""
+    xm.master_print(f"Sharding Wan transformer with TP degree {tp_degree}")
+
+    # Shard each transformer block
+    for block_id, block in enumerate(transformer.transformer_blocks):
+        xm.master_print(f"  Sharding block {block_id}")
+
+        # Shard attention layers
+        if hasattr(block, 'attn1'):
+            block.attn1 = shard_wan_transformer_attention(tp_degree, block.attn1)
+        if hasattr(block, 'attn2'):
+            block.attn2 = shard_wan_transformer_attention(tp_degree, block.attn2)
+
+        # Shard feedforward layer
+        if hasattr(block, 'ff'):
+            block.ff = shard_wan_transformer_feedforward(block.ff)
+
+    xm.master_print("Finished sharding Wan transformer")
+    return transformer
+
 # For measuring throughput
 class Throughput:
     def __init__(self, batch_size=8, data_parallel_degree=2, grad_accum_usteps=1, moving_avg_window_size=10):
@@ -328,6 +470,13 @@ def train(args):
 
     # Get max_frames from args or use default
     max_frames = getattr(args, 'max_frames', 4)
+    xm.master_print(f'Using max_frames={max_frames} to limit video frames for memory efficiency')
+
+    # Initialize tensor parallelism
+    tp_degree = getattr(args, 'tensor_parallel_degree', 2)
+    xm.master_print(f'Initializing tensor parallelism with degree {tp_degree}')
+    parallel_state.initialize_model_parallel(tensor_model_parallel_size=tp_degree)
+    xm.master_print(f'TP rank: {parallel_state.get_tensor_model_parallel_rank()}, TP size: {parallel_state.get_tensor_model_parallel_size()}')
 
     # Create all the components of our model pipeline and training loop
     xm.master_print('Building training loop components')
@@ -363,6 +512,10 @@ def train(args):
 
     xm.master_print("Enabling gradient checkpointing")
     unet.enable_gradient_checkpointing()
+
+    # Apply tensor parallelism sharding to the transformer
+    xm.master_print("Applying tensor parallelism to transformer")
+    unet = shard_wan_transformer(unet, tp_degree)
 
     optim_params = unet.parameters()
 
@@ -404,33 +557,9 @@ def train(args):
     args.height = getattr(args, 'height', 480)
     args.width = getattr(args, 'width', 832)
     args.dataset_repeat = getattr(args, 'dataset_repeat', 100)
-    args.num_frames = getattr(args, 'num_frames', 81)
+    # Use max_frames for dataset to avoid loading unnecessary frames
+    args.num_frames = max_frames
 
-    dataset = UnifiedDataset(
-        base_path=args.dataset_base_path,
-        metadata_path=args.dataset_metadata_path,
-        repeat=args.dataset_repeat,
-        data_file_keys=("video",),
-        main_data_operator=UnifiedDataset.default_video_operator(
-            base_path=args.dataset_base_path,
-            max_pixels=args.max_pixels,
-            height=args.height,
-            width=args.width,
-            height_division_factor=16,
-            width_division_factor=16,
-            num_frames=args.num_frames,
-            time_division_factor=4,
-            time_division_remainder=1,
-        ),
-    )
-    # TODO: make this a parameter of the script
-    args.dataset_base_path = 'data/example_video_dataset'
-    args.dataset_metadata_path = 'data/example_video_dataset/metadata.csv'
-    args.max_pixels = 1280*720
-    args.height = 480
-    args.width = 832
-    args.dataset_repeat = 100
-    args.num_frames = 81
     dataset = UnifiedDataset(
         base_path=args.dataset_base_path,
         metadata_path=args.dataset_metadata_path,
@@ -565,7 +694,7 @@ def train(args):
 
             # Process all video frames for each batch
             batch_video_tensors = []
-            max_frames = 4  # Limit frames to reduce memory usage (set to 4 for safety)
+            # Use the max_frames from args (already limited at dataset level)
             for batch_idx, batch_videos in enumerate(video_frames):
                 # Convert all frames in this batch to tensors
                 frame_tensors = []
@@ -610,7 +739,8 @@ def train(args):
                     T = CACHE_T
 
                 # Process frames in smaller chunks to reduce memory
-                chunk_size = 4  # Reduced from 8 to save memory
+                # Use chunk_size of 2 to minimize memory usage during VAE encoding
+                chunk_size = 2  # Reduced to 2 to save memory during compilation
                 latents_list = []
 
                 for i in range(0, T, chunk_size):
@@ -796,6 +926,7 @@ def parse_args():
     parser.add_argument('--resolution', choices=[512, 768], type=int, help='Which resolution of model to train')
     parser.add_argument('--batch_size', type=int, help='What per-device microbatch size to use')
     parser.add_argument('--max_frames', type=int, default=4, help='Maximum number of video frames to process (default: 4, use lower values to save memory)')
+    parser.add_argument('--tensor_parallel_degree', type=int, default=2, help='Tensor parallelism degree (default: 2, must divide world_size)')
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help='How many gradient accumulation steps to do (1 for no gradient accumulation)')
     parser.add_argument('--epochs', type=int, default=2000, help='How many epochs to train for')
 

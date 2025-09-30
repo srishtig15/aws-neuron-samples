@@ -18,6 +18,7 @@ def parse_args():
     parser.add_argument('--resolution', choices=[512], default=512, type=int, help='Which resolution of model to train')
     parser.add_argument('--batch_size', type=int, default=1, help='What per-device microbatch size to use')
     parser.add_argument('--max_frames', type=int, default=4, help='Maximum number of video frames to process (default: 4, use lower values to save memory)')
+    parser.add_argument('--tensor_parallel_degree', type=int, default=2, help='Tensor parallelism degree (default: 2, must divide world_size)')
     parser.add_argument('--gradient_accumulation_steps', type=int, default=2, help='How many gradient accumulation steps to do (1 for no gradient accumulation)')
     parser.add_argument('--epochs', type=int, default=6, help='How many epochs to train for')
 
@@ -84,6 +85,7 @@ if __name__ == "__main__":
     os.environ.pop("XLA_HLO_DEBUG", None)
 
     max_frames = f"--max_frames {args.max_frames}" if args.max_frames is not None else ""
+    tensor_parallel_degree = f"--tensor_parallel_degree {args.tensor_parallel_degree}" if args.tensor_parallel_degree is not None else ""
     gradient_accumulation_steps = f"--gradient_accumulation_steps {args.gradient_accumulation_steps}" if args.gradient_accumulation_steps is not None else ""
     save_model_epochs = f"--save_model_epochs {args.save_model_epochs}" if args.save_model_epochs is not None else ""
     checkpointing_steps = f"--checkpointing_steps {args.checkpointing_steps}" if args.checkpointing_steps is not None else ""
@@ -92,7 +94,7 @@ if __name__ == "__main__":
     resume_checkpoint_step = f"--resume_checkpoint_step {args.resume_checkpoint_step}" if args.resume_checkpoint_step is not None else ""
 
     # Only need to run for 1 epoch for NPC to do its thing
-    run_command = f"torchrun --nproc_per_node={WORLD_SIZE} {args.training_script_path} --model {args.model} --resolution {args.resolution} {max_frames} {gradient_accumulation_steps} --batch_size {args.batch_size} {save_model_epochs} {checkpointing_steps} {max_num_checkpoints} {resume_from_checkpoint} {resume_checkpoint_step}"
+    run_command = f"torchrun --nproc_per_node={WORLD_SIZE} {args.training_script_path} --model {args.model} --resolution {args.resolution} {max_frames} {tensor_parallel_degree} {gradient_accumulation_steps} --batch_size {args.batch_size} {save_model_epochs} {checkpointing_steps} {max_num_checkpoints} {resume_from_checkpoint} {resume_checkpoint_step}"
 
     # We use 10 parallel jobs because we expect up to 9 graphs: 8 without grad accum enabled, 9 with it enabled
     neuron_parallel_compile_command = "neuron_parallel_compile --num_parallel 10 " + run_command + " --epochs 1"
