@@ -220,22 +220,48 @@ def save_pipeline(results_dir, pipe):
 
         # Save transformer config
         if hasattr(pipe.transformer, 'config'):
-            pipe.transformer.config.save_pretrained(transformer_save_path)
+            import json
+            config_dict = dict(pipe.transformer.config)
+            with open(os.path.join(transformer_save_path, "config.json"), "w") as f:
+                json.dump(config_dict, f, indent=2)
 
-        # Save other components (VAE, text encoder, etc.) which are already on CPU
+        # Save other components (VAE, text encoder, etc.)
         xm.master_print("Saving other pipeline components...")
+
+        # Save VAE - might be on XLA device, move to CPU first
         if pipe.vae is not None:
-            pipe.vae.save_pretrained(os.path.join(results_dir, "vae"))
+            try:
+                vae_cpu = pipe.vae.to('cpu')
+                vae_cpu.save_pretrained(os.path.join(results_dir, "vae"))
+                del vae_cpu
+            except Exception as e:
+                xm.master_print(f"Warning: Could not save VAE: {e}")
+
+        # Save text encoder - might be on XLA device, move to CPU first
         if pipe.text_encoder is not None:
-            pipe.text_encoder.save_pretrained(os.path.join(results_dir, "text_encoder"))
+            try:
+                text_encoder_cpu = pipe.text_encoder.to('cpu')
+                text_encoder_cpu.save_pretrained(os.path.join(results_dir, "text_encoder"))
+                del text_encoder_cpu
+            except Exception as e:
+                xm.master_print(f"Warning: Could not save text_encoder: {e}")
+
+        # Save tokenizer (always on CPU)
         if pipe.tokenizer is not None:
-            pipe.tokenizer.save_pretrained(os.path.join(results_dir, "tokenizer"))
+            try:
+                pipe.tokenizer.save_pretrained(os.path.join(results_dir, "tokenizer"))
+            except Exception as e:
+                xm.master_print(f"Warning: Could not save tokenizer: {e}")
+
+        # Save scheduler (always on CPU)
         if pipe.scheduler is not None:
-            pipe.scheduler.save_pretrained(os.path.join(results_dir, "scheduler"))
+            try:
+                pipe.scheduler.save_pretrained(os.path.join(results_dir, "scheduler"))
+            except Exception as e:
+                xm.master_print(f"Warning: Could not save scheduler: {e}")
 
         # Save model index
         xm.master_print("Saving model index...")
-        import json
         model_index = {
             "_class_name": pipe.__class__.__name__,
             "_diffusers_version": "0.21.0",

@@ -64,6 +64,8 @@ data_parallel_degree = nproc_per_node / tensor_parallel_degree
 4. ✅ **使用优化标志**: `--internal-hlo2tensorizer-options='--fuse-dot-logistic=false'`
 
 ### 问题 3: 模型保存失败
+
+#### 3.1 XLA 存储指针错误
 **错误**: `RuntimeError: Attempted to access the data pointer on an invalid python storage`
 
 **原因**: XLA 设备上的张量无法直接被 safetensors 序列化
@@ -75,6 +77,41 @@ data_parallel_degree = nproc_per_node / tensor_parallel_degree
 2. 使用 xm._maybe_convert_to_cpu() 转换到 CPU
 3. 使用 torch.save() 保存（不用 safetensors）
 4. 分别保存各个组件
+```
+
+#### 3.2 FrozenDict 配置保存错误
+**错误**: `AttributeError: 'FrozenDict' object has no attribute 'save_pretrained'`
+
+**原因**: `pipe.transformer.config` 是 `FrozenDict` 对象，不是 `PretrainedConfig`
+
+**解决**: 手动转换为字典并保存为 JSON
+```python
+# 错误方式:
+pipe.transformer.config.save_pretrained(transformer_save_path)
+
+# 正确方式:
+config_dict = dict(pipe.transformer.config)
+with open(os.path.join(transformer_save_path, "config.json"), "w") as f:
+    json.dump(config_dict, f, indent=2)
+```
+
+#### 3.3 VAE 和 Text Encoder 在 XLA 设备上
+**问题**: 这些组件可能也在 XLA 设备上，需要先移到 CPU
+
+**解决**:
+```python
+# 移到 CPU 再保存
+vae_cpu = pipe.vae.to('cpu')
+vae_cpu.save_pretrained(os.path.join(results_dir, "vae"))
+del vae_cpu  # 释放内存
+
+# 对所有组件都添加异常处理
+try:
+    text_encoder_cpu = pipe.text_encoder.to('cpu')
+    text_encoder_cpu.save_pretrained(os.path.join(results_dir, "text_encoder"))
+    del text_encoder_cpu
+except Exception as e:
+    xm.master_print(f"Warning: Could not save text_encoder: {e}")
 ```
 
 ## 内存优化策略总结
@@ -270,12 +307,72 @@ wan_<model>_training-<resolution>-batch<size>-AdamW-64w-zero1_optimizer-grad_che
 ```
 <results_dir>-EPOCH_N/
 ├── transformer/
-│   └── diffusion_pytorch_model.bin
+│   ├── diffusion_pytorch_model.bin  # 模型权重
+│   └── config.json                  # 模型配置
 ├── vae/
+│   ├── diffusion_pytorch_model.safetensors
+│   └── config.json
 ├── text_encoder/
+│   ├── model.safetensors
+│   └── config.json
 ├── tokenizer/
+│   ├── tokenizer_config.json
+│   └── special_tokens_map.json
 ├── scheduler/
-└── model_index.json
+│   └── scheduler_config.json
+└── model_index.json                 # Pipeline 元数据
+```
+
+### 完整的保存流程
+
+修复后的 `save_pipeline()` 函数执行以下步骤：
+
+1. **同步 XLA 操作**
+```python
+xm.mark_step()
+xm.wait_device_ops()
+```
+
+2. **保存 Transformer**
+```python
+# 提取状态字典
+transformer_state = pipe.transformer.state_dict()
+
+# 转换到 CPU
+cpu_transformer_state = {}
+for k, v in transformer_state.items():
+    cpu_transformer_state[k] = xm._maybe_convert_to_cpu(v)
+
+# 保存权重
+torch.save(cpu_transformer_state, "transformer/diffusion_pytorch_model.bin")
+
+# 保存配置（手动转换 FrozenDict）
+config_dict = dict(pipe.transformer.config)
+with open("transformer/config.json", "w") as f:
+    json.dump(config_dict, f, indent=2)
+```
+
+3. **保存其他组件**（带异常处理）
+```python
+# 每个组件都先移到 CPU
+vae_cpu = pipe.vae.to('cpu')
+vae_cpu.save_pretrained("vae/")
+del vae_cpu  # 释放内存
+
+# 类似处理 text_encoder, tokenizer, scheduler
+```
+
+4. **保存 model_index.json**
+```python
+model_index = {
+    "_class_name": "WanPipeline",
+    "_diffusers_version": "0.21.0",
+    "transformer": ["diffusers", "WanTransformer3DModel"],
+    "vae": ["diffusers", "AutoencoderKLWan"],
+    "text_encoder": ["transformers", "UMT5EncoderModel"],
+    "tokenizer": ["transformers", "T5Tokenizer"],
+    "scheduler": ["diffusers", "DDPMScheduler"]
+}
 ```
 
 ### 加载训练好的模型
@@ -286,6 +383,30 @@ pipe = WanPipeline.from_pretrained(
     "/path/to/saved/model",
     torch_dtype=torch.bfloat16
 )
+
+# 生成视频
+output = pipe(
+    prompt="A cat playing with a ball",
+    num_frames=16,
+    height=512,
+    width=512
+)
+```
+
+### 验证保存的模型
+```bash
+# 检查文件结构
+tree <results_dir>-EPOCH_N/
+
+# 验证文件大小
+du -sh <results_dir>-EPOCH_N/*
+
+# 测试加载
+python -c "
+from diffusers import WanPipeline
+pipe = WanPipeline.from_pretrained('<results_dir>-EPOCH_N/')
+print('Model loaded successfully!')
+"
 ```
 
 ## 性能优化建议
@@ -344,6 +465,22 @@ pipe = WanPipeline.from_pretrained(
 
 **下一步**: 使用渐进式训练策略逐步提升分辨率到目标 512×512。
 
+## 更新日志
+
+### 2025-10-10 (第二次更新)
+- ✅ 修复模型保存的 FrozenDict 错误
+- ✅ 添加 VAE 和 Text Encoder 的 CPU 转换
+- ✅ 为所有组件添加异常处理
+- ✅ 完善保存流程文档
+- ✅ 添加模型验证命令
+
+### 2025-10-10 (初始版本)
+- ✅ 解决 SB 内存分配问题
+- ✅ 优化编译器参数
+- ✅ 配置 Tensor Parallelism
+- ✅ 创建渐进式训练策略
+
 ---
 
 *最后更新: 2025-10-10*
+*文档版本: v1.1*
