@@ -114,6 +114,64 @@ except Exception as e:
     xm.master_print(f"Warning: Could not save text_encoder: {e}")
 ```
 
+#### 3.4 模型在保存后未恢复到 XLA 设备 ⚠️ 关键修复
+**错误**: `RuntimeError: Input tensor is not an XLA tensor: CPUBFloat16Type`
+
+**出现时机**: Epoch 0 成功保存模型后，Epoch 1 开始训练时报错
+
+**原因**:
+- 在 `save_pipeline()` 中，VAE 和 text_encoder 被移到 CPU 进行保存
+- 保存完成后，这些模型仍然留在 CPU 上
+- 下一个 epoch 开始时，训练代码尝试在 XLA 设备上使用这些 CPU 张量
+- 导致 XLA 运行时错误
+
+**错误位置**: `wan_neuron_origin.py:432` 的 `forward_preprocess()` 函数
+```python
+with torch.no_grad():
+    encoder_hidden_states = text_encoder(text_input_ids)[0]  # text_encoder 在 CPU 上！
+```
+
+**解决方案** (wan_neuron_origin.py:231-261):
+```python
+# 保存前记住原始设备
+vae_device = None
+text_encoder_device = None
+
+# 保存 VAE
+if pipe.vae is not None:
+    try:
+        # 记住原始设备
+        vae_device = next(pipe.vae.parameters()).device
+        # 移到 CPU 并保存
+        vae_cpu = pipe.vae.to('cpu')
+        vae_cpu.save_pretrained(os.path.join(results_dir, "vae"))
+        del vae_cpu
+        # ⭐ 关键：移回原始 XLA 设备
+        if vae_device is not None and str(vae_device) != 'cpu':
+            pipe.vae = pipe.vae.to(vae_device)
+    except Exception as e:
+        xm.master_print(f"Warning: Could not save VAE: {e}")
+
+# 对 text_encoder 使用相同的模式
+if pipe.text_encoder is not None:
+    try:
+        text_encoder_device = next(pipe.text_encoder.parameters()).device
+        text_encoder_cpu = pipe.text_encoder.to('cpu')
+        text_encoder_cpu.save_pretrained(os.path.join(results_dir, "text_encoder"))
+        del text_encoder_cpu
+        # ⭐ 关键：移回原始 XLA 设备
+        if text_encoder_device is not None and str(text_encoder_device) != 'cpu':
+            pipe.text_encoder = pipe.text_encoder.to(text_encoder_device)
+    except Exception as e:
+        xm.master_print(f"Warning: Could not save text_encoder: {e}")
+```
+
+**为什么需要这个修复**:
+1. XLA 设备张量和 CPU 张量不能混用
+2. 训练循环期望所有模型都在 XLA 设备上
+3. 即使创建了 CPU 副本，原始对象的设备也会改变
+4. 必须显式地将原始模型移回 XLA 设备
+
 ## 内存优化策略总结
 
 ### SB (Scratchpad Buffer) 是什么？
@@ -462,10 +520,19 @@ print('Model loaded successfully!')
 3. **帧数**: 4 → 2 （进一步降低内存需求）
 4. **编译器优化**: 使用 `--fuse-dot-logistic=false` 提高稳定性
 5. **保存机制**: 修复 XLA 张量保存问题
+6. **设备迁移**: 保存后自动恢复模型到 XLA 设备（关键修复）
+
+**当前状态**: ✅ 编译成功 | ✅ Epoch 0 训练和保存成功 | ⏳ 等待验证多 epoch 训练
 
 **下一步**: 使用渐进式训练策略逐步提升分辨率到目标 512×512。
 
 ## 更新日志
+
+### 2025-10-10 (第三次更新) ⚠️ 关键修复
+- ✅ **修复设备迁移问题**: 保存模型后自动恢复到 XLA 设备
+- ✅ 解决 Epoch 1 训练失败的 "Input tensor is not an XLA tensor" 错误
+- ✅ 更新 `save_pipeline()` 函数，添加设备状态保存和恢复
+- ✅ 完善问题 3.4 的文档说明
 
 ### 2025-10-10 (第二次更新)
 - ✅ 修复模型保存的 FrozenDict 错误
@@ -483,4 +550,4 @@ print('Model loaded successfully!')
 ---
 
 *最后更新: 2025-10-10*
-*文档版本: v1.1*
+*文档版本: v1.2*

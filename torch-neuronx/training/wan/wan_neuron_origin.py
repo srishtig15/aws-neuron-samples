@@ -228,21 +228,35 @@ def save_pipeline(results_dir, pipe):
         # Save other components (VAE, text encoder, etc.)
         xm.master_print("Saving other pipeline components...")
 
+        # Remember original devices
+        vae_device = None
+        text_encoder_device = None
+
         # Save VAE - might be on XLA device, move to CPU first
         if pipe.vae is not None:
             try:
+                # Get current device
+                vae_device = next(pipe.vae.parameters()).device
                 vae_cpu = pipe.vae.to('cpu')
                 vae_cpu.save_pretrained(os.path.join(results_dir, "vae"))
                 del vae_cpu
+                # Move back to original device
+                if vae_device is not None and str(vae_device) != 'cpu':
+                    pipe.vae = pipe.vae.to(vae_device)
             except Exception as e:
                 xm.master_print(f"Warning: Could not save VAE: {e}")
 
         # Save text encoder - might be on XLA device, move to CPU first
         if pipe.text_encoder is not None:
             try:
+                # Get current device
+                text_encoder_device = next(pipe.text_encoder.parameters()).device
                 text_encoder_cpu = pipe.text_encoder.to('cpu')
                 text_encoder_cpu.save_pretrained(os.path.join(results_dir, "text_encoder"))
                 del text_encoder_cpu
+                # Move back to original device
+                if text_encoder_device is not None and str(text_encoder_device) != 'cpu':
+                    pipe.text_encoder = pipe.text_encoder.to(text_encoder_device)
             except Exception as e:
                 xm.master_print(f"Warning: Could not save text_encoder: {e}")
 
