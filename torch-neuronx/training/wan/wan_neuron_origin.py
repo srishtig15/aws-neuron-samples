@@ -86,7 +86,8 @@ os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2" # Comment this line out if using tr
 # --enable-saturate-infinity: Needed for correctness
 # --distribution-strategy=llm-training: Enable large model training optimizations
 # -O1: Use optimization level 1 to minimize memory usage during compilation
-compiler_flags = """ --target=trn2 --lnc=2 --retry_failed_compilation --cache_dir="./compiler_cache" --model-type=transformer --enable-saturate-infinity --distribution-strategy=llm-training -O1 """
+# --internal-hlo2tensorizer-options: Additional memory optimization options
+compiler_flags = """ --target=trn2 --lnc=2 --retry_failed_compilation --cache_dir="./compiler_cache" --model-type=transformer --enable-saturate-infinity --internal-hlo2tensorizer-options='--fuse-dot-logistic=false' """
 
 os.environ["NEURON_CC_FLAGS"] = os.environ.get("NEURON_CC_FLAGS", "") + compiler_flags
 
@@ -191,8 +192,63 @@ def save_pipeline(results_dir, pipe):
     if xm.is_master_ordinal():
         if not os.path.exists(results_dir):
             os.makedirs(results_dir)
-        # Save the entire pipeline
-        pipe.save_pretrained(results_dir)
+
+        # Wait for any pending XLA operations to complete before copying
+        xm.mark_step()
+        xm.wait_device_ops()
+
+        # Get the transformer state dict and convert to CPU
+        xm.master_print("Extracting transformer state dict...")
+        transformer_state = pipe.transformer.state_dict()
+
+        # Convert XLA tensors to CPU tensors
+        xm.master_print("Converting tensors to CPU...")
+        cpu_transformer_state = {}
+        for k, v in transformer_state.items():
+            cpu_transformer_state[k] = xm._maybe_convert_to_cpu(v)
+
+        # Create a temporary copy of the pipeline for saving
+        import copy
+        xm.master_print("Creating CPU copy of transformer for saving...")
+
+        # Save transformer separately using torch.save (works with XLA)
+        transformer_save_path = os.path.join(results_dir, "transformer")
+        os.makedirs(transformer_save_path, exist_ok=True)
+
+        xm.master_print("Saving transformer state dict...")
+        torch.save(cpu_transformer_state, os.path.join(transformer_save_path, "diffusion_pytorch_model.bin"))
+
+        # Save transformer config
+        if hasattr(pipe.transformer, 'config'):
+            pipe.transformer.config.save_pretrained(transformer_save_path)
+
+        # Save other components (VAE, text encoder, etc.) which are already on CPU
+        xm.master_print("Saving other pipeline components...")
+        if pipe.vae is not None:
+            pipe.vae.save_pretrained(os.path.join(results_dir, "vae"))
+        if pipe.text_encoder is not None:
+            pipe.text_encoder.save_pretrained(os.path.join(results_dir, "text_encoder"))
+        if pipe.tokenizer is not None:
+            pipe.tokenizer.save_pretrained(os.path.join(results_dir, "tokenizer"))
+        if pipe.scheduler is not None:
+            pipe.scheduler.save_pretrained(os.path.join(results_dir, "scheduler"))
+
+        # Save model index
+        xm.master_print("Saving model index...")
+        import json
+        model_index = {
+            "_class_name": pipe.__class__.__name__,
+            "_diffusers_version": "0.21.0",
+            "transformer": ["diffusers", "WanTransformer3DModel"],
+            "vae": ["diffusers", "AutoencoderKLWan"],
+            "text_encoder": ["transformers", "UMT5EncoderModel"],
+            "tokenizer": ["transformers", "T5Tokenizer"],
+            "scheduler": ["diffusers", "DDPMScheduler"]
+        }
+        with open(os.path.join(results_dir, "model_index.json"), "w") as f:
+            json.dump(model_index, f, indent=2)
+
+        xm.master_print("Pipeline saved successfully")
 
     xm.master_print(f"Done saving trained model to dir {results_dir}")
     return
@@ -318,8 +374,8 @@ def forward_preprocess(data, pipe, device, tokenizer, text_encoder, vae, use_gra
         width = first_batch_videos[0].size[0]
         num_frames = min(len(first_batch_videos), max_frames)  # Limit frames to reduce memory
     else:
-        height = 256  # 480
-        width = 256  # 832
+        height = 128  # 480
+        width = 128  # 832
         num_frames = min(81, max_frames)
 
     # Process text prompts with tokenizer and text encoder
@@ -443,8 +499,10 @@ def train(args):
     args.dataset_base_path = getattr(args, 'dataset_base_path', 'data/example_video_dataset')
     args.dataset_metadata_path = getattr(args, 'dataset_metadata_path', 'data/example_video_dataset/metadata.csv')
     args.max_pixels = getattr(args, 'max_pixels', 1280*720)
-    args.height = getattr(args, 'height', 256)  # 480
-    args.width = getattr(args, 'width', 256)  # 832
+    # Use command-line args if provided, otherwise use defaults
+    # Start with 128x128 for compilation, can increase to 256x256, 512x512, etc. for actual training
+    args.height = args.train_height if args.train_height is not None else 128
+    args.width = args.train_width if args.train_width is not None else 128
     args.dataset_repeat = getattr(args, 'dataset_repeat', 100)
     # Use max_frames for dataset to avoid loading unnecessary frames
     args.num_frames = max_frames
@@ -820,6 +878,10 @@ def parse_args():
     parser.add_argument('--tensor_parallel_degree', type=int, default=8, help='Tensor parallelism degree (default: 8 for 64 workers, must divide world_size)')
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help='How many gradient accumulation steps to do (1 for no gradient accumulation)')
     parser.add_argument('--epochs', type=int, default=2000, help='How many epochs to train for')
+
+    # High-resolution training support
+    parser.add_argument('--train_height', type=int, default=128, help='Training height (overrides dataset default). Use lower for compilation, then increase gradually.')
+    parser.add_argument('--train_width', type=int, default=128, help='Training width (overrides dataset default). Use lower for compilation, then increase gradually.')
 
     # Arguments for checkpointing
     parser.add_argument("--checkpointing_steps", type=int, default=None,

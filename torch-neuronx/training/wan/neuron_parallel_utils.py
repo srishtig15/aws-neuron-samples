@@ -239,7 +239,7 @@ def shard_transformer3d_attn_no_padding(tp_degree: int, attn: Attention, orig_nu
     dim_head = orig_inner_dim // orig_num_heads  # 128
     new_inner_dim = attn.inner_dim  # 已经被更新为384 (1536/4)
     
-    print(f"In no_padding: orig_inner_dim={orig_inner_dim}, new_inner_dim={new_inner_dim}, dim_head={dim_head}")
+    # print(f"In no_padding: orig_inner_dim={orig_inner_dim}, new_inner_dim={new_inner_dim}, dim_head={dim_head}")
     
     # 分片Q/K/V - 重要：由于norm是在投影之后应用的，我们需要gather_output=True
     # 或者修改norm的处理方式
@@ -402,12 +402,12 @@ def shard_transformer3d_attn(tp_degree: int, attn: Attention):
     # 检查是否需要padding
     extra_heads = get_number_of_extra_heads(attn.heads, tp_degree)
     
-    print(f"Original heads: {orig_num_heads}, Extra heads needed: {extra_heads}")
-    print(f"Original inner_dim: {orig_inner_dim}, dim_head: {dim_head}")
+    # print(f"Original heads: {orig_num_heads}, Extra heads needed: {extra_heads}")
+    # print(f"Original inner_dim: {orig_inner_dim}, dim_head: {dim_head}")
     
     # 如果不需要padding（如TP=4, heads=24时），使用简化版本
     if extra_heads == 0:
-        print(f"No padding needed for {orig_num_heads} heads with TP={tp_degree}")
+        # print(f"No padding needed for {orig_num_heads} heads with TP={tp_degree}")
         
         # 更新head数量（无padding）
         attn.heads = orig_num_heads // tp_degree
@@ -419,7 +419,7 @@ def shard_transformer3d_attn(tp_degree: int, attn: Attention):
     
     # 需要padding的情况
     total_padded_heads = attn.heads + extra_heads
-    print(f"Padding needed: {orig_num_heads} -> {total_padded_heads} heads")
+    # print(f"Padding needed: {orig_num_heads} -> {total_padded_heads} heads")
     
     # 更新head数量（有padding）
     attn.heads = neuronx_dist_utils.divide(total_padded_heads, tp_degree)
