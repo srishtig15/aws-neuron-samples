@@ -454,11 +454,11 @@ def train(args):
     LOCAL_RANK = xr.global_ordinal()
 
     # Get max_frames from args or use default
-    max_frames = getattr(args, 'max_frames', 4)
+    max_frames = getattr(args, 'max_frames', 2)
     xm.master_print(f'Using max_frames={max_frames} to limit video frames for memory efficiency')
 
     # Initialize tensor parallelism
-    tp_degree = getattr(args, 'tensor_parallel_degree', 2)
+    tp_degree = getattr(args, 'tensor_parallel_degree', 4)
     xm.master_print(f'Initializing tensor parallelism with degree {tp_degree}')
     parallel_state.initialize_model_parallel(tensor_model_parallel_size=tp_degree)
     xm.master_print(f'TP rank: {parallel_state.get_tensor_model_parallel_rank()}, TP size: {parallel_state.get_tensor_model_parallel_size()}')
@@ -489,10 +489,10 @@ def train(args):
 
     # unet = UNet2DConditionModel.from_pretrained(model_id, subfolder="unet")
     unet = pipe.transformer
-    if os.getenv('NEURON_RT_STOCHASTIC_ROUNDING_EN', None):
-        text_encoder = text_encoder.to(torch.bfloat16)
-        # vae = vae.to(torch.bfloat16)
-        unet = unet.to(torch.bfloat16)
+    # if os.getenv('NEURON_RT_STOCHASTIC_ROUNDING_EN', None):
+    #     text_encoder = text_encoder.to(torch.bfloat16)
+    #     # vae = vae.to(torch.bfloat16)
+    #     unet = unet.to(torch.bfloat16)
     unet.requires_grad_(True)
 
     xm.master_print("Enabling gradient checkpointing")
@@ -666,6 +666,8 @@ def train(args):
             # Use forward_preprocess to prepare data for WAN model
             # Limit frames to reduce memory usage
             inputs = forward_preprocess(batch, pipe, device, tokenizer, text_encoder, vae, use_gradient_checkpointing=True, max_frames=max_frames)
+            
+            print('inputs:', inputs)
 
             # Since WanPipeline doesn't have training_loss, we need to implement the forward pass manually
             # This is a simplified training loop - you'll need to adjust based on WAN's actual training requirements
@@ -915,7 +917,7 @@ def parse_args():
     parser.add_argument('--resolution', choices=[512, 768], type=int, help='Which resolution of model to train')
     parser.add_argument('--batch_size', type=int, help='What per-device microbatch size to use')
     parser.add_argument('--max_frames', type=int, default=2, help='Maximum number of video frames to process (default: 2, use lower values to save memory)')
-    parser.add_argument('--tensor_parallel_degree', type=int, default=8, help='Tensor parallelism degree (default: 8 for 64 workers, must divide world_size)')
+    parser.add_argument('--tensor_parallel_degree', type=int, default=4, help='Tensor parallelism degree (default: 4 for 64 workers, must divide world_size)')
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help='How many gradient accumulation steps to do (1 for no gradient accumulation)')
     parser.add_argument('--epochs', type=int, default=2000, help='How many epochs to train for')
 
