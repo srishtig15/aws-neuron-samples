@@ -87,7 +87,7 @@ os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2" # Comment this line out if using tr
 # --distribution-strategy=llm-training: Enable large model training optimizations
 # -O1: Use optimization level 1 to minimize memory usage during compilation
 # --internal-hlo2tensorizer-options: Additional memory optimization options
-compiler_flags = """ --target=trn2 --lnc=2 --retry_failed_compilation --cache_dir="./compiler_cache" --model-type=transformer --enable-saturate-infinity --internal-hlo2tensorizer-options='--fuse-dot-logistic=false' """
+compiler_flags = """ --target=trn2 --lnc=2 --retry_failed_compilation --cache_dir="./compiler_cache" --model-type=transformer --enable-saturate-infinity """  # --internal-hlo2tensorizer-options='--fuse-dot-logistic=false'
 
 os.environ["NEURON_CC_FLAGS"] = os.environ.get("NEURON_CC_FLAGS", "") + compiler_flags
 
@@ -440,6 +440,7 @@ def forward_preprocess(data, pipe, device, tokenizer, text_encoder, vae, use_gra
     # Convert PIL images to tensors and encode with VAE
     # Note: This is a placeholder - you'll need to implement proper video encoding
     # based on how WAN model expects the latents
+    print('encoder_hidden_states:', encoder_hidden_states.shape)
 
     return {
         "video_frames": video_frames,
@@ -705,7 +706,7 @@ def train(args):
             video_batch = torch.stack(batch_video_tensors, dim=0)  # [B, T, C, H, W]
             # print(f"Before permute: {video_batch.shape}")
             video_batch = video_batch.permute(0, 2, 1, 3, 4).to(device)  # [B, C, T, H, W]
-            # print(f"After permute (B, C, T, H, W): {video_batch.shape}")
+            print(f"After permute (B, C, T, H, W): {video_batch.shape}")
 
             # WAN VAE uses a special caching mechanism
             # It processes video frame by frame with temporal caching
@@ -759,7 +760,7 @@ def train(args):
                             xm.mark_step()  # Force XLA to clear memory
 
                 latents = torch.cat(latents_list, dim=2)
-                # print(f"Combined latents shape: {latents.shape}")
+                print(f"Combined latents shape: {latents.shape}")
 
                 # Clear intermediate list
                 del latents_list
