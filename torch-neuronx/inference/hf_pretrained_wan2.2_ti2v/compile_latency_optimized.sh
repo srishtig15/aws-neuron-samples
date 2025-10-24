@@ -15,16 +15,15 @@ python neuron_wan2_2_ti2v/compile_text_encoder.py \
 echo "compiling transformer"
 python neuron_wan2_2_ti2v/compile_transformer_latency_optimized.py \
 --compiled_models_dir "compile_workdir_latency_optimized" \
---max_sequence_length 512  #  \
-# --height 512 \
-# --width 512
+--max_sequence_length 512 \
+--height 512 \
+--width 512
 
-echo "compiling decoder"
-python neuron_wan2_2_ti2v/compile_decoder.py \
---compiled_models_dir "compile_workdir_latency_optimized"
+# echo "compiling decoder"
+# python neuron_wan2_2_ti2v/compile_decoder.py \
+# --compiled_models_dir "compile_workdir_latency_optimized"
 
 echo "run wan2.2 ti2v latency optimized"
-# export NEURON_RT_NUM_CORES=4
-export NEURON_RT_NUM_CORES=8
+export NEURON_RT_NUM_CORES=4
 python run_wan2.2_ti2v_latency_optimized.py
 python run_wan2.2_i2v_latency_optimized.py
