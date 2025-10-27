@@ -108,28 +108,6 @@ LOSS_FILE_FSTRING = "LOSSES-RANK-{RANK}.txt"
 ###                           HELPER FUNCTIONS                               ###
 ###                                                                          ###
 ################################################################################
-
-def shard_wan_transformer(transformer, tp_degree):
-    """Apply tensor parallelism to Wan transformer model"""
-    xm.master_print(f"Sharding Wan transformer with TP degree {tp_degree}")
-
-    # Shard each transformer block
-    for block_id, block in enumerate(transformer.blocks):
-        xm.master_print(f"  Sharding block {block_id}")
-
-        # Shard attention layers
-        if hasattr(block, 'attn1'):
-            block.attn1 = shard_transformer3d_attn(tp_degree, block.attn1)
-        if hasattr(block, 'attn2'):
-            block.attn2 = shard_transformer3d_attn(tp_degree, block.attn2)
-
-        # Shard feedforward layer
-        if hasattr(block, 'ff'):
-            block.ff = shard_transformer_feedforward(block.ff)
-
-    xm.master_print("Finished sharding Wan transformer")
-    return transformer
-
 # For measuring throughput
 class Throughput:
     def __init__(self, batch_size=8, data_parallel_degree=2, grad_accum_usteps=1, moving_avg_window_size=10):
@@ -209,16 +187,12 @@ def save_pipeline(results_dir, pipe):
         for k, v in transformer_state.items():
             cpu_transformer_state[k] = xm._maybe_convert_to_cpu(v)
 
-        # Create a temporary copy of the pipeline for saving
-        import copy
-        xm.master_print("Creating CPU copy of transformer for saving...")
-
         # Save transformer separately using torch.save (works with XLA)
         transformer_save_path = os.path.join(results_dir, "transformer")
         os.makedirs(transformer_save_path, exist_ok=True)
 
         xm.master_print("Saving transformer state dict...")
-        torch.save(cpu_transformer_state, os.path.join(transformer_save_path, "diffusion_pytorch_model.bin"))
+        torch.save(cpu_transformer_state, os.path.join(transformer_save_path, "transformer_pytorch_model.bin"))
 
         # Save transformer config
         if hasattr(pipe.transformer, 'config'):
@@ -409,6 +383,27 @@ def seed_rng(device):
 ###                                                                          ###
 ################################################################################
 
+def shard_wan_transformer(transformer, tp_degree):
+    """Apply tensor parallelism to Wan transformer model"""
+    xm.master_print(f"Sharding Wan transformer with TP degree {tp_degree}")
+
+    # Shard each transformer block
+    for block_id, block in enumerate(transformer.blocks):
+        xm.master_print(f"  Sharding block {block_id}")
+
+        # Shard attention layers
+        if hasattr(block, 'attn1'):
+            block.attn1 = shard_transformer3d_attn(tp_degree, block.attn1)
+        if hasattr(block, 'attn2'):
+            block.attn2 = shard_transformer3d_attn(tp_degree, block.attn2)
+
+        # Shard feedforward layer
+        if hasattr(block, 'ff'):
+            block.ff = shard_transformer_feedforward(block.ff)
+
+    xm.master_print("Finished sharding Wan transformer")
+    return transformer
+
 def forward_preprocess(data, pipe, device, tokenizer, text_encoder, vae, use_gradient_checkpointing=True, max_frames=4):
     """预处理UnifiedDataset的数据为WAN模型需要的格式"""
 
@@ -552,7 +547,7 @@ def train(args):
     # Use max_frames for dataset to avoid loading unnecessary frames
     args.num_frames = max_frames
     
-    print('args:', args)
+    xm.master_print('args:', args)
 
     dataset = UnifiedDataset(
         base_path=args.dataset_base_path,
@@ -672,7 +667,7 @@ def train(args):
             # Limit frames to reduce memory usage
             inputs = forward_preprocess(batch, pipe, device, tokenizer, text_encoder, vae, use_gradient_checkpointing=True, max_frames=max_frames)
             
-            print('inputs:', inputs)
+            xm.master_print('inputs:', inputs)
 
             # Since WanPipeline doesn't have training_loss, we need to implement the forward pass manually
             # This is a simplified training loop - you'll need to adjust based on WAN's actual training requirements
@@ -808,10 +803,10 @@ def train(args):
 
             # Add noise to latents
             noise = torch.randn_like(latents)
-            timesteps = torch.randint(0, pipe.scheduler.config.num_train_timesteps, (batch_size,), device=device)
+            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (batch_size,), device=device)
             timesteps = timesteps.long()  # Ensure timesteps are long type
 
-            noisy_latents = pipe.scheduler.add_noise(latents, noise, timesteps)
+            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
             # Ensure all inputs are in the correct dtype
             noisy_latents = noisy_latents.to(unet.dtype)
