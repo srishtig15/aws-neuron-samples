@@ -227,68 +227,73 @@ def save_pipeline(results_dir, pipe):
             with open(os.path.join(transformer_save_path, "config.json"), "w") as f:
                 json.dump(config_dict, f, indent=2)
 
-        # Save other components (VAE, text encoder, etc.)
-        xm.master_print("Saving other pipeline components...")
+        # NOTE: We ONLY save the transformer, as it's the only component that was trained.
+        # VAE, text_encoder, tokenizer, and scheduler were all frozen/unchanged.
+        # All other components should be loaded from the original base model during inference.
+        xm.master_print("Transformer saved. Other components (VAE, text_encoder, tokenizer, scheduler) should be loaded from base model.")
 
-        # Remember original devices
-        vae_device = None
-        text_encoder_device = None
+        # Save README with loading instructions
+        readme_content = """# Trained WAN Transformer Model
 
-        # Save VAE - might be on XLA device, move to CPU first
-        if pipe.vae is not None:
-            try:
-                # Get current device
-                vae_device = next(pipe.vae.parameters()).device
-                vae_cpu = pipe.vae.to('cpu')
-                vae_cpu.save_pretrained(os.path.join(results_dir, "vae"))
-                del vae_cpu
-                # Move back to original device
-                if vae_device is not None and str(vae_device) != 'cpu':
-                    pipe.vae = pipe.vae.to(vae_device)
-            except Exception as e:
-                xm.master_print(f"Warning: Could not save VAE: {e}")
+This checkpoint contains **ONLY the trained transformer weights**.
 
-        # Save text encoder - might be on XLA device, move to CPU first
-        if pipe.text_encoder is not None:
-            try:
-                # Get current device
-                text_encoder_device = next(pipe.text_encoder.parameters()).device
-                text_encoder_cpu = pipe.text_encoder.to('cpu')
-                text_encoder_cpu.save_pretrained(os.path.join(results_dir, "text_encoder"))
-                del text_encoder_cpu
-                # Move back to original device
-                if text_encoder_device is not None and str(text_encoder_device) != 'cpu':
-                    pipe.text_encoder = pipe.text_encoder.to(text_encoder_device)
-            except Exception as e:
-                xm.master_print(f"Warning: Could not save text_encoder: {e}")
+All other components (VAE, text_encoder, tokenizer, scheduler) were frozen during training
+and should be loaded from the original base model.
 
-        # Save tokenizer (always on CPU)
-        if pipe.tokenizer is not None:
-            try:
-                pipe.tokenizer.save_pretrained(os.path.join(results_dir, "tokenizer"))
-            except Exception as e:
-                xm.master_print(f"Warning: Could not save tokenizer: {e}")
+## Loading for Inference
 
-        # Save scheduler (always on CPU)
-        if pipe.scheduler is not None:
-            try:
-                pipe.scheduler.save_pretrained(os.path.join(results_dir, "scheduler"))
-            except Exception as e:
-                xm.master_print(f"Warning: Could not save scheduler: {e}")
+```python
+from diffusers import WanPipeline
+from diffusers import WanTransformer3DModel
+import torch
 
-        # Save model index
-        xm.master_print("Saving model index...")
-        model_index = {
-            "_class_name": pipe.__class__.__name__,
-            "_diffusers_version": "0.21.0",
-            "transformer": ["diffusers", "WanTransformer3DModel"],
-            "vae": ["diffusers", "AutoencoderKLWan"],
-            "text_encoder": ["transformers", "UMT5EncoderModel"],
-            "tokenizer": ["transformers", "T5Tokenizer"],
-            "scheduler": ["diffusers", "DDPMScheduler"]
-        }
-        with open(os.path.join(results_dir, "model_index.json"), "w") as f:
-            json.dump(model_index, f, indent=2)
+# Specify your original base model
+base_model_id = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"  # or your original model path
+
+# Load trained transformer from this checkpoint
+transformer = WanTransformer3DModel.from_pretrained(
+    "./transformer",
+    torch_dtype=torch.bfloat16
+)
+
+# Load complete pipeline with base model components and trained transformer
+pipe = WanPipeline.from_pretrained(
+    base_model_id,
+    transformer=transformer,  # Use trained transformer
+    torch_dtype=torch.bfloat16
+)
+
+# Now you can use the pipeline for inference
+video = pipe(
+    prompt="your prompt here",
+    num_frames=16,
+    height=512,
+    width=512,
+).frames[0]
+```
+
+## Directory Structure
+
+```
+checkpoint/
+├── transformer/
+│   ├── diffusion_pytorch_model.bin  # Trained weights
+│   └── config.json                   # Model config
+└── README.md                         # This file
+```
+
+## Important Notes
+
+- ✅ **transformer**: Trained weights (LOAD FROM HERE)
+- ❌ **VAE**: Not saved (load from base model)
+- ❌ **text_encoder**: Not saved (load from base model)
+- ❌ **tokenizer**: Not saved (load from base model)
+- ❌ **scheduler**: Not saved (load from base model)
+
+All components except transformer should come from the base model `from_pretrained()`.
+"""
+        with open(os.path.join(results_dir, "README.md"), "w") as f:
+            f.write(readme_content)
 
         xm.master_print("Pipeline saved successfully")
 
@@ -755,9 +760,7 @@ def train(args):
 
                         # Clear intermediate tensors to save memory
                         del chunk
-                        if i > 0:
-                            torch.cuda.empty_cache() if torch.cuda.is_available() else None
-                            xm.mark_step()  # Force XLA to clear memory
+                        # Note: VAE runs on CPU, no need for XLA synchronization here
 
                 latents = torch.cat(latents_list, dim=2)
                 # print(f"Combined latents shape: {latents.shape}")
@@ -921,7 +924,7 @@ def parse_args():
     parser.add_argument('--model', choices=['Wan-AI/Wan2.1-T2V-1.3B-Diffusers', 'Wan-AI/Wan2.2-TI2V-5B-Diffusers'], help='Which model to train')
     parser.add_argument('--resolution', choices=[512, 768], type=int, help='Which resolution of model to train')
     parser.add_argument('--batch_size', type=int, help='What per-device microbatch size to use')
-    parser.add_argument('--max_frames', type=int, default=2, help='Maximum number of video frames to process (default: 2, use lower values to save memory)')
+    parser.add_argument('--max_frames', type=int, default=16, help='Maximum number of video frames to process (default: 2, use lower values to save memory)')
     parser.add_argument('--tensor_parallel_degree', type=int, default=4, help='Tensor parallelism degree (default: 4 for 64 workers, must divide world_size)')
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help='How many gradient accumulation steps to do (1 for no gradient accumulation)')
     parser.add_argument('--epochs', type=int, default=2000, help='How many epochs to train for')

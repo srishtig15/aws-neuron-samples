@@ -17,7 +17,7 @@ def parse_args():
     parser.add_argument('--model', choices=['Wan-AI/Wan2.1-T2V-1.3B-Diffusers', 'Wan-AI/Wan2.2-TI2V-5B-Diffusers'], default='Wan-AI/Wan2.1-T2V-1.3B-Diffusers', help='Which model to train')
     parser.add_argument('--resolution', choices=[512], default=512, type=int, help='Which resolution of model to train')
     parser.add_argument('--batch_size', type=int, default=1, help='What per-device microbatch size to use')
-    parser.add_argument('--max_frames', type=int, default=2, help='Maximum number of video frames to process (default: 2, use lower values to save memory)')
+    parser.add_argument('--max_frames', type=int, default=16, help='Maximum number of video frames to process (default: 2, use lower values to save memory)')
     parser.add_argument('--tensor_parallel_degree', type=int, default=4, help='Tensor parallelism degree (default: 4, must divide world_size)')
     parser.add_argument('--gradient_accumulation_steps', type=int, default=2, help='How many gradient accumulation steps to do (1 for no gradient accumulation)')
     parser.add_argument('--epochs', type=int, default=6, help='How many epochs to train for')
