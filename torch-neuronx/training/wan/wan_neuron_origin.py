@@ -80,6 +80,8 @@ os.environ["NEURON_CUSTOM_SILU"] = "1"
 os.environ["XLA_DISABLE_FUNCTIONALIZATION"] = "0"
 os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "2" # Comment this line out if using trn1/inf2
 os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2" # Comment this line out if using trn1/inf2
+# Increase parameter wrapping threshold to avoid tuple arguments issue on Neuron
+os.environ["XLA_PARAMETER_WRAPPING_THREADSHOLD"] = "10000"
 
 ##### Neuron compiler flags #####
 # --model-type=transformer: Enable transformer-specific optimizations
@@ -440,7 +442,7 @@ def forward_preprocess(data, pipe, device, tokenizer, text_encoder, vae, use_gra
     # Convert PIL images to tensors and encode with VAE
     # Note: This is a placeholder - you'll need to implement proper video encoding
     # based on how WAN model expects the latents
-    print('encoder_hidden_states:', encoder_hidden_states.shape)
+    # print('encoder_hidden_states:', encoder_hidden_states.shape)  # torch.Size([1, 512, 4096])
 
     return {
         "video_frames": video_frames,
@@ -514,15 +516,12 @@ def train(args):
     text_encoder.eval()
     text_encoder.to(device)
 
+    # Keep VAE on CPU - it doesn't need to run on Trainium
     vae.requires_grad_(False)
     vae.eval()
-    # Needed for vae encoder to not downcast to bf16 with XLA_DOWNCAST_BF16
-    if os.getenv('NEURON_RT_STOCHASTIC_ROUNDING_EN', None):
-        for attn in vae.encoder.mid_block.attentions:
-            # Intent of this is to upcast to fp32, but actual effect under XLA_DOWNCAST_BF16 is to force to bf16.
-            attn.upcast_softmax = False
-        # Set to float64 so that XLA_DOWNCAST_BF16 keeps as FP32
-        vae = vae.to(device=device, dtype=torch.float32)
+    # Keep VAE on CPU with float32 precision
+    vae = vae.to(device='cpu', dtype=torch.float32)
+    xm.master_print("VAE kept on CPU for encoding")
 
     # TODO: parametrize optimizer parameters
     if is_pt_2_x:
@@ -705,8 +704,9 @@ def train(args):
             # Stack all batches: [B, T, C, H, W] then permute to [B, C, T, H, W]
             video_batch = torch.stack(batch_video_tensors, dim=0)  # [B, T, C, H, W]
             # print(f"Before permute: {video_batch.shape}")
-            video_batch = video_batch.permute(0, 2, 1, 3, 4).to(device)  # [B, C, T, H, W]
-            print(f"After permute (B, C, T, H, W): {video_batch.shape}")
+            # Keep video_batch on CPU for VAE encoding
+            video_batch = video_batch.permute(0, 2, 1, 3, 4)  # [B, C, T, H, W]
+            # print(f"After permute (B, C, T, H, W): {video_batch.shape}")
 
             # WAN VAE uses a special caching mechanism
             # It processes video frame by frame with temporal caching
@@ -714,10 +714,10 @@ def train(args):
                 B, C, T, H, W = video_batch.shape
                 # print(f"Encoding video with shape (B={B}, C={C}, T={T}, H={H}, W={W})")
 
-                # Initialize VAE cache - this is crucial for WAN VAE
+                # Initialize VAE cache on CPU - VAE runs on CPU
                 if hasattr(vae, 'init_cache'):
                     # print("Initializing VAE cache")
-                    vae.init_cache(height=H, width=W, device=device)
+                    vae.init_cache(height=H, width=W, device='cpu')
 
                 # WAN VAE needs special handling
                 # Process video in smaller chunks to reduce memory usage
@@ -760,7 +760,7 @@ def train(args):
                             xm.mark_step()  # Force XLA to clear memory
 
                 latents = torch.cat(latents_list, dim=2)
-                print(f"Combined latents shape: {latents.shape}")
+                # print(f"Combined latents shape: {latents.shape}")
 
                 # Clear intermediate list
                 del latents_list
@@ -789,10 +789,14 @@ def train(args):
                         # For WAN video models, the scaling factor is often 1.0
                         # Unlike Stable Diffusion which uses 0.18215
                         scaling_factor = 1.0
-                        print(f"Warning: scaling_factor not found in VAE config, using {scaling_factor} for WAN VAE")
+                        # print(f"Warning: scaling_factor not found in VAE config, using {scaling_factor} for WAN VAE")
 
-                print(f"Using VAE scaling factor: {scaling_factor}")
+                # print(f"Using VAE scaling factor: {scaling_factor}")
                 latents = latents * scaling_factor
+
+            # Move latents from CPU to Trainium device
+            latents = latents.to(device)
+            # print(f"Moved latents to device: {latents.device}")
 
             # Ensure latents are in the correct dtype for the model
             # WAN transformer expects bfloat16
