@@ -1,10 +1,11 @@
 import os
+os.environ["NEURON_INTERNAL_USE_VANILLA_TORCH_XLA"] = "1"  # RuntimeError: Unknown custom-call API version enum value: 0 (API_VERSION_UNSPECIFIED) https://github.com/aws-neuron/aws-neuron-sdk/issues/789
 os.environ["NEURON_FUSE_SOFTMAX"] = "1"
 os.environ["NEURON_CUSTOM_SILU"] = "1"
-os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "2" # Comment this line out if using trn1/inf2
-os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2" # Comment this line out if using trn1/inf2
-compiler_flags = """ --verbose=INFO --target=trn2 --lnc=2 --model-type=unet-inference --enable-fast-loading-neuron-binaries """ # Use these compiler flags for trn2
-# compiler_flags = """ --verbose=INFO --target=trn1 --model-type=unet-inference --enable-fast-loading-neuron-binaries """ # Use these compiler flags for trn1/inf2
+# os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "2" # Comment this line out if using trn1/inf2
+# os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2" # Comment this line out if using trn1/inf2
+# compiler_flags = """ --verbose=INFO --target=trn2 --lnc=2 --model-type=unet-inference --enable-fast-loading-neuron-binaries """ # Use these compiler flags for trn2
+compiler_flags = """ --verbose=INFO --target=trn1 --model-type=unet-inference --enable-fast-loading-neuron-binaries """ # Use these compiler flags for trn1/inf2. optlevel=1 creates smaller subgraphs
 os.environ["NEURON_CC_FLAGS"] = os.environ.get("NEURON_CC_FLAGS", "") + compiler_flags
 
 from diffusers import AutoencoderKLWan
@@ -35,15 +36,16 @@ def upcast_norms_to_f32(decoder: Decoder):
     decoder.norm_out = f32Wrapper(orig_norm_out)
 
 def compile_decoder(args):
-    latent_height = args.height//8
-    latent_width = args.width//8
+    # Must match transformer output: height//16 because of VAE (//8) + patch_embedding (//2)
+    latent_height = args.height//16
+    latent_width = args.width//16
     compiler_workdir = args.compiler_workdir
     compiled_models_dir = args.compiled_models_dir
     
     batch_size = 1
-    frames = 4  # default: 21
+    frames = 2  # default: 21
     # height, width = 32,32  # default: 96, 96
-    in_channels = 16
+    in_channels = 48
     
     model_id = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
     vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32, cache_dir="wan2.2_ti2v_hf_cache_dir")
@@ -52,19 +54,57 @@ def compile_decoder(args):
     decoder.eval()
     # upcast_norms_to_f32(decoder)  # TODO maybe we don't need to call upcast_norms_to_f32
     
+    # del decoder.up_blocks
+    # del decoder.norm_out
+    # del decoder.conv_out
+    print('decoder:', decoder)
+    
     with torch.no_grad():
-        sample_inputs_1 = torch.rand((batch_size, in_channels, 2, latent_height, latent_width), dtype=torch.float32)  # 这里第3维用frames（或者2即可）是因为静态编译的原因，实际上用1就可以
-        # feat_cache = [torch.rand((batch_size, 16, 2, latent_height, latent_width), dtype=torch.float32)] + \
-        #             [torch.rand((batch_size, 384, 2, latent_height, latent_width), dtype=torch.float32)] * 11 + \
-        #             [torch.rand((batch_size, 192, 2, latent_height*2, latent_width*2), dtype=torch.float32)] + \
-        #             [torch.rand((batch_size, 384, 2, latent_height*2, latent_width*2), dtype=torch.float32)] * 6 + \
-        #             [torch.rand((batch_size, 192, 2, latent_height*4, latent_width*4), dtype=torch.float32)] * 6 + \
-        #             [torch.rand((batch_size, 96, 2, latent_height*8, latent_width*8), dtype=torch.float32)] * 7 + \
-        #             [torch.rand((batch_size, 1, 1, latent_height, latent_width), dtype=torch.float32)]
-        
+        sample_inputs_1 = torch.rand((batch_size, in_channels, frames, latent_height, latent_width), dtype=torch.float32)
+
+        # 根据analyze_decoder_full.py的分析结果，创建完整的feat_cache
+        feat_cache = [
+            torch.rand((batch_size, 48, 2, latent_height, latent_width), dtype=torch.float32),  # 0: conv_in
+            torch.rand((batch_size, 1024, 2, latent_height, latent_width), dtype=torch.float32),  # 1: mid_block.resnets.0.conv1
+            torch.rand((batch_size, 1024, 2, latent_height, latent_width), dtype=torch.float32),  # 2: mid_block.resnets.0.conv2
+            torch.rand((batch_size, 1024, 2, latent_height, latent_width), dtype=torch.float32),  # 3: mid_block.resnets.1.conv1
+            torch.rand((batch_size, 1024, 2, latent_height, latent_width), dtype=torch.float32),  # 4: mid_block.resnets.1.conv2
+            torch.rand((batch_size, 1024, 2, latent_height, latent_width), dtype=torch.float32),  # 5: up_blocks.0.resnets.0.conv1
+            torch.rand((batch_size, 1024, 2, latent_height, latent_width), dtype=torch.float32),  # 6: up_blocks.0.resnets.0.conv2
+            torch.rand((batch_size, 1024, 2, latent_height, latent_width), dtype=torch.float32),  # 7: up_blocks.0.resnets.1.conv1
+            torch.rand((batch_size, 1024, 2, latent_height, latent_width), dtype=torch.float32),  # 8: up_blocks.0.resnets.1.conv2
+            torch.rand((batch_size, 1024, 2, latent_height, latent_width), dtype=torch.float32),  # 9: up_blocks.0.resnets.2.conv1
+            torch.rand((batch_size, 1024, 2, latent_height, latent_width), dtype=torch.float32),  # 10: up_blocks.0.resnets.2.conv2
+            torch.rand((batch_size, 1024, 2, latent_height, latent_width), dtype=torch.float32),  # 11: up_blocks.0.upsampler.time_conv
+            torch.rand((batch_size, 1024, 2, latent_height*2, latent_width*2), dtype=torch.float32),  # 12: up_blocks.1.resnets.0.conv1
+            torch.rand((batch_size, 1024, 2, latent_height*2, latent_width*2), dtype=torch.float32),  # 13: up_blocks.1.resnets.0.conv2
+            torch.rand((batch_size, 1024, 2, latent_height*2, latent_width*2), dtype=torch.float32),  # 14: up_blocks.1.resnets.1.conv1
+            torch.rand((batch_size, 1024, 2, latent_height*2, latent_width*2), dtype=torch.float32),  # 15: up_blocks.1.resnets.1.conv2
+            torch.rand((batch_size, 1024, 2, latent_height*2, latent_width*2), dtype=torch.float32),  # 16: up_blocks.1.resnets.2.conv1
+            torch.rand((batch_size, 1024, 2, latent_height*2, latent_width*2), dtype=torch.float32),  # 17: up_blocks.1.resnets.2.conv2
+            torch.rand((batch_size, 1024, 2, latent_height*2, latent_width*2), dtype=torch.float32),  # 18: up_blocks.1.upsampler.time_conv
+            torch.rand((batch_size, 1024, 2, latent_height*4, latent_width*4), dtype=torch.float32),  # 19: up_blocks.2.resnets.0.conv1
+            torch.rand((batch_size, 512, 2, latent_height*4, latent_width*4), dtype=torch.float32),  # 20: up_blocks.2.resnets.0.conv2
+            torch.rand((batch_size, 512, 2, latent_height*4, latent_width*4), dtype=torch.float32),  # 21: up_blocks.2.resnets.0.conv_shortcut
+            torch.rand((batch_size, 512, 2, latent_height*4, latent_width*4), dtype=torch.float32),  # 22: up_blocks.2.resnets.1.conv1
+            torch.rand((batch_size, 512, 2, latent_height*4, latent_width*4), dtype=torch.float32),  # 23: up_blocks.2.resnets.1.conv2
+            torch.rand((batch_size, 512, 2, latent_height*4, latent_width*4), dtype=torch.float32),  # 24: up_blocks.2.resnets.2.conv1
+            torch.rand((batch_size, 512, 2, latent_height*8, latent_width*8), dtype=torch.float32),  # 25: up_blocks.2.resnets.2.conv2
+            torch.rand((batch_size, 256, 2, latent_height*8, latent_width*8), dtype=torch.float32),  # 26: up_blocks.3.resnets.0.conv1
+            torch.rand((batch_size, 256, 2, latent_height*8, latent_width*8), dtype=torch.float32),  # 27: up_blocks.3.resnets.0.conv2
+            torch.rand((batch_size, 256, 2, latent_height*8, latent_width*8), dtype=torch.float32),  # 28: up_blocks.3.resnets.0.conv_shortcut
+            torch.rand((batch_size, 256, 2, latent_height*8, latent_width*8), dtype=torch.float32),  # 29: up_blocks.3.resnets.1.conv1
+            torch.rand((batch_size, 256, 2, latent_height*8, latent_width*8), dtype=torch.float32),  # 30: up_blocks.3.resnets.1.conv2
+            torch.rand((batch_size, 256, 2, latent_height*8, latent_width*8), dtype=torch.float32),  # 31: up_blocks.3.resnets.2.conv1
+            torch.rand((batch_size, 256, 2, latent_height*8, latent_width*8), dtype=torch.float32),  # 32: up_blocks.3.resnets.2.conv2 (dummy, not used)
+            torch.rand((batch_size, 12, 2, latent_height*8, latent_width*8), dtype=torch.float32),   # 33: conv_out (dummy, not used)
+        ]
+
+        # Trace decoder normally with feat_cache
+        # Will load without DataParallel at runtime to support list arguments
         compiled_decoder = torch_neuronx.trace(
             decoder,
-            sample_inputs_1,  # (sample_inputs_1, feat_cache), 
+            (sample_inputs_1, feat_cache),
             compiler_workdir=f"{compiler_workdir}/decoder",
             compiler_args=compiler_flags,
             inline_weights_to_neff=False)
@@ -90,8 +130,8 @@ def compile_decoder(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--height", help="height of generated video.", type=int, default=256)
-    parser.add_argument("--width", help="height of generated video.", type=int, default=256)
+    parser.add_argument("--height", help="height of generated video.", type=int, default=512)
+    parser.add_argument("--width", help="height of generated video.", type=int, default=512)
     parser.add_argument("--compiler_workdir", help="dir for compiler artifacts.", type=str, default="compiler_workdir")
     parser.add_argument("--compiled_models_dir", help="dir for compiled artifacts.", type=str, default="compiled_models")
     args = parser.parse_args()

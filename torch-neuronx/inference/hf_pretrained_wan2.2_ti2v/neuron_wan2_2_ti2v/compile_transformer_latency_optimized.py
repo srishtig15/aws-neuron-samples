@@ -93,12 +93,18 @@ def compile_transformer(args):
     compiler_workdir = args.compiler_workdir
     compiled_models_dir = args.compiled_models_dir
     batch_size = 1
-    frames = 21  # default: 21, reduced from 8 due to compiler instruction limit
+    frames = 2  # Compiled with frames=2. Runtime num_frames should be 5: (5-1)//4+1=2
     # height, width = 32, 32  # default: 96, 96
     in_channels = 48
+
+    # Calculate correct sequence length after patch embedding
+    # patch_size for Wan2.2-TI2V is (1, 2, 2)
+    patch_size_t, patch_size_h, patch_size_w = 1, 2, 2
+    seq_len = (frames // patch_size_t) * (latent_height // patch_size_h) * (latent_width // patch_size_w)
+
     sample_hidden_states = torch.ones((batch_size, in_channels, frames, latent_height, latent_width), dtype=torch.bfloat16)
     sample_encoder_hidden_states = torch.ones((batch_size, max_sequence_length, hidden_size), dtype=torch.bfloat16)
-    sample_timestep = torch.ones((batch_size, 256*frames), dtype=torch.float32)
+    sample_timestep = torch.ones((batch_size, seq_len), dtype=torch.float32)  # 修正：使用计算的seq_len
 
     get_transformer_model_f = partial(get_transformer_model, tp_degree)
     with torch.no_grad():

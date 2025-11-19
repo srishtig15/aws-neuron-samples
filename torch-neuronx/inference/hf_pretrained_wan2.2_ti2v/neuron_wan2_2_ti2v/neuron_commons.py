@@ -1,5 +1,6 @@
 from diffusers.models.transformers.transformer_wan import WanTransformer3DModel
 from transformers.models.umt5 import UMT5EncoderModel
+import torch.jit
 from torch import nn
 from types import SimpleNamespace
 
@@ -49,18 +50,92 @@ class SimpleWrapper(nn.Module):
     def __init__(self, model):
         super().__init__()
         self.model = model
+        # Store the expected feat_cache shapes for compiled decoder
+        self.feat_cache_shapes = None
+
+    def _init_feat_cache_shapes(self, x):
+        """Initialize feat_cache shapes based on input x"""
+        batch_size = x.shape[0]
+        latent_height = x.shape[3]
+        latent_width = x.shape[4]
+
+        # Create dummy feat_cache with correct shapes (matching compile_decoder.py)
+        self.feat_cache_shapes = [
+            (batch_size, 48, 2, latent_height, latent_width),  # 0: conv_in
+            (batch_size, 1024, 2, latent_height, latent_width),  # 1-4: mid_block
+            (batch_size, 1024, 2, latent_height, latent_width),
+            (batch_size, 1024, 2, latent_height, latent_width),
+            (batch_size, 1024, 2, latent_height, latent_width),
+            (batch_size, 1024, 2, latent_height, latent_width),
+            (batch_size, 1024, 2, latent_height, latent_width),  # 5-11: up_blocks.0
+            (batch_size, 1024, 2, latent_height, latent_width),
+            (batch_size, 1024, 2, latent_height, latent_width),
+            (batch_size, 1024, 2, latent_height, latent_width),
+            (batch_size, 1024, 2, latent_height, latent_width),
+            (batch_size, 1024, 2, latent_height, latent_width),
+            (batch_size, 1024, 2, latent_height, latent_width),
+            (batch_size, 1024, 2, latent_height*2, latent_width*2),  # 12-18: up_blocks.1
+            (batch_size, 1024, 2, latent_height*2, latent_width*2),
+            (batch_size, 1024, 2, latent_height*2, latent_width*2),
+            (batch_size, 1024, 2, latent_height*2, latent_width*2),
+            (batch_size, 1024, 2, latent_height*2, latent_width*2),
+            (batch_size, 1024, 2, latent_height*2, latent_width*2),
+            (batch_size, 1024, 2, latent_height*2, latent_width*2),
+            (batch_size, 1024, 2, latent_height*4, latent_width*4),  # 19-25: up_blocks.2
+            (batch_size, 512, 2, latent_height*4, latent_width*4),
+            (batch_size, 512, 2, latent_height*4, latent_width*4),
+            (batch_size, 512, 2, latent_height*4, latent_width*4),
+            (batch_size, 512, 2, latent_height*4, latent_width*4),
+            (batch_size, 512, 2, latent_height*4, latent_width*4),
+            (batch_size, 512, 2, latent_height*8, latent_width*8),
+            (batch_size, 256, 2, latent_height*8, latent_width*8),  # 26-33: up_blocks.3
+            (batch_size, 256, 2, latent_height*8, latent_width*8),
+            (batch_size, 256, 2, latent_height*8, latent_width*8),
+            (batch_size, 256, 2, latent_height*8, latent_width*8),
+            (batch_size, 256, 2, latent_height*8, latent_width*8),
+            (batch_size, 256, 2, latent_height*8, latent_width*8),
+            (batch_size, 256, 2, latent_height*8, latent_width*8),
+            (batch_size, 12, 2, latent_height*8, latent_width*8),
+        ]
+
     def forward(self, x, **kwargs):
         # print('self.model:', self.model)
         # print('x:', x.shape)  # , x
         # print('kwargs:', kwargs)
-        if 'feat_cache' in kwargs:  # For WanDecoder3d
-            output = self.model(x, feat_cache=kwargs['feat_cache'])
+
+        if 'feat_cache' in kwargs:
+            feat_cache = kwargs['feat_cache']
+
+            # Check if this is a compiled TorchScript model
+            is_torchscript = isinstance(self.model, torch.jit.ScriptModule)
+
+            if is_torchscript:
+                # TorchScript models cannot accept None in lists
+                # Replace None with zero tensors of correct shape
+                if self.feat_cache_shapes is None:
+                    self._init_feat_cache_shapes(x)
+
+                # Replace None values with zero tensors
+                feat_cache_fixed = []
+                for i, cache in enumerate(feat_cache):
+                    if cache is None and i < len(self.feat_cache_shapes):
+                        # Create zero tensor with correct shape
+                        feat_cache_fixed.append(torch.zeros(self.feat_cache_shapes[i], dtype=x.dtype, device=x.device))
+                    else:
+                        feat_cache_fixed.append(cache)
+
+                output = self.model(x, feat_cache_fixed)
+            else:
+                # Uncompiled model can handle None
+                output = self.model(x, feat_cache=feat_cache)
         else:
             output = self.model(x)
         # print('output:', output.shape)  # , output
         return output
+
     def clear_cache(self):
-        self.model.clear_cache()
+        if hasattr(self.model, 'clear_cache'):
+            self.model.clear_cache()
 
 import torch
 import math

@@ -19,9 +19,11 @@ python neuron_wan2_2_ti2v/compile_transformer_latency_optimized.py \
 --height 512 \
 --width 512
 
-# echo "compiling decoder"
-# python neuron_wan2_2_ti2v/compile_decoder.py \
-# --compiled_models_dir "compile_workdir_latency_optimized"
+echo "compiling decoder"
+python neuron_wan2_2_ti2v/compile_decoder.py \
+--compiled_models_dir "compile_workdir_latency_optimized" \
+--height 512 \
+--width 512
 
 echo "run wan2.2 ti2v latency optimized"
 export NEURON_RT_NUM_CORES=4
