@@ -43,7 +43,7 @@ def compile_decoder(args):
     compiled_models_dir = args.compiled_models_dir
     
     batch_size = 1
-    frames = 2  # default: 21
+    frames = 2  # Must be 2 because decoder needs CACHE_T=2 frames to initialize feat_cache
     # height, width = 32,32  # default: 96, 96
     in_channels = 48
     
@@ -57,7 +57,7 @@ def compile_decoder(args):
     # del decoder.up_blocks
     # del decoder.norm_out
     # del decoder.conv_out
-    print('decoder:', decoder)
+    # print('decoder:', decoder)
     
     with torch.no_grad():
         sample_inputs_1 = torch.rand((batch_size, in_channels, frames, latent_height, latent_width), dtype=torch.float32)

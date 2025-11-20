@@ -50,6 +50,20 @@ class SimpleWrapper(nn.Module):
     def __init__(self, model):
         super().__init__()
         self.model = model
+
+    def forward(self, x, **kwargs):
+        output = self.model(x, **kwargs)
+        return output
+
+    def clear_cache(self):
+        if hasattr(self.model, 'clear_cache'):
+            self.model.clear_cache()
+
+class DecoderWrapper(nn.Module):
+    """Specialized wrapper for VAE decoder that handles TorchScript feat_cache compatibility"""
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
         # Store the expected feat_cache shapes for compiled decoder
         self.feat_cache_shapes = None
 
@@ -59,50 +73,46 @@ class SimpleWrapper(nn.Module):
         latent_height = x.shape[3]
         latent_width = x.shape[4]
 
-        # Create dummy feat_cache with correct shapes (matching compile_decoder.py)
+        # Create dummy feat_cache with correct shapes (EXACTLY matching compile_decoder.py lines 67-100)
+        # All feat_cache tensors have time dimension of 2 (CACHE_T=2)
         self.feat_cache_shapes = [
             (batch_size, 48, 2, latent_height, latent_width),  # 0: conv_in
-            (batch_size, 1024, 2, latent_height, latent_width),  # 1-4: mid_block
-            (batch_size, 1024, 2, latent_height, latent_width),
-            (batch_size, 1024, 2, latent_height, latent_width),
-            (batch_size, 1024, 2, latent_height, latent_width),
-            (batch_size, 1024, 2, latent_height, latent_width),
-            (batch_size, 1024, 2, latent_height, latent_width),  # 5-11: up_blocks.0
-            (batch_size, 1024, 2, latent_height, latent_width),
-            (batch_size, 1024, 2, latent_height, latent_width),
-            (batch_size, 1024, 2, latent_height, latent_width),
-            (batch_size, 1024, 2, latent_height, latent_width),
-            (batch_size, 1024, 2, latent_height, latent_width),
-            (batch_size, 1024, 2, latent_height, latent_width),
-            (batch_size, 1024, 2, latent_height*2, latent_width*2),  # 12-18: up_blocks.1
-            (batch_size, 1024, 2, latent_height*2, latent_width*2),
-            (batch_size, 1024, 2, latent_height*2, latent_width*2),
-            (batch_size, 1024, 2, latent_height*2, latent_width*2),
-            (batch_size, 1024, 2, latent_height*2, latent_width*2),
-            (batch_size, 1024, 2, latent_height*2, latent_width*2),
-            (batch_size, 1024, 2, latent_height*2, latent_width*2),
-            (batch_size, 1024, 2, latent_height*4, latent_width*4),  # 19-25: up_blocks.2
-            (batch_size, 512, 2, latent_height*4, latent_width*4),
-            (batch_size, 512, 2, latent_height*4, latent_width*4),
-            (batch_size, 512, 2, latent_height*4, latent_width*4),
-            (batch_size, 512, 2, latent_height*4, latent_width*4),
-            (batch_size, 512, 2, latent_height*4, latent_width*4),
-            (batch_size, 512, 2, latent_height*8, latent_width*8),
-            (batch_size, 256, 2, latent_height*8, latent_width*8),  # 26-33: up_blocks.3
-            (batch_size, 256, 2, latent_height*8, latent_width*8),
-            (batch_size, 256, 2, latent_height*8, latent_width*8),
-            (batch_size, 256, 2, latent_height*8, latent_width*8),
-            (batch_size, 256, 2, latent_height*8, latent_width*8),
-            (batch_size, 256, 2, latent_height*8, latent_width*8),
-            (batch_size, 256, 2, latent_height*8, latent_width*8),
-            (batch_size, 12, 2, latent_height*8, latent_width*8),
+            (batch_size, 1024, 2, latent_height, latent_width),  # 1: mid_block.resnets.0.conv1
+            (batch_size, 1024, 2, latent_height, latent_width),  # 2: mid_block.resnets.0.conv2
+            (batch_size, 1024, 2, latent_height, latent_width),  # 3: mid_block.resnets.1.conv1
+            (batch_size, 1024, 2, latent_height, latent_width),  # 4: mid_block.resnets.1.conv2
+            (batch_size, 1024, 2, latent_height, latent_width),  # 5: up_blocks.0.resnets.0.conv1
+            (batch_size, 1024, 2, latent_height, latent_width),  # 6: up_blocks.0.resnets.0.conv2
+            (batch_size, 1024, 2, latent_height, latent_width),  # 7: up_blocks.0.resnets.1.conv1
+            (batch_size, 1024, 2, latent_height, latent_width),  # 8: up_blocks.0.resnets.1.conv2
+            (batch_size, 1024, 2, latent_height, latent_width),  # 9: up_blocks.0.resnets.2.conv1
+            (batch_size, 1024, 2, latent_height, latent_width),  # 10: up_blocks.0.resnets.2.conv2
+            (batch_size, 1024, 2, latent_height, latent_width),  # 11: up_blocks.0.upsampler.time_conv
+            (batch_size, 1024, 2, latent_height*2, latent_width*2),  # 12: up_blocks.1.resnets.0.conv1
+            (batch_size, 1024, 2, latent_height*2, latent_width*2),  # 13: up_blocks.1.resnets.0.conv2
+            (batch_size, 1024, 2, latent_height*2, latent_width*2),  # 14: up_blocks.1.resnets.1.conv1
+            (batch_size, 1024, 2, latent_height*2, latent_width*2),  # 15: up_blocks.1.resnets.1.conv2
+            (batch_size, 1024, 2, latent_height*2, latent_width*2),  # 16: up_blocks.1.resnets.2.conv1
+            (batch_size, 1024, 2, latent_height*2, latent_width*2),  # 17: up_blocks.1.resnets.2.conv2
+            (batch_size, 1024, 2, latent_height*2, latent_width*2),  # 18: up_blocks.1.upsampler.time_conv
+            (batch_size, 1024, 2, latent_height*4, latent_width*4),  # 19: up_blocks.2.resnets.0.conv1
+            (batch_size, 512, 2, latent_height*4, latent_width*4),  # 20: up_blocks.2.resnets.0.conv2
+            (batch_size, 512, 2, latent_height*4, latent_width*4),  # 21: up_blocks.2.resnets.0.conv_shortcut
+            (batch_size, 512, 2, latent_height*4, latent_width*4),  # 22: up_blocks.2.resnets.1.conv1
+            (batch_size, 512, 2, latent_height*4, latent_width*4),  # 23: up_blocks.2.resnets.1.conv2
+            (batch_size, 512, 2, latent_height*4, latent_width*4),  # 24: up_blocks.2.resnets.2.conv1
+            (batch_size, 512, 2, latent_height*8, latent_width*8),  # 25: up_blocks.2.resnets.2.conv2
+            (batch_size, 256, 2, latent_height*8, latent_width*8),  # 26: up_blocks.3.resnets.0.conv1
+            (batch_size, 256, 2, latent_height*8, latent_width*8),  # 27: up_blocks.3.resnets.0.conv2
+            (batch_size, 256, 2, latent_height*8, latent_width*8),  # 28: up_blocks.3.resnets.0.conv_shortcut
+            (batch_size, 256, 2, latent_height*8, latent_width*8),  # 29: up_blocks.3.resnets.1.conv1
+            (batch_size, 256, 2, latent_height*8, latent_width*8),  # 30: up_blocks.3.resnets.1.conv2
+            (batch_size, 256, 2, latent_height*8, latent_width*8),  # 31: up_blocks.3.resnets.2.conv1
+            (batch_size, 256, 2, latent_height*8, latent_width*8),  # 32: up_blocks.3.resnets.2.conv2 (dummy, not used)
+            (batch_size, 12, 2, latent_height*8, latent_width*8),  # 33: conv_out (dummy, not used)
         ]
 
     def forward(self, x, **kwargs):
-        # print('self.model:', self.model)
-        # print('x:', x.shape)  # , x
-        # print('kwargs:', kwargs)
-
         if 'feat_cache' in kwargs:
             feat_cache = kwargs['feat_cache']
 
@@ -124,13 +134,13 @@ class SimpleWrapper(nn.Module):
                     else:
                         feat_cache_fixed.append(cache)
 
+                # Pass as positional arguments for TorchScript
                 output = self.model(x, feat_cache_fixed)
             else:
-                # Uncompiled model can handle None
+                # Uncompiled model can handle None and keyword arguments
                 output = self.model(x, feat_cache=feat_cache)
         else:
             output = self.model(x)
-        # print('output:', output.shape)  # , output
         return output
 
     def clear_cache(self):

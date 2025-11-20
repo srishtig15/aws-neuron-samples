@@ -12,6 +12,7 @@ import torch_neuronx
 from neuron_wan2_2_ti2v.neuron_commons import InferenceTextEncoderWrapper
 from neuron_wan2_2_ti2v.neuron_commons import InferenceTransformerWrapper
 from neuron_wan2_2_ti2v.neuron_commons import SimpleWrapper
+from neuron_wan2_2_ti2v.neuron_commons import DecoderWrapper
 
 COMPILED_MODELS_DIR = "compile_workdir_latency_optimized"
 HUGGINGFACE_CACHE_DIR = "wan2.2_ti2v_hf_cache_dir"
@@ -57,10 +58,11 @@ if __name__ == "__main__":
     # )
     print('transformer_wrapper.transformer end ****************')
 
-    vae_decoder_wrapper = SimpleWrapper(pipe.vae.decoder)
+    vae_decoder_wrapper = DecoderWrapper(pipe.vae.decoder)
     print('vae_decoder_wrapper.model start ****************')
     # Decoder CANNOT use DataParallel because it accepts feat_cache (list argument)
     # DataParallel's scatter mechanism cannot handle list of tensors
+    # Use DecoderWrapper to handle TorchScript's feat_cache compatibility (None -> zero tensors)
     vae_decoder_wrapper.model = torch.jit.load(decoder_model_path)
     print('vae_decoder_wrapper.model:', vae_decoder_wrapper.model)
     print('vae_decoder_wrapper.model end ****************')
@@ -68,8 +70,7 @@ if __name__ == "__main__":
     vae_post_quant_conv_wrapper = SimpleWrapper(pipe.vae.post_quant_conv)
     print('vae_post_quant_conv_wrapper.model start ****************')
     vae_post_quant_conv_wrapper.model = torch_neuronx.DataParallel(
-        # torch.jit.load(post_quant_conv_model_path), [0, 1, 2, 3], False # Use for trn2
-        torch.jit.load(post_quant_conv_model_path), [0, 1, 2, 3], False # Use for trn1/inf2, 4, 5, 6, 7
+        torch.jit.load(post_quant_conv_model_path), [0, 1, 2, 3], False
     )
     print('vae_post_quant_conv_wrapper.model end ****************')
     
@@ -85,9 +86,9 @@ if __name__ == "__main__":
     output_warmup = pipe(
         prompt=prompt,
         negative_prompt=negative_prompt,
-        height=512,  # default: 480
-        width=512,  # default: 832
-        num_frames=7,  # default: 81
+        height=512,  # Compiled with 512x512
+        width=512,  # Compiled with 512x512
+        num_frames=7,  # Reduced from 7 to lower memory usage, produces latent_frames=2: (5-1)//4+1=2
         guidance_scale=5.0,
         max_sequence_length=seqlen  # default: 512
     ).frames[0]
@@ -98,9 +99,9 @@ if __name__ == "__main__":
     output = pipe(
         prompt=prompt,
         negative_prompt=negative_prompt,
-        height=512,  # default: 480
-        width=512,  # default: 832
-        num_frames=7,  # default: 81
+        height=512,  # Compiled with 512x512
+        width=512,  # Compiled with 512x512
+        num_frames=7,  # Reduced from 7 to lower memory usage, produces latent_frames=2: (5-1)//4+1=2
         guidance_scale=5.0,
         num_inference_steps=50,  # default: 50
         max_sequence_length=seqlen  # default: 512
