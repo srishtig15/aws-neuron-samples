@@ -43,7 +43,7 @@ def compile_decoder(args):
     compiled_models_dir = args.compiled_models_dir
     
     batch_size = 1
-    frames = 2  # Must be 2 because decoder needs CACHE_T=2 frames to initialize feat_cache
+    frames = 4  # Must be 2 because decoder needs CACHE_T=2 frames to initialize feat_cache
     # height, width = 32,32  # default: 96, 96
     in_channels = 48
     

@@ -93,7 +93,7 @@ def compile_transformer(args):
     compiler_workdir = args.compiler_workdir
     compiled_models_dir = args.compiled_models_dir
     batch_size = 1
-    frames = 2  # Compiled with frames=2. Runtime num_frames should be 5: (5-1)//4+1=2
+    frames = 4  # Compiled with frames=2. Runtime num_frames should be 5: (5-1)//4+1=2
     # height, width = 32, 32  # default: 96, 96
     in_channels = 48
 

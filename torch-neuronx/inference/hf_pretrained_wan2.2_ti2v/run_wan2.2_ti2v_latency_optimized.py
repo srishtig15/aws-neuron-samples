@@ -88,7 +88,7 @@ if __name__ == "__main__":
         negative_prompt=negative_prompt,
         height=512,  # Compiled with 512x512
         width=512,  # Compiled with 512x512
-        num_frames=7,  # Reduced from 7 to lower memory usage, produces latent_frames=2: (5-1)//4+1=2
+        num_frames=16,  # Reduced from 7 to lower memory usage, produces latent_frames=2: (5-1)//4+1=2
         guidance_scale=5.0,
         max_sequence_length=seqlen  # default: 512
     ).frames[0]
@@ -101,7 +101,7 @@ if __name__ == "__main__":
         negative_prompt=negative_prompt,
         height=512,  # Compiled with 512x512
         width=512,  # Compiled with 512x512
-        num_frames=7,  # Reduced from 7 to lower memory usage, produces latent_frames=2: (5-1)//4+1=2
+        num_frames=16,  # Reduced from 7 to lower memory usage, produces latent_frames=2: (5-1)//4+1=2
         guidance_scale=5.0,
         num_inference_steps=50,  # default: 50
         max_sequence_length=seqlen  # default: 512
