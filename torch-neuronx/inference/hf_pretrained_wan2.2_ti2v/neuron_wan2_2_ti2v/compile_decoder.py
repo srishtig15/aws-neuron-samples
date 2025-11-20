@@ -2,10 +2,10 @@ import os
 os.environ["NEURON_INTERNAL_USE_VANILLA_TORCH_XLA"] = "1"  # RuntimeError: Unknown custom-call API version enum value: 0 (API_VERSION_UNSPECIFIED) https://github.com/aws-neuron/aws-neuron-sdk/issues/789
 os.environ["NEURON_FUSE_SOFTMAX"] = "1"
 os.environ["NEURON_CUSTOM_SILU"] = "1"
-# os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "2" # Comment this line out if using trn1/inf2
-# os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2" # Comment this line out if using trn1/inf2
-# compiler_flags = """ --verbose=INFO --target=trn2 --lnc=2 --model-type=unet-inference --enable-fast-loading-neuron-binaries """ # Use these compiler flags for trn2
-compiler_flags = """ --verbose=INFO --target=trn1 --model-type=unet-inference --enable-fast-loading-neuron-binaries """ # Use these compiler flags for trn1/inf2. optlevel=1 creates smaller subgraphs
+os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "2" # Comment this line out if using trn1/inf2
+os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2" # Comment this line out if using trn1/inf2
+compiler_flags = """ --verbose=INFO --target=trn2 --lnc=2 --model-type=unet-inference --enable-fast-loading-neuron-binaries """ # Use these compiler flags for trn2
+# compiler_flags = """ --verbose=INFO --target=trn1 --model-type=unet-inference --enable-fast-loading-neuron-binaries """ # Use these compiler flags for trn1/inf2. optlevel=1 creates smaller subgraphs
 os.environ["NEURON_CC_FLAGS"] = os.environ.get("NEURON_CC_FLAGS", "") + compiler_flags
 
 from diffusers import AutoencoderKLWan

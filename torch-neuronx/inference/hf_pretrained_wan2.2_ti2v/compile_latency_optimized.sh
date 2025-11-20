@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# source /opt/aws_neuronx_venv_pytorch_2_7_nxd_inference/bin/activate
+# source /opt/aws_neuronx_venv_pytorch_2_8_nxd_inference/bin/activate
 
 export PYTHONPATH=`pwd`:$PYTHONPATH
 
