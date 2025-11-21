@@ -43,7 +43,8 @@ def compile_decoder(args):
     compiled_models_dir = args.compiled_models_dir
     
     batch_size = 1
-    frames = 4  # Must be 2 because decoder needs CACHE_T=2 frames to initialize feat_cache
+    decoder_frames = 2  # Decoder needs CACHE_T=2 frames (will pad 1-frame inputs at runtime)
+    latent_frames = 4  # post_quant_conv processes full latents. For num_frames=15: (15-1)//4+1=4
     # height, width = 32,32  # default: 96, 96
     in_channels = 48
     
@@ -60,7 +61,8 @@ def compile_decoder(args):
     # print('decoder:', decoder)
     
     with torch.no_grad():
-        sample_inputs_1 = torch.rand((batch_size, in_channels, frames, latent_height, latent_width), dtype=torch.float32)
+        # Decoder input: always 2 frames (CACHE_T=2)
+        decoder_input = torch.rand((batch_size, in_channels, decoder_frames, latent_height, latent_width), dtype=torch.float32)
 
         # 根据analyze_decoder_full.py的分析结果，创建完整的feat_cache
         feat_cache = [
@@ -104,7 +106,7 @@ def compile_decoder(args):
         # Will load without DataParallel at runtime to support list arguments
         compiled_decoder = torch_neuronx.trace(
             decoder,
-            (sample_inputs_1, feat_cache),
+            (decoder_input, feat_cache),
             compiler_workdir=f"{compiler_workdir}/decoder",
             compiler_args=compiler_flags,
             inline_weights_to_neff=False)
@@ -114,11 +116,12 @@ def compile_decoder(args):
             os.makedirs(compiled_model_dir)
         torch.jit.save(compiled_decoder, f"{compiled_model_dir}/model.pt")
 
-        sample_inputs = torch.rand((batch_size, in_channels, frames, latent_height, latent_width), dtype=torch.float32)
-        
+        # post_quant_conv input: full latent_frames (e.g., 4 for num_frames=15)
+        post_quant_conv_input = torch.rand((batch_size, in_channels, latent_frames, latent_height, latent_width), dtype=torch.float32)
+
         compiled_post_quant_conv = torch_neuronx.trace(
             vae.post_quant_conv,
-            sample_inputs,
+            post_quant_conv_input,
             compiler_workdir=f"{compiler_workdir}/post_quant_conv",
             compiler_args=compiler_flags,
             inline_weights_to_neff=False)

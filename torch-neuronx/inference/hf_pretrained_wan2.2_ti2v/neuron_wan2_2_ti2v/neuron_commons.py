@@ -120,8 +120,13 @@ class DecoderWrapper(nn.Module):
             is_torchscript = isinstance(self.model, torch.jit.ScriptModule)
 
             if is_torchscript:
-                # TorchScript models cannot accept None in lists
-                # Replace None with zero tensors of correct shape
+                # Compiled model expects 2 frames (CACHE_T=2)
+                # If we only have 1 frame, pad it by duplicating
+                original_frame_count = x.shape[2]
+                if original_frame_count == 1:
+                    # Duplicate the frame to make it 2 frames
+                    x = torch.cat([x, x], dim=2)
+
                 if self.feat_cache_shapes is None:
                     self._init_feat_cache_shapes(x)
 
@@ -129,16 +134,20 @@ class DecoderWrapper(nn.Module):
                 feat_cache_fixed = []
                 for i, cache in enumerate(feat_cache):
                     if cache is None and i < len(self.feat_cache_shapes):
-                        # Create zero tensor with correct shape
                         feat_cache_fixed.append(torch.zeros(self.feat_cache_shapes[i], dtype=x.dtype, device=x.device))
                     else:
                         feat_cache_fixed.append(cache)
 
                 # Pass as positional arguments for TorchScript
                 output = self.model(x, feat_cache_fixed)
+
+                # If original input was 1 frame, only return the last frame
+                if original_frame_count == 1:
+                    output = output[:, :, -1:, :, :]
+
             else:
                 # Uncompiled model can handle None and keyword arguments
-                output = self.model(x, feat_cache=feat_cache)
+                output = self.model(x, feat_cache=feat_cache, **kwargs)
         else:
             output = self.model(x)
         return output
