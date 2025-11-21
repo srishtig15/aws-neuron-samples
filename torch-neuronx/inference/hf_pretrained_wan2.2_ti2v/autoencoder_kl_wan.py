@@ -1205,21 +1205,15 @@ class AutoencoderKLWan(ModelMixin, ConfigMixin, FromOriginalModelMixin):
 
         self.clear_cache()
         x = self.post_quant_conv(z)
-        # Process frames: first call with 2 frames (if available), then frame by frame
-        i = 0
-        while i < num_frame:
+        for i in range(num_frame):
             self._conv_idx = [0]
             if i == 0:
-                # First call: pass 2 frames if available (decoder needs CACHE_T=2 for initialization)
-                end_idx = min(2, num_frame)
                 out = self.decoder(
-                    x[:, :, 0 : end_idx, :, :], feat_cache=self._feat_map, feat_idx=self._conv_idx, first_chunk=True
+                    x[:, :, i : i + 1, :, :], feat_cache=self._feat_map, feat_idx=self._conv_idx, first_chunk=True
                 )
-                i = end_idx  # Move to next unprocessed frame
             else:
                 out_ = self.decoder(x[:, :, i : i + 1, :, :], feat_cache=self._feat_map, feat_idx=self._conv_idx)
                 out = torch.cat([out, out_], 2)
-                i += 1
 
         if self.config.patch_size is not None:
             out = unpatchify(out, patch_size=self.config.patch_size)

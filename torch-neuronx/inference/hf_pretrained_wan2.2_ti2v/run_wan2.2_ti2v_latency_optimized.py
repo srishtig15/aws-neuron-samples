@@ -108,4 +108,6 @@ if __name__ == "__main__":
     ).frames[0]
     end = time.time()
     print('time:', end-start)
+    print(f"Output shape: {output.shape}")
+    print(f"Output frames: {len(output)}")
     export_to_video(output, "output.mp4", fps=15)
