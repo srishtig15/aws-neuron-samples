@@ -16,7 +16,7 @@ from neuron_wan2_2_ti2v.neuron_commons import InferenceTextEncoderWrapper
 from neuron_wan2_2_ti2v.neuron_commons import InferenceTransformerWrapper
 from neuron_wan2_2_ti2v.neuron_commons import SimpleWrapper
 from neuron_wan2_2_ti2v.neuron_commons import DecoderWrapper
-from neuron_wan2_2_ti2v.neuron_commons import EncoderWrapper
+from neuron_wan2_2_ti2v.neuron_commons import EncoderWrapperNoCache
 
 COMPILED_MODELS_DIR = "compile_workdir_latency_optimized"
 HUGGINGFACE_CACHE_DIR = "wan2.2_ti2v_hf_cache_dir"
@@ -83,6 +83,7 @@ if __name__ == "__main__":
     decoder_model_path = f"{COMPILED_MODELS_DIR}/decoder/model.pt"
     post_quant_conv_model_path = f"{COMPILED_MODELS_DIR}/post_quant_conv/model.pt"
     encoder_model_path = f"{COMPILED_MODELS_DIR}/encoder/model.pt"
+    quant_conv_model_path = f"{COMPILED_MODELS_DIR}/quant_conv/model.pt"
     
     seqlen=512  # default: 512
     
@@ -125,21 +126,30 @@ if __name__ == "__main__":
         torch.jit.load(post_quant_conv_model_path), [0, 1, 2, 3], False
     )
     print('vae_post_quant_conv_wrapper.model end ****************')
-    
-    # vae_encoder_wrapper = EncoderWrapper(pipe.vae.encoder)
+
+    # # Encoder was compiled WITHOUT feat_cache (I2V only needs 1-frame processing)
+    # vae_encoder_wrapper = EncoderWrapperNoCache(pipe.vae.encoder)
     # print('vae_encoder_wrapper.model start ****************')
-    # # Decoder CANNOT use DataParallel because it accepts feat_cache (list argument)
-    # # DataParallel's scatter mechanism cannot handle list of tensors
-    # # Use EncoderWrapper to handle TorchScript's feat_cache compatibility (None -> zero tensors)
-    # vae_encoder_wrapper.model = torch.jit.load(encoder_model_path)
-    # # print('vae_encoder_wrapper.model:', vae_encoder_wrapper.model)
+    # # Encoder can use DataParallel since it was compiled without feat_cache (no list arguments)
+    # vae_encoder_wrapper.model = torch_neuronx.DataParallel(
+    #     torch.jit.load(encoder_model_path), [0, 1, 2, 3], False
+    # )
     # print('vae_encoder_wrapper.model end ****************')
-    
+
+    # Load compiled quant_conv (separate from encoder)
+    vae_quant_conv_wrapper = SimpleWrapper(pipe.vae.quant_conv)
+    print('vae_quant_conv_wrapper.model start ****************')
+    vae_quant_conv_wrapper.model = torch_neuronx.DataParallel(
+        torch.jit.load(quant_conv_model_path), [0, 1, 2, 3], False
+    )
+    print('vae_quant_conv_wrapper.model end ****************')
+
     pipe.text_encoder = text_encoder_wrapper
     pipe.transformer = transformer_wrapper
     pipe.vae.decoder = vae_decoder_wrapper
     pipe.vae.post_quant_conv = vae_post_quant_conv_wrapper
     # pipe.vae.encoder = vae_encoder_wrapper
+    pipe.vae.quant_conv = vae_quant_conv_wrapper
     
     height = 512
     width = 512

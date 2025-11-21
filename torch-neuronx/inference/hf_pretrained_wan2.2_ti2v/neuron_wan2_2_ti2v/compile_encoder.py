@@ -23,7 +23,7 @@ def compile_encoder(args):
     width = args.width
 
     batch_size = 1
-    encoder_frames = 2  # Compile with CACHE_T=2 frames (EncoderWrapper will pad 1-frame I2V inputs at runtime)
+    encoder_frames = 1  # Compile with CACHE_T=2 frames (EncoderWrapper will pad 1-frame I2V inputs at runtime)
 
     model_id = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
     vae = AutoencoderKLWan.from_pretrained(
@@ -50,7 +50,9 @@ def compile_encoder(args):
     print(f'  Encoder input: (batch_size={batch_size}, channels={in_channels}, frames={encoder_frames}, height={patchified_height}, width={patchified_width})')
     
     with torch.no_grad():
-        # Encoder input: AFTER patchify (CACHE_T=2 frames for compilation)
+        # Encoder input: AFTER patchify
+        # Compile with 2 frames (CACHE_T=2) to avoid "Value out of range" error
+        # At runtime, EncoderWrapper will pad 1-frame I2V inputs to 2 frames
         # If patch_size=2: (1, 12, 2, 256, 256)
         # If patch_size=1 or None: (1, 3, 2, 512, 512)
         encoder_input = torch.rand(
@@ -58,7 +60,7 @@ def compile_encoder(args):
             dtype=torch.float32
         )
 
-        # Encoder feat_cache: 26 layers
+        # Encoder feat_cache: 24 layers (excluding conv_shortcut layers)
         # IMPORTANT: feat_cache stores INPUT shape to each conv layer
         # Spatial dimensions are AFTER patchify and downsample progressively
         # For 512x512 input with patch_size=2:
@@ -108,23 +110,61 @@ def compile_encoder(args):
 
         print(f'feat_cache has {len(feat_cache)} elements')
 
-        # Trace encoder with feat_cache
-        # Cannot use DataParallel at runtime because it doesn't support list[Tensor] arguments
-        print("\nTracing encoder...")
-        compiled_encoder = torch_neuronx.trace(
-            encoder,
-            (encoder_input, feat_cache),
-            compiler_workdir=f"{compiler_workdir}/encoder",
+        # # Trace encoder with feat_cache
+        # # Cannot use DataParallel at runtime because it doesn't support list[Tensor] arguments
+        # print("\nTracing encoder...")
+        # compiled_encoder = torch_neuronx.trace(
+        #     encoder,
+        #     encoder_input,  # (encoder_input, feat_cache),
+        #     compiler_workdir=f"{compiler_workdir}/encoder",
+        #     compiler_args=compiler_flags.split(),
+        #     inline_weights_to_neff=False
+        # )
+
+        # # Save compiled model
+        # compiled_model_dir = f"{compiled_models_dir}/encoder"
+        # if not os.path.exists(compiled_model_dir):
+        #     os.makedirs(compiled_model_dir)
+        # torch.jit.save(compiled_encoder, f"{compiled_model_dir}/model.pt")
+        # print(f"\nCompiled encoder saved to: {compiled_model_dir}/model.pt")
+
+        # Compile quant_conv (separate from encoder, like post_quant_conv in decoder)
+        # quant_conv does not use feat_cache, just channel conversion
+        print("\n" + "="*80)
+        print("Compiling quant_conv...")
+        print("="*80)
+
+        # quant_conv input: encoder output
+        # Encoder output shape: (batch_size, z_dim*2, output_frames, latent_h, latent_w)
+        # For 512x512 input: (1, 32, output_frames, 32, 32)
+        # Note: encoder does 4x temporal compression, so 2 input frames → output_frames depends on caching behavior
+        # For I2V: quant_conv will process encoder output with variable frame count
+        # We compile with encoder_frames to match encoder compilation
+        z_channels = vae.config.z_dim * 2  # 32 channels
+
+        # quant_conv input has same spatial size as encoder output (32x32 for 512x512)
+        quant_conv_input = torch.rand(
+            (batch_size, z_channels, encoder_frames, patchified_height//8, patchified_width//8),
+            dtype=torch.float32
+        )
+
+        print(f'quant_conv input shape: {quant_conv_input.shape}')
+        print(f'quant_conv: {z_channels} → {z_channels} channels (1x1x1 conv)')
+
+        compiled_quant_conv = torch_neuronx.trace(
+            vae.quant_conv,
+            quant_conv_input,
+            compiler_workdir=f"{compiler_workdir}/quant_conv",
             compiler_args=compiler_flags.split(),
             inline_weights_to_neff=False
         )
 
-        # Save compiled model
-        compiled_model_dir = f"{compiled_models_dir}/encoder"
+        # Save compiled quant_conv
+        compiled_model_dir = f"{compiled_models_dir}/quant_conv"
         if not os.path.exists(compiled_model_dir):
             os.makedirs(compiled_model_dir)
-        torch.jit.save(compiled_encoder, f"{compiled_model_dir}/model.pt")
-        print(f"\nCompiled encoder saved to: {compiled_model_dir}/model.pt")
+        torch.jit.save(compiled_quant_conv, f"{compiled_model_dir}/model.pt")
+        print(f"\nCompiled quant_conv saved to: {compiled_model_dir}/model.pt")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

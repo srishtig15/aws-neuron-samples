@@ -60,6 +60,26 @@ class SimpleWrapper(nn.Module):
             self.model.clear_cache()
 
 
+class EncoderWrapperNoCache(nn.Module):
+    """Wrapper for compiled encoder that was compiled WITHOUT feat_cache
+
+    This wrapper ignores feat_cache and feat_idx arguments since the encoder
+    was compiled without temporal caching support.
+    """
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, x, feat_cache=None, feat_idx=None, **kwargs):
+        # Ignore feat_cache and feat_idx - compiled encoder doesn't use them
+        output = self.model(x)
+        return output
+
+    def clear_cache(self):
+        # No cache to clear
+        pass
+
+
 class EncoderWrapper(nn.Module):
     """Specialized wrapper for VAE encoder that handles TorchScript feat_cache compatibility"""
     def __init__(self, model):
