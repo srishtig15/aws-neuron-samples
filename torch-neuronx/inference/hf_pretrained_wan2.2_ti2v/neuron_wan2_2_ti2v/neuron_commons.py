@@ -141,9 +141,13 @@ class DecoderWrapper(nn.Module):
                 # Pass as positional arguments for TorchScript
                 output = self.model(x, feat_cache_fixed)
 
-                # If original input was 1 frame, only return the last frame
+                # If original input was 1 frame, decoder outputs 8 frames (2 latent × 4x upsampling)
+                # We take the last 4 frames (corresponding to the duplicated latent frame)
                 if original_frame_count == 1:
-                    output = output[:, :, -1:, :, :]
+                    # Decoder does 4x temporal upsampling: 1 latent frame → 4 output frames
+                    # Since we duplicated to 2 frames: 2 latent frames → 8 output frames
+                    # Take the last 4 frames (from the second, duplicated latent frame)
+                    output = output[:, :, -4:, :, :]
 
             else:
                 # Uncompiled model can handle None and keyword arguments
