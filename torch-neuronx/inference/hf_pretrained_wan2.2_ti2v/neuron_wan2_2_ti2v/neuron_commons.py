@@ -141,6 +141,11 @@ class DecoderWrapper(nn.Module):
                 # Pass as positional arguments for TorchScript
                 output = self.model(x, feat_cache_fixed)
 
+                # Propagate updates from feat_cache_fixed back to original feat_cache
+                # This is crucial for temporal caching to work across iterations
+                for i in range(len(feat_cache)):
+                    feat_cache[i] = feat_cache_fixed[i]
+
                 # If original input was 1 frame, decoder outputs 8 frames (2 latent × 4x upsampling)
                 # We take the last 4 frames (corresponding to the duplicated latent frame)
                 if original_frame_count == 1:
