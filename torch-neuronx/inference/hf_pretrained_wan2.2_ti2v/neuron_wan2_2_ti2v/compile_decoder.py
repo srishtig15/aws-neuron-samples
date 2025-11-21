@@ -1,5 +1,6 @@
 import os
-os.environ["NEURON_INTERNAL_USE_VANILLA_TORCH_XLA"] = "1"  # RuntimeError: Unknown custom-call API version enum value: 0 (API_VERSION_UNSPECIFIED) https://github.com/aws-neuron/aws-neuron-sdk/issues/789
+# os.environ["NEURON_INTERNAL_USE_VANILLA_TORCH_XLA"] = "1"  # RuntimeError: Unknown custom-call API version enum value: 0 (API_VERSION_UNSPECIFIED) https://github.com/aws-neuron/aws-neuron-sdk/issues/789
+os.environ["XLA_DISABLE_FUNCTIONALIZATION"] = "0"
 os.environ["NEURON_FUSE_SOFTMAX"] = "1"
 os.environ["NEURON_CUSTOM_SILU"] = "1"
 os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "2" # Comment this line out if using trn1/inf2
