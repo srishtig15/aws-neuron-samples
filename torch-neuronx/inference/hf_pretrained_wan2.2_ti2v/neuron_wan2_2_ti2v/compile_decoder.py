@@ -44,7 +44,7 @@ def compile_decoder(args):
     
     batch_size = 1
     decoder_frames = 2  # Decoder needs CACHE_T=2 frames (will pad 1-frame inputs at runtime)
-    latent_frames = 4  # post_quant_conv processes full latents. For num_frames=15: (15-1)//4+1=4
+    latent_frames = 21  # post_quant_conv processes full latents. For num_frames=15: (15-1)//4+1=4
     # height, width = 32,32  # default: 96, 96
     in_channels = 48
     
