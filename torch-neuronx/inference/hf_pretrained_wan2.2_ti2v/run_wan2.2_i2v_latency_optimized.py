@@ -15,6 +15,8 @@ import torch_neuronx
 from neuron_wan2_2_ti2v.neuron_commons import InferenceTextEncoderWrapper
 from neuron_wan2_2_ti2v.neuron_commons import InferenceTransformerWrapper
 from neuron_wan2_2_ti2v.neuron_commons import SimpleWrapper
+from neuron_wan2_2_ti2v.neuron_commons import DecoderWrapper
+from neuron_wan2_2_ti2v.neuron_commons import EncoderWrapper
 
 COMPILED_MODELS_DIR = "compile_workdir_latency_optimized"
 HUGGINGFACE_CACHE_DIR = "wan2.2_ti2v_hf_cache_dir"
@@ -39,6 +41,7 @@ def prepare_image_latents(pipe, image, num_frames, height, width, device, dtype,
     # 重要：为VAE添加时间维度 [batch, channels, num_frames=1, height, width]
     image = image.unsqueeze(2)  # [1, C, 1, H, W]
     image = image.to(device=device, dtype=dtype)
+    # print('image:', image.shape, image.dtype)
     
     # 编码图像到潜在空间
     with torch.no_grad():
@@ -79,6 +82,7 @@ if __name__ == "__main__":
     transformer_model_path = f"{COMPILED_MODELS_DIR}/transformer" 
     decoder_model_path = f"{COMPILED_MODELS_DIR}/decoder/model.pt"
     post_quant_conv_model_path = f"{COMPILED_MODELS_DIR}/post_quant_conv/model.pt"
+    encoder_model_path = f"{COMPILED_MODELS_DIR}/encoder/model.pt"
     
     seqlen=512  # default: 512
     
@@ -106,31 +110,40 @@ if __name__ == "__main__":
     # )
     print('transformer_wrapper.transformer end ****************')
 
-    # vae_decoder_wrapper = SimpleWrapper(pipe.vae.decoder)
-    # print('vae_decoder_wrapper.model start ****************')
-    # vae_decoder_wrapper.model = torch_neuronx.DataParallel( 
-    #     # torch.jit.load(decoder_model_path), [0, 1, 2, 3], False  # Use for trn2
-    #     torch.jit.load(decoder_model_path), [0, 1, 2, 3, 4, 5, 6, 7], False # Use for trn1/inf2
-    # )
+    vae_decoder_wrapper = DecoderWrapper(pipe.vae.decoder)
+    print('vae_decoder_wrapper.model start ****************')
+    # Decoder CANNOT use DataParallel because it accepts feat_cache (list argument)
+    # DataParallel's scatter mechanism cannot handle list of tensors
+    # Use DecoderWrapper to handle TorchScript's feat_cache compatibility (None -> zero tensors)
+    vae_decoder_wrapper.model = torch.jit.load(decoder_model_path)
     # print('vae_decoder_wrapper.model:', vae_decoder_wrapper.model)
-    # print('vae_decoder_wrapper.model end ****************')
+    print('vae_decoder_wrapper.model end ****************')
     
-    # vae_post_quant_conv_wrapper = SimpleWrapper(pipe.vae.post_quant_conv)
-    # print('vae_post_quant_conv_wrapper.model start ****************')
-    # vae_post_quant_conv_wrapper.model = torch_neuronx.DataParallel(
-    #     torch.jit.load(post_quant_conv_model_path), [0, 1, 2, 3], False # Use for trn2
-    #     # torch.jit.load(post_quant_conv_model_path), [0, 1, 2, 3, 4, 5, 6, 7], False # Use for trn1/inf2
-    # )
-    # print('vae_post_quant_conv_wrapper.model end ****************')
+    vae_post_quant_conv_wrapper = SimpleWrapper(pipe.vae.post_quant_conv)
+    print('vae_post_quant_conv_wrapper.model start ****************')
+    vae_post_quant_conv_wrapper.model = torch_neuronx.DataParallel(
+        torch.jit.load(post_quant_conv_model_path), [0, 1, 2, 3], False
+    )
+    print('vae_post_quant_conv_wrapper.model end ****************')
+    
+    # vae_encoder_wrapper = EncoderWrapper(pipe.vae.encoder)
+    # print('vae_encoder_wrapper.model start ****************')
+    # # Decoder CANNOT use DataParallel because it accepts feat_cache (list argument)
+    # # DataParallel's scatter mechanism cannot handle list of tensors
+    # # Use EncoderWrapper to handle TorchScript's feat_cache compatibility (None -> zero tensors)
+    # vae_encoder_wrapper.model = torch.jit.load(encoder_model_path)
+    # # print('vae_encoder_wrapper.model:', vae_encoder_wrapper.model)
+    # print('vae_encoder_wrapper.model end ****************')
     
     pipe.text_encoder = text_encoder_wrapper
     pipe.transformer = transformer_wrapper
-    # pipe.vae.decoder = vae_decoder_wrapper
-    # pipe.vae.post_quant_conv = vae_post_quant_conv_wrapper
+    pipe.vae.decoder = vae_decoder_wrapper
+    pipe.vae.post_quant_conv = vae_post_quant_conv_wrapper
+    # pipe.vae.encoder = vae_encoder_wrapper
     
     height = 512
     width = 512
-    num_frames = 61
+    num_frames = 81
     
     # 加载输入图像
     input_image = "cat.png"  # 或直接传入PIL Image对象
@@ -153,18 +166,19 @@ if __name__ == "__main__":
     prompt = "A cat walks on the grass, realistic"
     negative_prompt = "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
 
-    # start = time.time()
-    # output_warmup = pipe(
-    #     prompt=prompt,
-    #     negative_prompt=negative_prompt,
-    #     height=height,  # default: 480
-    #     width=width,  # default: 832
-    #     num_frames=num_frames,  # default: 81
-    #     guidance_scale=5.0,
-    #     max_sequence_length=seqlen  # default: 512
-    # ).frames[0]
-    # end = time.time()
-    # print('warmup time:', end-start)
+    start = time.time()
+    output_warmup = pipe(
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        height=height,  # default: 480
+        width=width,  # default: 832
+        num_frames=num_frames,  # default: 81
+        guidance_scale=5.0,
+        num_inference_steps=50,
+        max_sequence_length=seqlen  # default: 512
+    ).frames[0]
+    end = time.time()
+    print('warmup time:', end-start)
 
     start = time.time()
     output = pipe(
@@ -181,4 +195,4 @@ if __name__ == "__main__":
     ).frames[0]
     end = time.time()
     print('time:', end-start)
-    export_to_video(output, "output.mp4", fps=15)
+    export_to_video(output, "output.mp4", fps=24)

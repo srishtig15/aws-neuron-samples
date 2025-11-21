@@ -59,6 +59,114 @@ class SimpleWrapper(nn.Module):
         if hasattr(self.model, 'clear_cache'):
             self.model.clear_cache()
 
+
+class EncoderWrapper(nn.Module):
+    """Specialized wrapper for VAE encoder that handles TorchScript feat_cache compatibility"""
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+        # Store the expected feat_cache shapes for compiled encoder
+        self.feat_cache_shapes = None
+
+    def _init_feat_cache_shapes(self, x):
+        """Initialize feat_cache shapes based on input x (AFTER patchify)"""
+        batch_size = x.shape[0]
+        # x is AFTER patchify: (batch, 12, frames, patchified_height, patchified_width)
+        # For 512x512 input with patch_size=2: (batch, 12, frames, 256, 256)
+        patchified_height = x.shape[3]
+        patchified_width = x.shape[4]
+
+        # Create feat_cache with correct shapes (EXACTLY matching compile_encoder.py)
+        # IMPORTANT: feat_cache stores INPUT shape to each conv layer
+        # All feat_cache tensors have time dimension of 2 (CACHE_T=2)
+        # Encoder downsamples spatially from patchified resolution: 256 -> 128 -> 64 -> 32
+        self.feat_cache_shapes = [
+            # conv_in: 12 → 160
+            (batch_size, 12, 2, patchified_height, patchified_width),
+            # down_blocks.0: 160 channels throughout, 256x256
+            (batch_size, 160, 2, patchified_height, patchified_width),  # resnets.0.conv1 (160→160)
+            (batch_size, 160, 2, patchified_height, patchified_width),  # resnets.0.conv2 (160→160)
+            (batch_size, 160, 2, patchified_height, patchified_width),  # resnets.1.conv1 (160→160)
+            (batch_size, 160, 2, patchified_height, patchified_width),  # resnets.1.conv2 (160→160)
+            # down_blocks.1: 160 → 320 channel increase, 128x128
+            # NOTE: conv_shortcut is NOT in feat_cache (called without feat_cache argument)
+            (batch_size, 160, 2, patchified_height//2, patchified_width//2),  # resnets.0.conv1 (160→320)
+            (batch_size, 320, 2, patchified_height//2, patchified_width//2),  # resnets.0.conv2 (320→320)
+            (batch_size, 320, 2, patchified_height//2, patchified_width//2),  # resnets.1.conv1 (320→320)
+            (batch_size, 320, 2, patchified_height//2, patchified_width//2),  # resnets.1.conv2 (320→320)
+            (batch_size, 320, 2, patchified_height//4, patchified_width//4),  # downsampler.time_conv (320→320) - AFTER spatial downsample!
+            # down_blocks.2: 320 → 640 channel increase, 64x64
+            # NOTE: conv_shortcut is NOT in feat_cache (called without feat_cache argument)
+            (batch_size, 320, 2, patchified_height//4, patchified_width//4),  # resnets.0.conv1 (320→640)
+            (batch_size, 640, 2, patchified_height//4, patchified_width//4),  # resnets.0.conv2 (640→640)
+            (batch_size, 640, 2, patchified_height//4, patchified_width//4),  # resnets.1.conv1 (640→640)
+            (batch_size, 640, 2, patchified_height//4, patchified_width//4),  # resnets.1.conv2 (640→640)
+            (batch_size, 640, 2, patchified_height//8, patchified_width//8),  # downsampler.time_conv (640→640) - AFTER spatial downsample!
+            # down_blocks.3: 640 channels throughout, 32x32
+            (batch_size, 640, 2, patchified_height//8, patchified_width//8),  # resnets.0.conv1 (640→640)
+            (batch_size, 640, 2, patchified_height//8, patchified_width//8),  # resnets.0.conv2 (640→640)
+            (batch_size, 640, 2, patchified_height//8, patchified_width//8),  # resnets.1.conv1 (640→640)
+            (batch_size, 640, 2, patchified_height//8, patchified_width//8),  # resnets.1.conv2 (640→640)
+            # mid_block: 640 channels throughout, 32x32
+            (batch_size, 640, 2, patchified_height//8, patchified_width//8),  # resnets.0.conv1 (640→640)
+            (batch_size, 640, 2, patchified_height//8, patchified_width//8),  # resnets.0.conv2 (640→640)
+            (batch_size, 640, 2, patchified_height//8, patchified_width//8),  # resnets.1.conv1 (640→640)
+            (batch_size, 640, 2, patchified_height//8, patchified_width//8),  # resnets.1.conv2 (640→640)
+            # conv_out: 640 → 96
+            (batch_size, 640, 2, patchified_height//8, patchified_width//8),  # conv_out (640→96)
+        ]
+
+    def forward(self, x, **kwargs):
+        if 'feat_cache' in kwargs:
+            feat_cache = kwargs['feat_cache']
+
+            # Check if this is a compiled TorchScript model
+            is_torchscript = isinstance(self.model, torch.jit.ScriptModule)
+
+            if is_torchscript:
+                # Compiled model expects 2 frames (CACHE_T=2)
+                # If we only have 1 frame, pad it by duplicating
+                original_frame_count = x.shape[2]
+                if original_frame_count == 1:
+                    # Duplicate the frame to make it 2 frames
+                    x = torch.cat([x, x], dim=2)
+
+                if self.feat_cache_shapes is None:
+                    self._init_feat_cache_shapes(x)
+
+                # Replace None values with zero tensors
+                feat_cache_fixed = []
+                for i, cache in enumerate(feat_cache):
+                    if cache is None and i < len(self.feat_cache_shapes):
+                        feat_cache_fixed.append(torch.zeros(self.feat_cache_shapes[i], dtype=x.dtype, device=x.device))
+                    else:
+                        feat_cache_fixed.append(cache)
+
+                # Pass as positional arguments for TorchScript
+                output = self.model(x, feat_cache_fixed)
+
+                # Propagate updates from feat_cache_fixed back to original feat_cache
+                # This is crucial for temporal caching to work across iterations
+                for i in range(len(feat_cache)):
+                    feat_cache[i] = feat_cache_fixed[i]
+
+                # Encoder processes 2 input frames -> outputs latents with temporal downsampling
+                # For 2 input frames -> 1 latent frame (4x temporal downsampling)
+                # If original input was 1 frame (duplicated to 2), we don't need to adjust output
+                # because the encoder naturally outputs the correct number of latent frames
+
+            else:
+                # Uncompiled model can handle None and keyword arguments
+                output = self.model(x, feat_cache=feat_cache, **kwargs)
+        else:
+            output = self.model(x)
+        return output
+
+    def clear_cache(self):
+        if hasattr(self.model, 'clear_cache'):
+            self.model.clear_cache()
+
+
 class DecoderWrapper(nn.Module):
     """Specialized wrapper for VAE decoder that handles TorchScript feat_cache compatibility"""
     def __init__(self, model):

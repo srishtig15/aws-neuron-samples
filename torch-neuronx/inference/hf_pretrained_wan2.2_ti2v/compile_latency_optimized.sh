@@ -1,6 +1,7 @@
 #!/bin/bash
 
 # source /opt/aws_neuronx_venv_pytorch_2_8_nxd_inference/bin/activate
+# cp autoencoder_kl_wan.py /opt/aws_neuronx_venv_pytorch_2_8_nxd_inference/lib/python3.10/site-packages/diffusers/models/autoencoders/  # Trainium2 doesn't support 'nearest-exact'
 
 export PYTHONPATH=`pwd`:$PYTHONPATH
 
@@ -21,6 +22,12 @@ python neuron_wan2_2_ti2v/compile_transformer_latency_optimized.py \
 
 echo "compiling decoder"
 python neuron_wan2_2_ti2v/compile_decoder.py \
+--compiled_models_dir "compile_workdir_latency_optimized" \
+--height 512 \
+--width 512
+
+echo "compiling encoder"
+python neuron_wan2_2_ti2v/compile_encoder.py \
 --compiled_models_dir "compile_workdir_latency_optimized" \
 --height 512 \
 --width 512
