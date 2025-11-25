@@ -91,7 +91,8 @@ def compile_transformer(args):
     compiler_workdir = args.compiler_workdir
     compiled_models_dir = args.compiled_models_dir
     batch_size = 1
-    latent_frames = 21  # Compiled with frames=21. Runtime num_frames should be 81: (81-1)//4+1=21
+    latent_frames = (args.num_frames - 1) // 4 + 1  # Convert num_frames to latent_frames
+    print(f"num_frames={args.num_frames} -> latent_frames={latent_frames}")
     in_channels = 48
 
     # Calculate correct sequence length after patch embedding
@@ -125,6 +126,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--height", help="height of generated video.", type=int, default=512)
     parser.add_argument("--width", help="width of generated video.", type=int, default=512)
+    parser.add_argument("--num_frames", help="number of frames in generated video.", type=int, default=81)
     parser.add_argument("--num_images_per_prompt", help="number of images per prompt.", type=int, default=1)
     parser.add_argument("--max_sequence_length", help="max sequence length.", type=int, default=512)
     parser.add_argument("--compiler_workdir", help="dir for compiler artifacts.", type=str, default="compiler_workdir")

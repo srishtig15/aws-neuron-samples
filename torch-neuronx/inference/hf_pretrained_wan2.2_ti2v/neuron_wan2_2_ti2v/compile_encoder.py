@@ -110,23 +110,23 @@ def compile_encoder(args):
 
         print(f'feat_cache has {len(feat_cache)} elements')
 
-        # # Trace encoder with feat_cache
-        # # Cannot use DataParallel at runtime because it doesn't support list[Tensor] arguments
-        # print("\nTracing encoder...")
-        # compiled_encoder = torch_neuronx.trace(
-        #     encoder,
-        #     encoder_input,  # (encoder_input, feat_cache),
-        #     compiler_workdir=f"{compiler_workdir}/encoder",
-        #     compiler_args=compiler_flags.split(),
-        #     inline_weights_to_neff=False
-        # )
+        # Trace encoder with feat_cache
+        # Cannot use DataParallel at runtime because it doesn't support list[Tensor] arguments
+        print("\nTracing encoder...")
+        compiled_encoder = torch_neuronx.trace(
+            encoder,
+            encoder_input,  # (encoder_input, feat_cache),
+            compiler_workdir=f"{compiler_workdir}/encoder",
+            compiler_args=compiler_flags.split(),
+            inline_weights_to_neff=False
+        )
 
-        # # Save compiled model
-        # compiled_model_dir = f"{compiled_models_dir}/encoder"
-        # if not os.path.exists(compiled_model_dir):
-        #     os.makedirs(compiled_model_dir)
-        # torch.jit.save(compiled_encoder, f"{compiled_model_dir}/model.pt")
-        # print(f"\nCompiled encoder saved to: {compiled_model_dir}/model.pt")
+        # Save compiled model
+        compiled_model_dir = f"{compiled_models_dir}/encoder"
+        if not os.path.exists(compiled_model_dir):
+            os.makedirs(compiled_model_dir)
+        torch.jit.save(compiled_encoder, f"{compiled_model_dir}/model.pt")
+        print(f"\nCompiled encoder saved to: {compiled_model_dir}/model.pt")
 
         # Compile quant_conv (separate from encoder, like post_quant_conv in decoder)
         # quant_conv does not use feat_cache, just channel conversion

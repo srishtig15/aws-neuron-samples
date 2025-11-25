@@ -5,8 +5,8 @@ os.environ["NEURON_FUSE_SOFTMAX"] = "1"
 os.environ["NEURON_CUSTOM_SILU"] = "1"
 os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "2" # Comment this line out if using trn1/inf2
 os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2" # Comment this line out if using trn1/inf2
-compiler_flags = """ --verbose=INFO --target=trn2 --lnc=2 --model-type=unet-inference --enable-fast-loading-neuron-binaries """ # Use these compiler flags for trn2
-# compiler_flags = """ --verbose=INFO --target=trn1 --model-type=unet-inference --enable-fast-loading-neuron-binaries """ # Use these compiler flags for trn1/inf2. optlevel=1 creates smaller subgraphs
+compiler_flags = """ --target=trn2 --lnc=2 --model-type=unet-inference --enable-fast-loading-neuron-binaries """ # Use these compiler flags for trn2,  --verbose=INFO
+# compiler_flags = """ --target=trn1 --model-type=unet-inference --enable-fast-loading-neuron-binaries """ # Use these compiler flags for trn1/inf2. optlevel=1 creates smaller subgraphs,  --verbose=INFO
 os.environ["NEURON_CC_FLAGS"] = os.environ.get("NEURON_CC_FLAGS", "") + compiler_flags
 
 from diffusers import AutoencoderKLWan
@@ -45,8 +45,8 @@ def compile_decoder(args):
     
     batch_size = 1
     decoder_frames = 2  # Decoder needs CACHE_T=2 frames (will pad 1-frame inputs at runtime)
-    latent_frames = 21  # post_quant_conv processes full latents. For num_frames=15: (15-1)//4+1=4
-    # height, width = 32,32  # default: 96, 96
+    latent_frames = (args.num_frames - 1) // 4 + 1  # post_quant_conv processes full latents
+    print(f"num_frames={args.num_frames} -> latent_frames={latent_frames}")
     in_channels = 48
     
     model_id = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
@@ -54,13 +54,10 @@ def compile_decoder(args):
     
     decoder: Decoder = vae.decoder
     decoder.eval()
-    # upcast_norms_to_f32(decoder)  # TODO maybe we don't need to call upcast_norms_to_f32
-    
-    # del decoder.up_blocks
-    # del decoder.norm_out
-    # del decoder.conv_out
     # print('decoder:', decoder)
-    
+
+    # upcast_norms_to_f32(decoder)  # TODO maybe we don't need to call upcast_norms_to_f32
+        
     with torch.no_grad():
         # Decoder input: always 2 frames (CACHE_T=2)
         decoder_input = torch.rand((batch_size, in_channels, decoder_frames, latent_height, latent_width), dtype=torch.float32)
@@ -135,7 +132,8 @@ def compile_decoder(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--height", help="height of generated video.", type=int, default=512)
-    parser.add_argument("--width", help="height of generated video.", type=int, default=512)
+    parser.add_argument("--width", help="width of generated video.", type=int, default=512)
+    parser.add_argument("--num_frames", help="number of frames in generated video.", type=int, default=81)
     parser.add_argument("--compiler_workdir", help="dir for compiler artifacts.", type=str, default="compiler_workdir")
     parser.add_argument("--compiled_models_dir", help="dir for compiled artifacts.", type=str, default="compiled_models")
     args = parser.parse_args()
