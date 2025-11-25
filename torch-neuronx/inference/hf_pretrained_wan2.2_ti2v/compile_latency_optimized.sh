@@ -41,6 +41,11 @@ python neuron_wan2_2_ti2v/compile_decoder.py \
 # --width 1280 \
 # --num_frames 61
 
+python neuron_wan2_2_ti2v/compile_decoder_tp.py \
+--compiled_models_dir "compile_workdir_latency_optimized" \
+--height 512 \
+--width 512
+
 echo "compiling encoder"
 python neuron_wan2_2_ti2v/compile_encoder.py \
 --compiled_models_dir "compile_workdir_latency_optimized" \

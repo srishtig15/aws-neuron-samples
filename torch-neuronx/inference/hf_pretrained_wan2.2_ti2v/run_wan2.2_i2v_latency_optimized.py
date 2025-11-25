@@ -16,7 +16,7 @@ from neuron_wan2_2_ti2v.neuron_commons import InferenceTextEncoderWrapper
 from neuron_wan2_2_ti2v.neuron_commons import InferenceTransformerWrapper
 from neuron_wan2_2_ti2v.neuron_commons import SimpleWrapper
 from neuron_wan2_2_ti2v.neuron_commons import DecoderWrapper
-from neuron_wan2_2_ti2v.neuron_commons import EncoderWrapperNoCache
+# from neuron_wan2_2_ti2v.neuron_commons import EncoderWrapperNoCache  # Not used - encoder runs on CPU
 
 COMPILED_MODELS_DIR = "compile_workdir_latency_optimized"
 HUGGINGFACE_CACHE_DIR = "wan2.2_ti2v_hf_cache_dir"
@@ -79,11 +79,11 @@ if __name__ == "__main__":
     # print(pipe.vae)
         
     text_encoder_model_path = f"{COMPILED_MODELS_DIR}/text_encoder"
-    transformer_model_path = f"{COMPILED_MODELS_DIR}/transformer" 
+    transformer_model_path = f"{COMPILED_MODELS_DIR}/transformer"
     decoder_model_path = f"{COMPILED_MODELS_DIR}/decoder/model.pt"
     post_quant_conv_model_path = f"{COMPILED_MODELS_DIR}/post_quant_conv/model.pt"
-    encoder_model_path = f"{COMPILED_MODELS_DIR}/encoder/model.pt"
-    quant_conv_model_path = f"{COMPILED_MODELS_DIR}/quant_conv/model.pt"
+    # encoder_model_path = f"{COMPILED_MODELS_DIR}/encoder/model.pt"  # Not used - encoder runs on CPU
+    # quant_conv_model_path = f"{COMPILED_MODELS_DIR}/quant_conv/model.pt"  # Not used - quant_conv runs on CPU
     
     seqlen=512  # default: 512
     
@@ -136,20 +136,25 @@ if __name__ == "__main__":
     # )
     # print('vae_encoder_wrapper.model end ****************')
 
-    # Load compiled quant_conv (separate from encoder)
-    vae_quant_conv_wrapper = SimpleWrapper(pipe.vae.quant_conv)
-    print('vae_quant_conv_wrapper.model start ****************')
-    vae_quant_conv_wrapper.model = torch_neuronx.DataParallel(
-        torch.jit.load(quant_conv_model_path), [0, 1, 2, 3], False
-    )
-    print('vae_quant_conv_wrapper.model end ****************')
+    # NOTE: For I2V, encoder runs on CPU (not compiled due to neuronx-cc compiler bugs)
+    # Therefore, quant_conv must also run on CPU to avoid device mismatch
+    # quant_conv is only used during encoding, which happens once for the input image
+    # This is acceptable for I2V since encoding is not the bottleneck
+
+    # # Load compiled quant_conv (separate from encoder) - DISABLED for I2V
+    # vae_quant_conv_wrapper = SimpleWrapper(pipe.vae.quant_conv)
+    # print('vae_quant_conv_wrapper.model start ****************')
+    # vae_quant_conv_wrapper.model = torch_neuronx.DataParallel(
+    #     torch.jit.load(quant_conv_model_path), [0, 1, 2, 3], False
+    # )
+    # print('vae_quant_conv_wrapper.model end ****************')
 
     pipe.text_encoder = text_encoder_wrapper
     pipe.transformer = transformer_wrapper
     pipe.vae.decoder = vae_decoder_wrapper
     pipe.vae.post_quant_conv = vae_post_quant_conv_wrapper
-    # pipe.vae.encoder = vae_encoder_wrapper
-    pipe.vae.quant_conv = vae_quant_conv_wrapper
+    # pipe.vae.encoder = vae_encoder_wrapper  # Runs on CPU (not compiled)
+    # pipe.vae.quant_conv = vae_quant_conv_wrapper  # Runs on CPU (to match encoder)
     
     height = 512
     width = 512
@@ -205,4 +210,4 @@ if __name__ == "__main__":
     ).frames[0]
     end = time.time()
     print('time:', end-start)
-    export_to_video(output, "output.mp4", fps=24)
+    export_to_video(output, "output_i2v.mp4", fps=24)
