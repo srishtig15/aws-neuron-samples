@@ -89,32 +89,35 @@ def shard_t5_ff(ff: T5LayerFF):
 
 def shard_umt5_self_attention(tp_degree: int, selfAttention: UMT5Attention):
     orig_inner_dim = selfAttention.q.out_features
-    dim_head = orig_inner_dim // selfAttention.n_heads
     original_nheads = selfAttention.n_heads
-    selfAttention.n_heads = selfAttention.n_heads // tp_degree
+    dim_head = orig_inner_dim // original_nheads
+    selfAttention.n_heads = original_nheads // tp_degree
     selfAttention.inner_dim = dim_head * selfAttention.n_heads
     orig_q = selfAttention.q
     selfAttention.q = ColumnParallelLinear(
         selfAttention.q.in_features,
         selfAttention.q.out_features,
-        bias=False, 
-        gather_output=False)
+        bias=False,
+        gather_output=False,
+        dtype=torch.bfloat16)
     selfAttention.q.weight.data = get_sharded_data(orig_q.weight.data, 0)
     del(orig_q)
     orig_k = selfAttention.k
     selfAttention.k = ColumnParallelLinear(
-        selfAttention.k.in_features, 
-        selfAttention.k.out_features, 
+        selfAttention.k.in_features,
+        selfAttention.k.out_features,
         bias=(selfAttention.k.bias is not None),
-        gather_output=False)
+        gather_output=False,
+        dtype=torch.bfloat16)
     selfAttention.k.weight.data = get_sharded_data(orig_k.weight.data, 0)
     del(orig_k)
     orig_v = selfAttention.v
     selfAttention.v = ColumnParallelLinear(
-        selfAttention.v.in_features, 
-        selfAttention.v.out_features, 
+        selfAttention.v.in_features,
+        selfAttention.v.out_features,
         bias=(selfAttention.v.bias is not None),
-        gather_output=False)
+        gather_output=False,
+        dtype=torch.bfloat16)
     selfAttention.v.weight.data = get_sharded_data(orig_v.weight.data, 0)
     del(orig_v)
     orig_out = selfAttention.o
@@ -122,7 +125,8 @@ def shard_umt5_self_attention(tp_degree: int, selfAttention: UMT5Attention):
         selfAttention.o.in_features,
         selfAttention.o.out_features,
         bias=(selfAttention.o.bias is not None),
-        input_is_parallel=True)
+        input_is_parallel=True,
+        dtype=torch.bfloat16)
     selfAttention.o.weight.data = get_sharded_data(orig_out.weight.data, 1)
     del(orig_out)
     return selfAttention
@@ -133,23 +137,26 @@ def shard_umt5_ff(ff: UMT5LayerFF):
         orig_wi_0.in_features,
         orig_wi_0.out_features,
         bias=False,
-        gather_output=False)
+        gather_output=False,
+        dtype=torch.bfloat16)
     ff.DenseReluDense.wi_0.weight.data = get_sharded_data(orig_wi_0.weight.data, 0)
     orig_wi_1 = ff.DenseReluDense.wi_1
     ff.DenseReluDense.wi_1 = ColumnParallelLinear(
         orig_wi_1.in_features,
         orig_wi_1.out_features,
         bias=False,
-        gather_output=False)
+        gather_output=False,
+        dtype=torch.bfloat16)
     ff.DenseReluDense.wi_1.weight.data = get_sharded_data(orig_wi_1.weight.data, 0)
     orig_wo = ff.DenseReluDense.wo
     ff.DenseReluDense.wo = RowParallelLinear(
         orig_wo.in_features,
         orig_wo.out_features,
         bias=False,
-        input_is_parallel=True)
+        input_is_parallel=True,
+        dtype=torch.bfloat16)
     ff.DenseReluDense.wo.weight.data = get_sharded_data(orig_wo.weight.data, 1)
-    ff.DenseReluDense.act = torch.nn.GELU(approximate="tanh")
+    ff.DenseReluDense.act = torch.nn.GELU(approximate="tanh")  # Replace NewGELUActivation()
     return ff
 
 def shard_transformer_attn(tp_degree: int, attn: Attention):

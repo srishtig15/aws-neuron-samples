@@ -4,8 +4,8 @@ os.environ["NEURON_CUSTOM_SILU"] = "1"
 os.environ["XLA_DISABLE_FUNCTIONALIZATION"] = "0"
 os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "2" # Comment this line out if using trn1/inf2
 os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2" # Comment this line out if using trn1/inf2
-compiler_flags = """ --verbose=INFO --target=trn2 --lnc=2 --model-type=unet-inference --enable-fast-loading-neuron-binaries """ # Use these compiler flags for trn2
-# compiler_flags = """ --verbose=INFO --target=trn1 --model-type=unet-inference --enable-fast-loading-neuron-binaries """ # Use these compiler flags for trn1/inf2
+compiler_flags = """ --target=trn2 --lnc=2 --model-type=transformer --enable-fast-loading-neuron-binaries """ # Use these compiler flags for trn2,  --verbose=INFO
+# compiler_flags = """ --target=trn1 --model-type=transformer --enable-fast-loading-neuron-binaries """ # Use these compiler flags for trn1/inf2,  --verbose=INFO
 os.environ["NEURON_CC_FLAGS"] = os.environ.get("NEURON_CC_FLAGS", "") + compiler_flags
 
 import torch
@@ -32,6 +32,7 @@ class TracingUMT5WrapperTP(nn.Module):
             precomputed_bias = self.t.encoder.block[block_idx].layer[0].SelfAttention.compute_bias(seqlen, seqlen)
             precomputed_bias_tp = get_sharded_data(precomputed_bias, 1)
             self.t.encoder.block[block_idx].layer[0].SelfAttention.compute_bias = lambda *args, **kwargs: precomputed_bias_tp
+        # print('self.t:', self.t)
     
     def forward(self, text_input_ids, attention_mask=None):
         return self.t(
@@ -45,9 +46,10 @@ def get_text_encoder(tp_degree: int, sequence_length: int):
     text_encoder = UMT5EncoderModel.from_pretrained(model_id, subfolder="text_encoder", torch_dtype=DTYPE, cache_dir="wan2.2_ti2v_hf_cache_dir")
     text_encoder.eval()
     
+    # print('text_encoder:', text_encoder)
+    
     for idx, block in enumerate(text_encoder.encoder.block):
         block: UMT5Block = block
-        block.layer[1].DenseReluDense.act = torch.nn.GELU(approximate="tanh")
         selfAttention: UMT5LayerSelfAttention = block.layer[0].SelfAttention
         ff: UMT5LayerFF = block.layer[1]
         layer_norm_0 = block.layer[0].layer_norm.to(torch.float32)
@@ -71,7 +73,7 @@ def compile_text_encoder(args):
     
     compiler_workdir = args.compiler_workdir
     compiled_models_dir = args.compiled_models_dir
-    
+        
     with torch.no_grad():
         sample_inputs = torch.ones((batch_size, sequence_length), dtype=torch.int64), \
             torch.ones((batch_size, sequence_length), dtype=torch.int64)        
@@ -81,6 +83,7 @@ def compile_text_encoder(args):
             compiler_workdir=f"{compiler_workdir}/text_encoder",
             compiler_args=compiler_flags,
             tp_degree=tp_degree,
+            inline_weights_to_neff=False,
         )
         compiled_model_dir = f"{compiled_models_dir}/text_encoder"
         if not os.path.exists(compiled_model_dir):
