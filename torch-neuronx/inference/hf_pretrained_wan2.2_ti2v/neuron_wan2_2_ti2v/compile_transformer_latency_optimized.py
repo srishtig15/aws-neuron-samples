@@ -4,8 +4,8 @@ os.environ["NEURON_CUSTOM_SILU"] = "1"
 os.environ["XLA_DISABLE_FUNCTIONALIZATION"] = "0"
 os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "2" # Comment this line out if using trn1/inf2
 os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2" # Comment this line out if using trn1/inf2
-compiler_flags = """ --verbose=INFO --target=trn2 --lnc=2 --internal-hlo2tensorizer-options='--fuse-dot-logistic=false' --model-type=transformer --enable-fast-loading-neuron-binaries """ # Use these compiler flags for trn2
-# compiler_flags = """ --verbose=INFO --target=trn1 --model-type=transformer --enable-fast-loading-neuron-binaries --enable-experimental-O1 """ # Use these compiler flags for trn1/inf2
+compiler_flags = """ --target=trn2 --lnc=2 --internal-hlo2tensorizer-options='--fuse-dot-logistic=false' --model-type=transformer --enable-fast-loading-neuron-binaries """ # Use these compiler flags for trn2,  --verbose=INFO
+# compiler_flags = """ --target=trn1 --model-type=transformer --enable-fast-loading-neuron-binaries --enable-experimental-O1 """ # Use these compiler flags for trn1/inf2,  --verbose=INFO
 os.environ["NEURON_CC_FLAGS"] = os.environ.get("NEURON_CC_FLAGS", "") + compiler_flags
 
 from diffusers import AutoencoderKLWan, WanPipeline
@@ -25,17 +25,17 @@ from neuron_parallel_utils import shard_transformer_attn, shard_transformer_feed
 # torch.nn.functional.scaled_dot_product_attention = attention_wrapper_for_transformer
 
 
-# def upcast_norms_to_f32(transformer):
-#     transformer.condition_embedder.time_embedder = f32Wrapper(transformer.condition_embedder.time_embedder)
-#     for block in transformer.blocks:
-#         orig_norm1 = block.norm1
-#         orig_norm2 = block.norm2
-#         orig_norm3 = block.norm3
-#         block.norm1 = f32Wrapper(orig_norm1)
-#         block.norm2 = f32Wrapper(orig_norm2)
-#         block.norm3 = f32Wrapper(orig_norm3)
-#     orig_norm_out = transformer.norm_out
-#     transformer.norm_out = f32Wrapper(orig_norm_out)
+def upcast_norms_to_f32(transformer):
+    transformer.condition_embedder.time_embedder = f32Wrapper(transformer.condition_embedder.time_embedder)
+    for block in transformer.blocks:
+        orig_norm1 = block.norm1
+        orig_norm2 = block.norm2
+        orig_norm3 = block.norm3
+        block.norm1 = f32Wrapper(orig_norm1)
+        block.norm2 = f32Wrapper(orig_norm2)
+        block.norm3 = f32Wrapper(orig_norm3)
+    orig_norm_out = transformer.norm_out
+    transformer.norm_out = f32Wrapper(orig_norm_out)
     
 class TracingTransformerWrapper(nn.Module):
     def __init__(self, transformer):
@@ -44,6 +44,7 @@ class TracingTransformerWrapper(nn.Module):
         self.config = transformer.config
         self.dtype = transformer.dtype
         self.device = transformer.device    
+        # print('self.transformer:', self.transformer)
     
     def forward(self, hidden_states=None, timestep=None, encoder_hidden_states=None, **kwargs):
         return self.transformer(
@@ -58,6 +59,7 @@ def get_transformer_model(tp_degree: int):
     model_id = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
     vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32, cache_dir="wan2.2_ti2v_hf_cache_dir")
     pipe = WanPipeline.from_pretrained(model_id, vae=vae, torch_dtype=DTYPE, cache_dir="wan2.2_ti2v_hf_cache_dir")
+    # print('pipe.transformer:', pipe.transformer)
     
     # upcast_norms_to_f32(pipe.transformer)
     
@@ -74,10 +76,6 @@ def get_transformer_model(tp_degree: int):
         # 分片feedforward层
         block.ffn = shard_transformer_feedforward(block.ffn)
         
-        # 分片scale_shift_table - 这个表需要与hidden_states的channel维度匹配
-        # scale_shift_table原始形状: [1, 6, 3072]
-        # 不分片scale_shift_table，因为hidden_states本身没有被分片
-        
     mod_pipe_transformer_f = TracingTransformerWrapper(pipe.transformer)
     return mod_pipe_transformer_f, {}
 
@@ -93,14 +91,14 @@ def compile_transformer(args):
     compiler_workdir = args.compiler_workdir
     compiled_models_dir = args.compiled_models_dir
     batch_size = 1
-    latent_frames = 21  # Compiled with frames=2. Runtime num_frames should be 5: (5-1)//4+1=2
-    # height, width = 32, 32  # default: 96, 96
+    latent_frames = 21  # Compiled with frames=21. Runtime num_frames should be 81: (81-1)//4+1=21
     in_channels = 48
 
     # Calculate correct sequence length after patch embedding
     # patch_size for Wan2.2-TI2V is (1, 2, 2)
     patch_size_t, patch_size_h, patch_size_w = 1, 2, 2
     seq_len = (latent_frames // patch_size_t) * (latent_height // patch_size_h) * (latent_width // patch_size_w)
+    print('seq_len:', seq_len)
 
     sample_hidden_states = torch.ones((batch_size, in_channels, latent_frames, latent_height, latent_width), dtype=torch.bfloat16)
     sample_encoder_hidden_states = torch.ones((batch_size, max_sequence_length, hidden_size), dtype=torch.bfloat16)

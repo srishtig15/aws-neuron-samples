@@ -61,7 +61,7 @@ class DistributedRMSNorm(nn.Module):
         
         try:
             # 检查是否在分布式环境中
-            tp_size = parallel_state.get_tensor_model_parallel_size() if parallel_state.is_initialized() else 1
+            tp_size = parallel_state.get_tensor_model_parallel_size()
             
             if tp_size > 1 and is_xla:
                 # 使用XLA的all_reduce（编译时友好）
