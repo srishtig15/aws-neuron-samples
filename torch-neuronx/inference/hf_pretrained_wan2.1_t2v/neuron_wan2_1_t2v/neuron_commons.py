@@ -133,8 +133,8 @@ def attention_wrapper_sharded_without_swap(query, key, value):
     
     attn_output = torch.zeros((bs*n_head, q_len, d_head), dtype=torch.bfloat16, device=q.device)
     
-    use_sharded_attention_kernel = True # Use "need use_sharded_attention_kernel = True" in case of trn2
-    # use_sharded_attention_kernel = False # We do not "need use_sharded_attention_kernel" in case of trn1/inf2
+    # use_sharded_attention_kernel = True # Use "need use_sharded_attention_kernel = True" in case of trn2
+    use_sharded_attention_kernel = False # We do not "need use_sharded_attention_kernel" in case of trn1/inf2
     
     if use_sharded_attention_kernel:
         # grid = (vnc(2),)
