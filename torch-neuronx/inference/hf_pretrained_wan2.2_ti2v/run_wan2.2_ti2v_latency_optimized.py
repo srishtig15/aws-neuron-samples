@@ -97,7 +97,8 @@ if __name__ == "__main__":
     vae_post_quant_conv_wrapper = SimpleWrapper(pipe.vae.post_quant_conv)
     print('vae_post_quant_conv_wrapper.model start ****************')
     vae_post_quant_conv_wrapper.model = torch_neuronx.DataParallel(
-        torch.jit.load(post_quant_conv_model_path), [0, 1, 2, 3], False
+        # torch.jit.load(post_quant_conv_model_path), [0, 1, 2, 3], False
+        torch.jit.load(post_quant_conv_model_path), [0, 1, 2, 3, 4, 5, 6, 7], False
     )
     print('vae_post_quant_conv_wrapper.model end ****************')
     

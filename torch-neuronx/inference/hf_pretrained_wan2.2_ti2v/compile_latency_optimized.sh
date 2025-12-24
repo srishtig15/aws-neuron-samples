@@ -1,7 +1,8 @@
 #!/bin/bash
 
-# source /opt/aws_neuronx_venv_pytorch_2_8_nxd_inference/bin/activate
-# cp autoencoder_kl_wan.py /opt/aws_neuronx_venv_pytorch_2_8_nxd_inference/lib/python3.10/site-packages/diffusers/models/autoencoders/  # Trainium2 doesn't support 'nearest-exact'
+# source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
+# pip install -r requirements.txt
+# cp autoencoder_kl_wan.py /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.10/site-packages/diffusers/models/autoencoders/  # Trainium2 doesn't support 'nearest-exact'
 
 export PYTHONPATH=`pwd`:$PYTHONPATH
 
@@ -59,6 +60,7 @@ python neuron_wan2_2_ti2v/compile_decoder.py \
 # --width 1280
 
 echo "run wan2.2 ti2v latency optimized"
-export NEURON_RT_NUM_CORES=4
+# export NEURON_RT_NUM_CORES=4
+export NEURON_RT_NUM_CORES=8
 python run_wan2.2_ti2v_latency_optimized.py
 python run_wan2.2_i2v_latency_optimized.py
