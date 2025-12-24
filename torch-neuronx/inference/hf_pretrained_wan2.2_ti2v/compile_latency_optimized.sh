@@ -27,7 +27,7 @@ python neuron_wan2_2_ti2v/compile_transformer_latency_optimized.py \
 # --max_sequence_length 512 \
 # --height 720 \
 # --width 1280 \
-# --num_frames 61
+# --num_frames 81
 
 echo "compiling decoder"
 python neuron_wan2_2_ti2v/compile_decoder.py \
@@ -40,13 +40,13 @@ python neuron_wan2_2_ti2v/compile_decoder.py \
 # --compiled_models_dir "compile_workdir_latency_optimized" \
 # --height 720 \
 # --width 1280 \
-# --num_frames 61
+# --num_frames 81
 
 # python neuron_wan2_2_ti2v/compile_decoder_tp.py \
 # --compiled_models_dir "compile_workdir_latency_optimized" \
 # --height 720 \
 # --width 1280 \
-# --tp_degree 4
+# --tp_degree 8
 
 # echo "compiling encoder"
 # python neuron_wan2_2_ti2v/compile_encoder.py \

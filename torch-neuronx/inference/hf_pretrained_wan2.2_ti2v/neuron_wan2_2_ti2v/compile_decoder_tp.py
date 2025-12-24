@@ -653,8 +653,11 @@ def compile_decoder_tp(args):
             torch.rand((batch_size, 512 // tp_degree, 2, latent_height*4, latent_width*4), dtype=torch.float32),   # resnets.2.conv2
             # [25-30] up_block 3 (last block): 512->256 channels, spatial=latent_height*8×latent_width*8
             # Note: no upsampler in last block
-            torch.rand((batch_size, 512 // tp_degree, 2, latent_height*8, latent_width*8), dtype=torch.float32),   # resnets.0.conv1 (input 512)
-            torch.rand((batch_size, 256, 2, latent_height*8, latent_width*8), dtype=torch.float32),                 # resnets.0.conv2 (output 256, gathered)
+            # For last block: resnet.0 has input_sharded=True, output_sharded=False
+            # conv1: ColumnRowParallel (input sharded, output sharded) -> cache needs sharded shape
+            # conv2: RowParallel (input sharded, output gathered) -> cache needs sharded shape
+            torch.rand((batch_size, 512 // tp_degree, 2, latent_height*8, latent_width*8), dtype=torch.float32),   # resnets.0.conv1 (input 512 sharded)
+            torch.rand((batch_size, 256 // tp_degree, 2, latent_height*8, latent_width*8), dtype=torch.float32),   # resnets.0.conv2 (input 256 sharded, output gathered)
             torch.rand((batch_size, 256, 2, latent_height*8, latent_width*8), dtype=torch.float32),                 # resnets.1.conv1 (gathered)
             torch.rand((batch_size, 256, 2, latent_height*8, latent_width*8), dtype=torch.float32),                 # resnets.1.conv2 (gathered)
             torch.rand((batch_size, 256, 2, latent_height*8, latent_width*8), dtype=torch.float32),                 # resnets.2.conv1 (gathered)
