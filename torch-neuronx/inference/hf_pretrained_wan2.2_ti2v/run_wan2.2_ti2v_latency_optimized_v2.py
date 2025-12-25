@@ -1,7 +1,9 @@
 """
-Wan2.2 TI2V Inference using Model Builder V2 API.
+Wan2.2 TI2V Inference using Model Builder V2 API (Hybrid).
 
-This script uses NxDModel.load() instead of the deprecated parallel_model_load.
+This script uses:
+- NxDModel.load() for text_encoder and transformer (V2 API)
+- torch.jit.load() for decoder and post_quant_conv (V1 API, due to list input limitation)
 
 Usage:
     python run_wan2.2_ti2v_latency_optimized_v2.py --compiled_models_dir compiled_models
@@ -11,19 +13,25 @@ from diffusers import AutoencoderKLWan, WanPipeline
 from diffusers.utils import export_to_video
 
 import argparse
+import json
 import numpy as npy
 import os
 import random
 import time
 import torch
+import torch_neuronx
 
 from neuronx_distributed import NxDModel
+from safetensors.torch import load_file
 
 from neuron_wan2_2_ti2v.neuron_commons_v2 import (
     InferenceTextEncoderWrapperV2,
     InferenceTransformerWrapperV2,
-    SimpleWrapperV2,
-    DecoderWrapperV2,
+)
+# Import V1 wrappers for decoder (due to list input limitation in V2 API)
+from neuron_wan2_2_ti2v.neuron_commons import (
+    SimpleWrapper,
+    DecoderWrapper,
 )
 
 
@@ -36,6 +44,24 @@ def set_seed(seed: int):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     print(f"Random seed set to: {seed}")
+
+
+def load_model_config(model_path):
+    """Load model configuration from config.json."""
+    config_path = os.path.join(model_path, "config.json")
+    with open(config_path, "r") as f:
+        return json.load(f)
+
+
+def load_sharded_weights(model_path, tp_degree):
+    """Load sharded weights from safetensors files."""
+    weights_path = os.path.join(model_path, "weights")
+    sharded_weights = []
+    for rank in range(tp_degree):
+        ckpt_path = os.path.join(weights_path, f"tp{rank}_sharded_checkpoint.safetensors")
+        ckpt = load_file(ckpt_path)
+        sharded_weights.append(ckpt)
+    return sharded_weights
 
 
 # Defaults - can be overridden via command line
@@ -59,12 +85,11 @@ def main(args):
         model_id, vae=vae, torch_dtype=DTYPE, cache_dir=HUGGINGFACE_CACHE_DIR
     )
 
-    # V2 model paths
+    # Model paths (V2 for text_encoder/transformer, V1 for decoder/post_quant_conv)
     compiled_models_dir = args.compiled_models_dir
-    text_encoder_model_path = f"{compiled_models_dir}/text_encoder_v2/nxd_model.pt"
-    transformer_model_path = f"{compiled_models_dir}/transformer_v2/nxd_model.pt"
-    decoder_model_path = f"{compiled_models_dir}/decoder_v2/nxd_model.pt"
-    post_quant_conv_model_path = f"{compiled_models_dir}/post_quant_conv_v2/nxd_model.pt"
+    text_encoder_dir = f"{compiled_models_dir}/text_encoder_v2"
+    transformer_dir = f"{compiled_models_dir}/transformer_v2"
+    # Note: decoder and post_quant_conv use V1 paths (model.pt) due to list input limitation in V2 API
 
     seqlen = args.max_sequence_length
 
@@ -73,7 +98,10 @@ def main(args):
     text_encoder_wrapper = InferenceTextEncoderWrapperV2(
         torch.bfloat16, pipe.text_encoder, seqlen
     )
-    text_encoder_nxd = NxDModel.load(text_encoder_model_path)
+    text_encoder_config = load_model_config(text_encoder_dir)
+    text_encoder_nxd = NxDModel.load(os.path.join(text_encoder_dir, "nxd_model.pt"))
+    text_encoder_weights = load_sharded_weights(text_encoder_dir, text_encoder_config["tp_degree"])
+    text_encoder_nxd.set_weights(text_encoder_weights)
     text_encoder_nxd.to_neuron()
     text_encoder_wrapper.t = text_encoder_nxd
     print("Text encoder loaded.")
@@ -81,25 +109,29 @@ def main(args):
     # Load Transformer using NxDModel
     print("Loading transformer (V2)...")
     transformer_wrapper = InferenceTransformerWrapperV2(pipe.transformer)
-    transformer_nxd = NxDModel.load(transformer_model_path)
+    transformer_config = load_model_config(transformer_dir)
+    transformer_nxd = NxDModel.load(os.path.join(transformer_dir, "nxd_model.pt"))
+    transformer_weights = load_sharded_weights(transformer_dir, transformer_config["tp_degree"])
+    transformer_nxd.set_weights(transformer_weights)
     transformer_nxd.to_neuron()
     transformer_wrapper.transformer = transformer_nxd
     print("Transformer loaded.")
 
-    # Load Decoder using NxDModel
-    print("Loading decoder (V2)...")
-    vae_decoder_wrapper = DecoderWrapperV2(pipe.vae.decoder)
-    decoder_nxd = NxDModel.load(decoder_model_path)
-    decoder_nxd.to_neuron()
-    vae_decoder_wrapper.model = decoder_nxd
+    # Load Decoder using V1 API (torch.jit.load)
+    # Note: Decoder uses feat_cache (list input) which V2 API doesn't support
+    print("Loading decoder (V1 - torch.jit)...")
+    decoder_model_path = f"{compiled_models_dir}/decoder/model.pt"
+    vae_decoder_wrapper = DecoderWrapper(pipe.vae.decoder)
+    vae_decoder_wrapper.model = torch.jit.load(decoder_model_path)
     print("Decoder loaded.")
 
-    # Load post_quant_conv using NxDModel
-    print("Loading post_quant_conv (V2)...")
-    vae_post_quant_conv_wrapper = SimpleWrapperV2(pipe.vae.post_quant_conv)
-    post_quant_conv_nxd = NxDModel.load(post_quant_conv_model_path)
-    post_quant_conv_nxd.to_neuron()
-    vae_post_quant_conv_wrapper.model = post_quant_conv_nxd
+    # Load post_quant_conv using V1 API (torch.jit.load with DataParallel)
+    print("Loading post_quant_conv (V1 - torch.jit)...")
+    post_quant_conv_model_path = f"{compiled_models_dir}/post_quant_conv/model.pt"
+    vae_post_quant_conv_wrapper = SimpleWrapper(pipe.vae.post_quant_conv)
+    vae_post_quant_conv_wrapper.model = torch_neuronx.DataParallel(
+        torch.jit.load(post_quant_conv_model_path), [0, 1, 2, 3], False  # Use for trn2
+    )
     print("post_quant_conv loaded.")
 
     # Replace pipeline components with compiled versions

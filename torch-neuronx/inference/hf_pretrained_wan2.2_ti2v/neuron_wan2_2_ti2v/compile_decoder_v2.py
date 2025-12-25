@@ -22,6 +22,7 @@ from torch import nn
 from typing import List
 
 from neuronx_distributed import ModelBuilder, NxDModel, NxDParallelState
+from safetensors.torch import save_file
 
 from neuron_commons import attention_wrapper, f32Wrapper
 
@@ -153,6 +154,13 @@ def compile_decoder_v2(args):
         print(f"Saving decoder to {decoder_output_path}...")
         traced_decoder.save(os.path.join(decoder_output_path, "nxd_model.pt"))
 
+        # Save decoder weights (tp_degree=1, no sharding needed)
+        print("Saving decoder weights...")
+        decoder_weights_path = os.path.join(decoder_output_path, "weights")
+        os.makedirs(decoder_weights_path, exist_ok=True)
+        decoder_checkpoint = decoder_wrapper.state_dict()
+        save_file(decoder_checkpoint, os.path.join(decoder_weights_path, "tp0_sharded_checkpoint.safetensors"))
+
         # Save decoder config
         decoder_config = {
             "batch_size": batch_size,
@@ -191,6 +199,13 @@ def compile_decoder_v2(args):
         os.makedirs(pqc_output_path, exist_ok=True)
         print(f"Saving post_quant_conv to {pqc_output_path}...")
         traced_pqc.save(os.path.join(pqc_output_path, "nxd_model.pt"))
+
+        # Save post_quant_conv weights (tp_degree=1, no sharding needed)
+        print("Saving post_quant_conv weights...")
+        pqc_weights_path = os.path.join(pqc_output_path, "weights")
+        os.makedirs(pqc_weights_path, exist_ok=True)
+        pqc_checkpoint = post_quant_conv_wrapper.state_dict()
+        save_file(pqc_checkpoint, os.path.join(pqc_weights_path, "tp0_sharded_checkpoint.safetensors"))
 
         # Save post_quant_conv config
         pqc_config = {

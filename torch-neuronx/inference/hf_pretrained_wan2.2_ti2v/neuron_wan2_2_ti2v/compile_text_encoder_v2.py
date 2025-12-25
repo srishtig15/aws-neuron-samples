@@ -18,7 +18,7 @@ import torch
 import argparse
 from torch import nn
 
-from neuronx_distributed import ModelBuilder, NxDModel, NxDParallelState
+from neuronx_distributed import ModelBuilder, NxDModel, NxDParallelState, shard_checkpoint
 from neuronx_distributed.parallel_layers import parallel_state
 
 from transformers.models.umt5 import UMT5EncoderModel
@@ -108,6 +108,9 @@ def compile_text_encoder_v2(args):
         )
         text_encoder.eval()
 
+        # Save UNSHARDED state dict BEFORE sharding (for shard_checkpoint later)
+        unsharded_text_encoder_state = text_encoder.state_dict()
+
         print("Sharding text encoder blocks...")
         text_encoder = shard_text_encoder(text_encoder, tp_degree)
 
@@ -135,6 +138,53 @@ def compile_text_encoder_v2(args):
 
         print(f"Saving compiled model to {output_path}...")
         traced_model.save(os.path.join(output_path, "nxd_model.pt"))
+
+        # Save sharded weights
+        print("Saving sharded weights...")
+        weights_path = os.path.join(output_path, "weights")
+        os.makedirs(weights_path, exist_ok=True)
+
+        # Get the full state dict from the sharded model (includes all buffers)
+        sharded_model_state = model.state_dict()
+
+        # Transform unsharded keys to match sharded model structure
+        def get_transformed_key(key):
+            new_key = "t." + key
+            if "layer_norm.weight" in new_key:
+                new_key = new_key.replace("layer_norm.weight", "layer_norm.original.weight")
+            elif "final_layer_norm.weight" in new_key:
+                new_key = new_key.replace("final_layer_norm.weight", "final_layer_norm.original.weight")
+            return new_key
+
+        # Build mapping of transformed keys to original values
+        unsharded_key_map = {}
+        for orig_key, value in unsharded_text_encoder_state.items():
+            transformed_key = get_transformed_key(orig_key)
+            # Convert layer_norm weights to float32
+            if "layer_norm" in transformed_key:
+                unsharded_key_map[transformed_key] = value.clone().to(torch.float32)
+            else:
+                unsharded_key_map[transformed_key] = value.clone()
+
+        # Build checkpoint: use unsharded values for weights (to be properly sharded),
+        # but use sharded model values for buffers
+        unsharded_checkpoint = {}
+        for key, sharded_value in sharded_model_state.items():
+            if key in unsharded_key_map:
+                # Use unsharded value (will be sharded by shard_checkpoint)
+                unsharded_checkpoint[key] = unsharded_key_map[key]
+            else:
+                # Use value from sharded model (buffers or computed values)
+                unsharded_checkpoint[key] = sharded_value.clone()
+
+        # Use shard_checkpoint with checkpoint - it will shard parallel layer weights per rank
+        shard_checkpoint(
+            checkpoint=unsharded_checkpoint,
+            model=model,
+            start_rank=0,
+            end_rank=tp_degree - 1,
+            serialize_path=weights_path,
+        )
 
         # Save config for loading
         config = {

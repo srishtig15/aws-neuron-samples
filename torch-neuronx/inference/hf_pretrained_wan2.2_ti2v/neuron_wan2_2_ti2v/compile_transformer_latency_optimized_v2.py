@@ -22,11 +22,40 @@ import argparse
 from torch import nn
 import torch.nn.functional as F
 
-from neuronx_distributed import ModelBuilder, NxDModel, NxDParallelState
+from neuronx_distributed import ModelBuilder, NxDModel, NxDParallelState, shard_checkpoint
 from neuronx_distributed.parallel_layers import parallel_state
 
 # Reuse existing sharding functions
 from neuron_parallel_utils import shard_transformer3d_attn, shard_transformer_feedforward
+
+
+def make_rope_buffers_persistent(transformer):
+    """
+    Re-register RoPE buffers as persistent so they appear in state_dict().
+
+    The Wan transformer's RoPE buffers are registered with persistent=False,
+    which means they don't appear in state_dict(). During shard_checkpoint,
+    keys not in state_dict() get removed. By re-registering them as persistent,
+    they will be included in the checkpoint and loaded correctly.
+    """
+    if hasattr(transformer, 'rope'):
+        rope = transformer.rope
+        # Get current buffer values
+        if hasattr(rope, 'freqs_cos') and rope.freqs_cos is not None:
+            freqs_cos = rope.freqs_cos.clone()
+            # Delete the non-persistent buffer
+            del rope._buffers['freqs_cos']
+            # Re-register as persistent
+            rope.register_buffer('freqs_cos', freqs_cos, persistent=True)
+            print("Made rope.freqs_cos persistent")
+
+        if hasattr(rope, 'freqs_sin') and rope.freqs_sin is not None:
+            freqs_sin = rope.freqs_sin.clone()
+            # Delete the non-persistent buffer
+            del rope._buffers['freqs_sin']
+            # Re-register as persistent
+            rope.register_buffer('freqs_sin', freqs_sin, persistent=True)
+            print("Made rope.freqs_sin persistent")
 
 
 class TracingTransformerWrapperV2(nn.Module):
@@ -116,6 +145,15 @@ def compile_transformer_v2(args):
             cache_dir="wan2.2_ti2v_hf_cache_dir"
         )
 
+        # Make RoPE buffers persistent BEFORE saving state dict
+        # This ensures they are included in state_dict() and not removed by shard_checkpoint
+        print("Making RoPE buffers persistent...")
+        make_rope_buffers_persistent(pipe.transformer)
+
+        # Save UNSHARDED state dict BEFORE sharding (for shard_checkpoint later)
+        # Now includes rope.freqs_cos and rope.freqs_sin
+        unsharded_transformer_state = pipe.transformer.state_dict()
+
         print("Sharding transformer blocks...")
         pipe.transformer = shard_transformer_for_v2(pipe.transformer, tp_degree)
 
@@ -144,6 +182,53 @@ def compile_transformer_v2(args):
 
         print(f"Saving compiled model to {output_path}...")
         traced_model.save(os.path.join(output_path, "nxd_model.pt"))
+
+        # Save sharded weights
+        print("Saving sharded weights...")
+        weights_path = os.path.join(output_path, "weights")
+        os.makedirs(weights_path, exist_ok=True)
+
+        # Get the full state dict from the sharded model (wrapper)
+        sharded_model_state = model.state_dict()
+
+        # Build checkpoint: use unsharded values for weights (to be properly sharded)
+        # RoPE buffers are now persistent and included in unsharded_transformer_state
+        unsharded_checkpoint = {}
+        unsharded_keys = {"transformer." + k for k in unsharded_transformer_state.keys()}
+
+        # Debug: Check if RoPE keys are included
+        rope_keys_in_unsharded = [k for k in unsharded_transformer_state.keys() if 'rope' in k.lower()]
+        print(f"RoPE keys in unsharded state: {rope_keys_in_unsharded}")
+
+        # Add weights from state_dict
+        # Note: norm_k/norm_q weights are already sharded in the model and won't be
+        # re-sharded by shard_checkpoint (only ColumnParallelLinear/RowParallelLinear are).
+        # So we use the sharded values directly for those.
+        for key, sharded_value in sharded_model_state.items():
+            # Check if this is a norm weight that's already been sharded
+            is_already_sharded_norm = 'norm_k.weight' in key or 'norm_q.weight' in key
+
+            if key in unsharded_keys and not is_already_sharded_norm:
+                # Use unsharded value (will be sharded by shard_checkpoint)
+                orig_key = key.replace("transformer.", "", 1)
+                unsharded_checkpoint[key] = unsharded_transformer_state[orig_key].clone()
+            else:
+                # Use value from sharded model (already sharded norm weights, buffers, etc.)
+                unsharded_checkpoint[key] = sharded_value.clone()
+
+        # Debug: Check RoPE keys in final checkpoint
+        rope_keys_in_checkpoint = [k for k in unsharded_checkpoint.keys() if 'rope' in k.lower()]
+        print(f"RoPE keys in checkpoint: {rope_keys_in_checkpoint}")
+        print(f"Total checkpoint keys: {len(unsharded_checkpoint)}")
+
+        # Use shard_checkpoint with checkpoint - it will shard parallel layer weights per rank
+        shard_checkpoint(
+            checkpoint=unsharded_checkpoint,
+            model=model,
+            start_rank=0,
+            end_rank=tp_degree - 1,
+            serialize_path=weights_path,
+        )
 
         # Save config for loading
         config = {
