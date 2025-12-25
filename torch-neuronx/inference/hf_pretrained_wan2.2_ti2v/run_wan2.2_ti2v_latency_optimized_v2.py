@@ -8,6 +8,13 @@ This script uses:
 Usage:
     python run_wan2.2_ti2v_latency_optimized_v2.py --compiled_models_dir compiled_models
 """
+# IMPORTANT: Set environment variables BEFORE any imports
+# These must be set before Neuron runtime initializes to avoid collectives world size mismatch
+import os
+os.environ["NEURON_RT_NUM_CORES"] = "8"  # Match tp_degree used during compilation
+os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "2"  # For trn2 logical core config
+os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2"  # For trn2 logical core config
+
 # imports
 from diffusers import AutoencoderKLWan, WanPipeline
 from diffusers.utils import export_to_video
@@ -15,7 +22,6 @@ from diffusers.utils import export_to_video
 import argparse
 import json
 import numpy as npy
-import os
 import random
 import time
 import torch

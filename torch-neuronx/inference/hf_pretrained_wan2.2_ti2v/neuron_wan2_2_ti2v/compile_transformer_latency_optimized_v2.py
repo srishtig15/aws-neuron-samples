@@ -24,9 +24,72 @@ import torch.nn.functional as F
 
 from neuronx_distributed import ModelBuilder, NxDModel, NxDParallelState, shard_checkpoint
 from neuronx_distributed.parallel_layers import parallel_state
+from safetensors.torch import load_file, save_file
 
 # Reuse existing sharding functions
 from neuron_parallel_utils import shard_transformer3d_attn, shard_transformer_feedforward
+
+
+def fix_norm_weights_per_rank(weights_path, unsharded_norm_weights, tp_degree):
+    """
+    Fix norm_k/norm_q weights for each rank after shard_checkpoint.
+
+    The issue: During V2 compilation, parallel_state.get_tensor_model_parallel_rank()
+    always returns 0 inside NxDParallelState. This means all norm weights are sharded
+    using rank 0's slice. shard_checkpoint doesn't re-shard DistributedRMSNorm weights,
+    so all ranks end up with the SAME (incorrect) weights.
+
+    This function manually fixes each rank's norm weights with the correct slice.
+    It also handles the padding case where norm weights may be padded before sharding.
+    """
+    print(f"Fixing norm weights for {tp_degree} ranks...")
+
+    for rank in range(tp_degree):
+        ckpt_path = os.path.join(weights_path, f"tp{rank}_sharded_checkpoint.safetensors")
+        ckpt = load_file(ckpt_path)
+
+        # Fix each norm weight
+        fixed_count = 0
+        for key, unsharded_weight in unsharded_norm_weights.items():
+            if key in ckpt:
+                ckpt_shape = ckpt[key].shape[0]
+                unsharded_dim = unsharded_weight.shape[0]
+
+                # Calculate expected shard size without padding
+                expected_shard_size = unsharded_dim // tp_degree
+
+                # Check if padding was applied
+                if ckpt_shape == expected_shard_size:
+                    # No padding case: directly slice unsharded weights
+                    start = expected_shard_size * rank
+                    end = expected_shard_size * (rank + 1)
+                    correct_slice = unsharded_weight[start:end].clone()
+                else:
+                    # Padding case: need to pad unsharded weights first, then slice
+                    # The checkpoint has padded shape, calculate total padded dim
+                    total_padded_dim = ckpt_shape * tp_degree
+
+                    # Create padded version with ones (default for RMSNorm)
+                    padded_weight = torch.ones(total_padded_dim, dtype=unsharded_weight.dtype)
+                    padded_weight[:unsharded_dim] = unsharded_weight
+
+                    # Now slice for this rank
+                    start = ckpt_shape * rank
+                    end = ckpt_shape * (rank + 1)
+                    correct_slice = padded_weight[start:end].clone()
+
+                # Verify the shape matches
+                if correct_slice.shape == ckpt[key].shape:
+                    ckpt[key] = correct_slice
+                    fixed_count += 1
+                else:
+                    print(f"Warning: Shape mismatch for {key}: expected {correct_slice.shape}, got {ckpt[key].shape}")
+
+        # Save the fixed checkpoint
+        save_file(ckpt, ckpt_path)
+        print(f"  Rank {rank}: Fixed {fixed_count} norm weights")
+
+    print("Norm weights fixed for all ranks.")
 
 
 def make_rope_buffers_persistent(transformer):
@@ -154,6 +217,15 @@ def compile_transformer_v2(args):
         # Now includes rope.freqs_cos and rope.freqs_sin
         unsharded_transformer_state = pipe.transformer.state_dict()
 
+        # Collect UNSHARDED norm weights for later fixing
+        # These need to be manually sharded per rank after shard_checkpoint
+        unsharded_norm_weights = {}
+        for key, value in unsharded_transformer_state.items():
+            if 'norm_k.weight' in key or 'norm_q.weight' in key:
+                # Store with the wrapper prefix that will be used in checkpoint
+                unsharded_norm_weights[f"transformer.{key}"] = value.clone()
+        print(f"Collected {len(unsharded_norm_weights)} unsharded norm weights for per-rank sharding")
+
         print("Sharding transformer blocks...")
         pipe.transformer = shard_transformer_for_v2(pipe.transformer, tp_degree)
 
@@ -229,6 +301,12 @@ def compile_transformer_v2(args):
             end_rank=tp_degree - 1,
             serialize_path=weights_path,
         )
+
+        # Fix norm weights per rank
+        # shard_checkpoint doesn't properly handle DistributedRMSNorm weights because
+        # parallel_state.get_tensor_model_parallel_rank() returns 0 during NxDParallelState.
+        # This manually fixes each rank's norm weights with the correct slice.
+        fix_norm_weights_per_rank(weights_path, unsharded_norm_weights, tp_degree)
 
         # Save config for loading
         config = {
