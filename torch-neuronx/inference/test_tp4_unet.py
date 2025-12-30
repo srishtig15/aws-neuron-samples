@@ -33,21 +33,18 @@ def main():
     print(f"text_embeds shape: {text_embeds.shape}, dtype: {text_embeds.dtype}")
     print(f"time_ids shape: {time_ids.shape}, dtype: {time_ids.dtype}")
 
-    print("\n=== Running forward pass ===")
-    with torch.no_grad():
-        output = unet_neuron(sample, timestep, encoder_hidden_states, text_embeds, time_ids)
+    print("\n=== Running forward pass (10 iterations) ===")
+    import time
+    for i in range(10):
+        with torch.no_grad():
+            start = time.time()
+            output = unet_neuron(sample, timestep, encoder_hidden_states, text_embeds, time_ids)
+            elapsed = time.time() - start
 
-    print(f"Output type: {type(output)}")
-    if isinstance(output, tuple):
-        print(f"Output[0] shape: {output[0].shape}")
-        print(f"Output[0] dtype: {output[0].dtype}")
-        print(f"Output[0] min/max: {output[0].min():.4f} / {output[0].max():.4f}")
-    else:
-        print(f"Output shape: {output.shape}")
-        print(f"Output dtype: {output.dtype}")
-        print(f"Output min/max: {output.min():.4f} / {output.max():.4f}")
+        sample_out = output[0] if isinstance(output, tuple) else output
+        print(f"Iteration {i+1}: {elapsed:.3f}s, output min/max: {sample_out.min():.4f} / {sample_out.max():.4f}")
 
-    print("\n=== SUCCESS ===")
+    print("\n=== SUCCESS - All 10 iterations completed ===")
 
 if __name__ == "__main__":
     main()
