@@ -1,10 +1,33 @@
 import torch
+from torch import nn
 from diffusers.models.attention import FeedForward
 from diffusers.models.attention_processor import Attention
+from diffusers.models.normalization import RMSNorm
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, RowParallelLinear
 from neuronx_distributed.parallel_layers.pad import get_number_of_extra_heads, pad_model
 import neuronx_distributed.parallel_layers.utils as neuronx_dist_utils
+
+
+class ShardedRMSNorm(nn.Module):
+    """RMSNorm that works with sharded hidden dimensions."""
+    def __init__(self, dim, eps=1e-6, elementwise_affine=True):
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+        if elementwise_affine:
+            self.weight = nn.Parameter(torch.ones(dim))
+        else:
+            self.register_parameter('weight', None)
+
+    def forward(self, x):
+        # RMSNorm computation - normalize over last dimension
+        rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
+        x_normed = x / rms
+        if self.weight is not None:
+            return x_normed * self.weight
+        return x_normed
 
 
 def get_sharded_data(data, dim):
@@ -15,6 +38,19 @@ def get_sharded_data(data, dim):
         return data[s * tp_rank : s * (tp_rank + 1)].clone()
     elif dim == 1:
         return data[:, s * tp_rank : s * (tp_rank + 1)].clone()
+
+
+def shard_rmsnorm(orig_norm, new_dim):
+    """Create a sharded RMSNorm from an original RMSNorm."""
+    eps = orig_norm.eps if hasattr(orig_norm, 'eps') else 1e-6
+    elementwise_affine = hasattr(orig_norm, 'weight') and orig_norm.weight is not None
+
+    new_norm = ShardedRMSNorm(new_dim, eps=eps, elementwise_affine=elementwise_affine)
+
+    if elementwise_affine and orig_norm.weight is not None:
+        new_norm.weight.data = get_sharded_data(orig_norm.weight.data, 0)
+
+    return new_norm
 
 
 def shard_qwen_attention(tp_degree: int, attn: Attention):
@@ -128,8 +164,13 @@ def shard_qwen_attention(tp_degree: int, attn: Attention):
             attn.to_add_out.bias.data = orig_add_out.bias.data.detach()
         del orig_add_out
 
+    # Note: RMSNorm layers (norm_q, norm_k, norm_added_q, norm_added_k) should NOT be sharded!
+    # They operate on head_dim (128) which doesn't change with tensor parallelism.
+    # The norms are applied AFTER unflatten to [batch, seq, heads, head_dim],
+    # so they normalize over head_dim, not inner_dim.
+
     # Note: pad_model is not needed when heads are evenly divisible by tp_degree
-    # pad_model(attn, tp_degree, orig_num_heads, wrapped_classes=(Attention,))
+    # For QwenImage: 24 heads / 4 = 6 heads per rank (evenly divisible)
     return attn
 
 

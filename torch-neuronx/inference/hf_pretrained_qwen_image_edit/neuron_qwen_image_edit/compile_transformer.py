@@ -1,10 +1,12 @@
 import os
 os.environ["NEURON_FUSE_SOFTMAX"] = "1"
 os.environ["NEURON_CUSTOM_SILU"] = "1"
+os.environ["XLA_DISABLE_FUNCTIONALIZATION"] = "0"
 os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "2"  # For trn2
 os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2"  # For trn2
 
-compiler_flags = """ --verbose=INFO --target=trn2 --lnc=2 --model-type=transformer --enable-fast-loading-neuron-binaries """
+# Compiler flags based on wan2.2 reference
+compiler_flags = """ --target=trn2 --lnc=2 --internal-hlo2tensorizer-options='--fuse-dot-logistic=false' --model-type=transformer --enable-fast-loading-neuron-binaries """
 os.environ["NEURON_CC_FLAGS"] = os.environ.get("NEURON_CC_FLAGS", "") + compiler_flags
 
 import torch
@@ -63,13 +65,29 @@ def get_transformer_model(tp_degree: int, img_shapes: list):
         local_files_only=True,
         cache_dir=CACHE_DIR)
 
+    num_blocks = len(pipe.transformer.transformer_blocks)
+    print(f"Sharding {num_blocks} transformer blocks with TP={tp_degree}")
+
     # Shard transformer blocks
     for block_idx, block in enumerate(pipe.transformer.transformer_blocks):
+        if block_idx == 0:
+            print(f"Block 0 attention heads: {block.attn.heads}")
+            print(f"Block 0 to_q shape: {block.attn.to_q.weight.shape}")
+
         # Shard attention
         block.attn = shard_qwen_attention(tp_degree, block.attn)
+
+        if block_idx == 0:
+            print(f"After sharding - Block 0 attention heads: {block.attn.heads}")
+
         # Shard feedforward (img_mlp and txt_mlp)
         block.img_mlp = shard_feedforward(block.img_mlp)
         block.txt_mlp = shard_feedforward(block.txt_mlp)
+
+        if (block_idx + 1) % 10 == 0:
+            print(f"  Processed {block_idx + 1}/{num_blocks} blocks")
+
+    print(f"All {num_blocks} blocks sharded successfully")
 
     transformer_wrapper = TracingTransformerWrapper(pipe.transformer, img_shapes)
     return transformer_wrapper, {}
