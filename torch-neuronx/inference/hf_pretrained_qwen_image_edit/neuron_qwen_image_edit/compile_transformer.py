@@ -20,6 +20,7 @@ from diffusers.models.transformers.transformer_qwenimage import QwenImageTransfo
 
 from neuron_commons import attention_wrapper_for_transformer
 from neuron_parallel_utils import shard_qwen_attention, shard_feedforward
+from neuron_rope import patch_qwenimage_rope
 
 # Note: Do NOT override SDPA globally during compilation
 # The diffusers attention processor handles attention internally
@@ -65,6 +66,10 @@ def get_transformer_model(tp_degree: int, img_shapes: list):
         local_files_only=True,
         cache_dir=CACHE_DIR)
 
+    # Patch RoPE to use Neuron-compatible implementation (no complex numbers)
+    print("Patching RoPE for Neuron compatibility...")
+    pipe.transformer = patch_qwenimage_rope(pipe.transformer)
+
     num_blocks = len(pipe.transformer.transformer_blocks)
     print(f"Sharding {num_blocks} transformer blocks with TP={tp_degree}")
 
@@ -94,8 +99,8 @@ def get_transformer_model(tp_degree: int, img_shapes: list):
 
 
 def compile_transformer(args):
-    tp_degree = 4  # Tensor parallel degree for trn2
-    os.environ["LOCAL_WORLD_SIZE"] = "4"
+    tp_degree = 8  # Tensor parallel degree for trn2
+    os.environ["LOCAL_WORLD_SIZE"] = "8"
 
     latent_height = args.height // 8
     latent_width = args.width // 8

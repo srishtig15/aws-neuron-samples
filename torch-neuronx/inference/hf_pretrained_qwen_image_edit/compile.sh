@@ -46,7 +46,8 @@ python neuron_qwen_image_edit/compile_transformer.py \
     --height ${HEIGHT} \
     --width ${WIDTH} \
     --compiled_models_dir ${COMPILED_MODELS_DIR} \
-    --compiler_workdir ${COMPILER_WORKDIR}
+    --compiler_workdir ${COMPILER_WORKDIR} \
+    --max_sequence_length 128
 echo "Transformer compiled successfully!"
 echo ""
 
