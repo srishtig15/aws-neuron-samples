@@ -5,8 +5,8 @@ This script runs the Qwen-Image-Edit model ENTIRELY on Neuron devices.
 All components (Text Encoder, Transformer, VAE) run on Trainium2.
 
 Components:
-- Text Encoder (Qwen2.5-VL): Vision encoder + Language model (TP=4)
-- Transformer: QwenImageTransformer2DModel (TP=4)
+- Text Encoder (Qwen2.5-VL): Vision encoder + Language model
+- Transformer: QwenImageTransformer2DModel (TP=8)
 - VAE: Encoder and Decoder
 
 Usage:
@@ -194,7 +194,7 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     compiled_language_model = neuronx_distributed.trace.parallel_model_load(
         language_model_path
     )
-    print("  Language model loaded (TP=4)!")
+    print("  Language model loaded!")
 
     # Create Text Encoder Wrapper
     pipe.text_encoder = NeuronTextEncoderWrapper(
@@ -232,7 +232,7 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     pipe.transformer = NeuronTransformerWrapper(
         pipe.transformer, compiled_transformer, img_shapes
     )
-    print("  Transformer loaded (TP=4)!")
+    print("  Transformer loaded (TP=8)!")
 
     # ========================================
     # 3. Load VAE (Encoder + Decoder)
@@ -430,7 +430,7 @@ if __name__ == "__main__":
     # Text encoder settings - MUST match compilation settings
     parser.add_argument("--image_size", type=int, default=448,
                         help="Vision encoder image size (must match compiled model)")
-    parser.add_argument("--max_sequence_length", type=int, default=512,
+    parser.add_argument("--max_sequence_length", type=int, default=128,
                         help="Max text sequence length (must match compiled model)")
 
     # Inference settings

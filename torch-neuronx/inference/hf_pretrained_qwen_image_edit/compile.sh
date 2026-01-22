@@ -40,7 +40,7 @@ python neuron_qwen_image_edit/compile_vae.py \
 echo "VAE compiled successfully!"
 echo ""
 
-# Step 3: Compile Transformer (TP=4)
+# Step 3: Compile Transformer
 echo "[Step 3/4] Compiling Transformer..."
 python neuron_qwen_image_edit/compile_transformer.py \
     --height ${HEIGHT} \
@@ -61,7 +61,7 @@ python neuron_qwen_image_edit/compile_text_encoder.py \
     --mode separate \
     --use_subprocess \
     --image_size ${IMAGE_SIZE} \
-    --max_sequence_length 512 \
+    --max_sequence_length 128 \
     --compiled_models_dir ${COMPILED_MODELS_DIR} \
     --compiler_workdir ${COMPILER_WORKDIR}
 echo "Text Encoder compiled!"
