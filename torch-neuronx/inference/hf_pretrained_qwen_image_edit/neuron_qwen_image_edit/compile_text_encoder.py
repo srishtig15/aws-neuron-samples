@@ -1,0 +1,506 @@
+"""
+Text Encoder Compilation for Qwen-Image-Edit-2509
+
+The text encoder (Qwen2.5-VL) is a multimodal vision-language model with:
+1. Vision Encoder (Qwen2_5_VisionTransformerPretrainedModel) - 32 blocks
+2. Language Model (Qwen2_5_VLTextModel) - 28 layers
+
+This script compiles both components for Trainium2 using tensor parallelism.
+"""
+
+import os
+os.environ["NEURON_FUSE_SOFTMAX"] = "1"
+os.environ["NEURON_CUSTOM_SILU"] = "1"
+os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "2"  # For trn2
+os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2"  # For trn2
+
+compiler_flags = """ --verbose=INFO --target=trn2 --lnc=2 --model-type=transformer --enable-fast-loading-neuron-binaries """
+os.environ["NEURON_CC_FLAGS"] = os.environ.get("NEURON_CC_FLAGS", "") + compiler_flags
+
+import torch
+import argparse
+import torch_neuronx
+import neuronx_distributed
+from functools import partial
+from torch import nn
+
+from diffusers import QwenImageEditPlusPipeline
+from neuron_commons import attention_wrapper, f32Wrapper
+from neuron_parallel_utils import (
+    shard_qwen2_attention, shard_qwen2_mlp,
+    shard_vision_attention, shard_vision_mlp
+)
+
+# Override SDPA
+torch.nn.functional.scaled_dot_product_attention = attention_wrapper
+
+CACHE_DIR = "qwen_image_edit_hf_cache_dir"
+MODEL_ID = "Qwen/Qwen-Image-Edit-2509"
+
+
+class VisionEncoderWrapper(nn.Module):
+    """
+    Wrapper for the Qwen2.5-VL Vision Encoder.
+    Compiles the vision transformer that processes image patches.
+    """
+    def __init__(self, visual):
+        super().__init__()
+        self.visual = visual
+
+    def forward(self, pixel_values, grid_thw):
+        """
+        Args:
+            pixel_values: (num_patches, 3*temporal*patch_h*patch_w) - flattened patches
+            grid_thw: (num_images, 3) - temporal, height, width in grid space
+        Returns:
+            image_embeds: (total_patches, hidden_size)
+        """
+        return self.visual(pixel_values, grid_thw)
+
+
+class LanguageModelWrapper(nn.Module):
+    """
+    Wrapper for the Qwen2.5-VL Language Model.
+    Processes the combined text and vision embeddings.
+    """
+    def __init__(self, language_model, embed_tokens):
+        super().__init__()
+        self.language_model = language_model
+        self.embed_tokens = embed_tokens
+
+    def forward(self, inputs_embeds, attention_mask):
+        """
+        Args:
+            inputs_embeds: (batch, seq_len, hidden_size) - combined text+vision embeddings
+            attention_mask: (batch, seq_len)
+        Returns:
+            hidden_states: (batch, seq_len, hidden_size)
+        """
+        outputs = self.language_model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            return_dict=True
+        )
+        return outputs.last_hidden_state
+
+
+class FullTextEncoderWrapper(nn.Module):
+    """
+    Full wrapper for the Qwen2.5-VL text encoder with fixed shapes.
+    This is used when compiling the complete text encoder for image editing.
+
+    For simplicity in compilation, we use a fixed sequence length and image size.
+    """
+    def __init__(self, text_encoder, max_seq_len, num_image_tokens):
+        super().__init__()
+        self.text_encoder = text_encoder
+        self.config = text_encoder.config
+        self.max_seq_len = max_seq_len
+        self.num_image_tokens = num_image_tokens
+
+    def forward(self, input_ids, attention_mask, pixel_values, image_grid_thw):
+        """
+        Fixed-shape forward pass for tracing.
+
+        Args:
+            input_ids: (batch, text_seq_len)
+            attention_mask: (batch, total_seq_len)
+            pixel_values: (num_patches, channels) - preprocessed image patches
+            image_grid_thw: (num_images, 3) - grid dimensions
+        Returns:
+            hidden_states: (batch, total_seq_len, hidden_size)
+        """
+        outputs = self.text_encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            output_hidden_states=True,
+            return_dict=True
+        )
+        return outputs.hidden_states[-1]
+
+
+def upcast_norms_to_f32(module):
+    """Upcast normalization layers to float32 for numerical stability."""
+    for name, child in module.named_children():
+        if isinstance(child, (torch.nn.LayerNorm,)):
+            setattr(module, name, f32Wrapper(child.to(torch.float32)))
+        # Handle RMSNorm (Qwen uses this)
+        elif 'RMSNorm' in child.__class__.__name__:
+            setattr(module, name, f32Wrapper(child.to(torch.float32)))
+        else:
+            upcast_norms_to_f32(child)
+
+
+def get_vision_encoder(tp_degree: int):
+    """Load and prepare vision encoder for tracing."""
+    pipe = QwenImageEditPlusPipeline.from_pretrained(
+        MODEL_ID,
+        torch_dtype=torch.bfloat16,
+        local_files_only=True,
+        cache_dir=CACHE_DIR)
+
+    visual = pipe.text_encoder.model.visual
+    visual.eval()
+    upcast_norms_to_f32(visual)
+
+    return VisionEncoderWrapper(visual), {}
+
+
+def get_language_model(tp_degree: int):
+    """Load and shard language model for tensor parallelism."""
+    pipe = QwenImageEditPlusPipeline.from_pretrained(
+        MODEL_ID,
+        torch_dtype=torch.bfloat16,
+        local_files_only=True,
+        cache_dir=CACHE_DIR)
+
+    text_encoder = pipe.text_encoder
+    lang_model = text_encoder.model.language_model
+    embed_tokens = lang_model.embed_tokens
+    lang_model.eval()
+
+    # Shard the language model layers
+    for layer in lang_model.layers:
+        if hasattr(layer, 'self_attn'):
+            layer.self_attn = shard_qwen2_attention(tp_degree, layer.self_attn)
+        if hasattr(layer, 'mlp'):
+            layer.mlp = shard_qwen2_mlp(layer.mlp)
+
+    upcast_norms_to_f32(lang_model)
+
+    return LanguageModelWrapper(lang_model, embed_tokens), {}
+
+
+def compile_vision_encoder(args):
+    """
+    Compile the Vision Encoder component.
+
+    The vision encoder processes image patches and outputs vision embeddings.
+    Input shape depends on image size and patch configuration.
+    """
+    batch_size = 1
+    image_size = args.image_size
+    patch_size = 14
+    temporal_patch_size = 2
+    spatial_merge_size = 2
+
+    # Validate image_size
+    if image_size % patch_size != 0:
+        raise ValueError(
+            f"image_size ({image_size}) must be divisible by patch_size ({patch_size}). "
+            f"Valid sizes: 224, 336, 448, 560, etc.")
+
+    num_patches_per_side = image_size // patch_size
+    if num_patches_per_side % spatial_merge_size != 0:
+        raise ValueError(
+            f"image_size / patch_size ({num_patches_per_side}) must be divisible by "
+            f"spatial_merge_size ({spatial_merge_size}). "
+            f"Valid image sizes: 224, 336, 448, 560, etc.")
+
+    # Calculate number of patches for a single image
+    # Qwen2.5-VL uses Conv3d with kernel (temporal_patch_size, patch_size, patch_size)
+    # For a single frame: num_patches = (H/patch_size) * (W/patch_size)
+    num_patches_h = image_size // patch_size
+    num_patches_w = image_size // patch_size
+    num_patches = num_patches_h * num_patches_w
+
+    # pixel_values shape for the vision encoder
+    # After preprocessing, it's (num_patches, 3 * temporal_patch_size * patch_size * patch_size)
+    channels_per_patch = 3 * temporal_patch_size * patch_size * patch_size  # 3*2*14*14 = 1176
+
+    compiler_workdir = args.compiler_workdir
+    compiled_models_dir = args.compiled_models_dir
+    dtype = torch.bfloat16
+
+    print("=" * 50)
+    print("Compiling Vision Encoder")
+    print("=" * 50)
+    print(f"  Image size: {image_size}x{image_size}")
+    print(f"  Patch size: {patch_size}")
+    print(f"  Num patches: {num_patches}")
+    print(f"  Channels per patch: {channels_per_patch}")
+
+    pipe = QwenImageEditPlusPipeline.from_pretrained(
+        MODEL_ID,
+        torch_dtype=dtype,
+        local_files_only=True,
+        cache_dir=CACHE_DIR)
+
+    visual = pipe.text_encoder.model.visual
+    visual.eval()
+    upcast_norms_to_f32(visual)
+
+    # Sample inputs
+    # pixel_values: (total_patches, patch_dim)
+    sample_pixel_values = torch.ones((num_patches, channels_per_patch), dtype=dtype)
+    # grid_thw: (num_images, 3) - temporal, height, width in grid units
+    sample_grid_thw = torch.tensor([[1, num_patches_h, num_patches_w]], dtype=torch.int64)
+
+    vision_wrapper = VisionEncoderWrapper(visual)
+
+    with torch.no_grad():
+        try:
+            compiled_vision = torch_neuronx.trace(
+                vision_wrapper,
+                (sample_pixel_values, sample_grid_thw),
+                compiler_workdir=f"{compiler_workdir}/vision_encoder",
+                compiler_args=compiler_flags,
+                inline_weights_to_neff=False
+            )
+
+            vision_dir = f"{compiled_models_dir}/vision_encoder"
+            if not os.path.exists(vision_dir):
+                os.makedirs(vision_dir)
+            torch.jit.save(compiled_vision, f"{vision_dir}/model.pt")
+            print(f"Vision encoder compiled and saved to {vision_dir}")
+            return True
+
+        except Exception as e:
+            print(f"Vision encoder compilation failed: {e}")
+            return False
+
+
+def compile_language_model(args):
+    """
+    Compile the Language Model component with tensor parallelism.
+
+    The language model processes text tokens combined with vision embeddings.
+    """
+    batch_size = 1
+    sequence_length = args.max_sequence_length
+    hidden_size = 3584  # Qwen2.5-VL hidden size
+    tp_degree = 4
+
+    os.environ["LOCAL_WORLD_SIZE"] = str(tp_degree)
+
+    compiler_workdir = args.compiler_workdir
+    compiled_models_dir = args.compiled_models_dir
+
+    print("=" * 50)
+    print("Compiling Language Model")
+    print("=" * 50)
+    print(f"  Sequence length: {sequence_length}")
+    print(f"  Hidden size: {hidden_size}")
+    print(f"  TP degree: {tp_degree}")
+
+    get_lang_model_f = partial(get_language_model, tp_degree)
+
+    with torch.no_grad():
+        # inputs_embeds: (batch, seq_len, hidden_size)
+        sample_inputs_embeds = torch.ones(
+            (batch_size, sequence_length, hidden_size), dtype=torch.bfloat16)
+        # attention_mask: (batch, seq_len)
+        sample_attention_mask = torch.ones(
+            (batch_size, sequence_length), dtype=torch.int64)
+
+        sample_inputs = (sample_inputs_embeds, sample_attention_mask)
+
+        try:
+            compiled_lang_model = neuronx_distributed.trace.parallel_model_trace(
+                get_lang_model_f,
+                sample_inputs,
+                compiler_workdir=f"{compiler_workdir}/language_model",
+                compiler_args=compiler_flags,
+                tp_degree=tp_degree,
+                inline_weights_to_neff=False
+            )
+
+            lang_model_dir = f"{compiled_models_dir}/language_model"
+            if not os.path.exists(lang_model_dir):
+                os.makedirs(lang_model_dir)
+
+            neuronx_distributed.trace.parallel_model_save(
+                compiled_lang_model, lang_model_dir)
+            print(f"Language model compiled and saved to {lang_model_dir}")
+            return True
+
+        except Exception as e:
+            print(f"Language model compilation failed: {e}")
+            return False
+
+
+def compile_text_encoder_full(args):
+    """
+    Compile the full text encoder (vision + language) with fixed shapes.
+    This is more complex but allows end-to-end compilation.
+    """
+    batch_size = 1
+    text_seq_len = args.max_sequence_length
+    image_size = args.image_size
+    patch_size = 14
+    spatial_merge_size = 2  # Qwen2.5-VL spatial merge
+
+    # Calculate image token count after spatial merge
+    num_patches_h = image_size // patch_size
+    num_patches_w = image_size // patch_size
+    merged_h = num_patches_h // spatial_merge_size
+    merged_w = num_patches_w // spatial_merge_size
+    num_image_tokens = merged_h * merged_w
+
+    total_seq_len = text_seq_len + num_image_tokens
+    tp_degree = 4
+
+    os.environ["LOCAL_WORLD_SIZE"] = str(tp_degree)
+
+    compiler_workdir = args.compiler_workdir
+    compiled_models_dir = args.compiled_models_dir
+
+    print("=" * 50)
+    print("Compiling Full Text Encoder")
+    print("=" * 50)
+    print(f"  Image size: {image_size}")
+    print(f"  Text sequence length: {text_seq_len}")
+    print(f"  Image tokens: {num_image_tokens}")
+    print(f"  Total sequence length: {total_seq_len}")
+    print(f"  TP degree: {tp_degree}")
+
+    def get_full_text_encoder(tp_degree):
+        pipe = QwenImageEditPlusPipeline.from_pretrained(
+            MODEL_ID,
+            torch_dtype=torch.bfloat16,
+            local_files_only=True,
+            cache_dir=CACHE_DIR)
+
+        text_encoder = pipe.text_encoder
+        text_encoder.eval()
+
+        # Shard language model
+        lang_model = text_encoder.model.language_model
+        for layer in lang_model.layers:
+            if hasattr(layer, 'self_attn'):
+                layer.self_attn = shard_qwen2_attention(tp_degree, layer.self_attn)
+            if hasattr(layer, 'mlp'):
+                layer.mlp = shard_qwen2_mlp(layer.mlp)
+
+        upcast_norms_to_f32(text_encoder)
+
+        return FullTextEncoderWrapper(text_encoder, total_seq_len, num_image_tokens), {}
+
+    get_encoder_f = partial(get_full_text_encoder, tp_degree)
+
+    # Calculate pixel_values shape
+    num_patches = num_patches_h * num_patches_w
+    channels_per_patch = 3 * 2 * patch_size * patch_size  # 1176
+
+    with torch.no_grad():
+        sample_inputs = (
+            torch.ones((batch_size, text_seq_len), dtype=torch.int64),
+            torch.ones((batch_size, total_seq_len), dtype=torch.int64),
+            torch.ones((num_patches, channels_per_patch), dtype=torch.bfloat16),
+            torch.tensor([[1, num_patches_h, num_patches_w]], dtype=torch.int64),
+        )
+
+        try:
+            compiled_encoder = neuronx_distributed.trace.parallel_model_trace(
+                get_encoder_f,
+                sample_inputs,
+                compiler_workdir=f"{compiler_workdir}/text_encoder",
+                compiler_args=compiler_flags,
+                tp_degree=tp_degree,
+                inline_weights_to_neff=False
+            )
+
+            encoder_dir = f"{compiled_models_dir}/text_encoder"
+            if not os.path.exists(encoder_dir):
+                os.makedirs(encoder_dir)
+
+            neuronx_distributed.trace.parallel_model_save(
+                compiled_encoder, encoder_dir)
+            print(f"Full text encoder compiled and saved to {encoder_dir}")
+            return True
+
+        except Exception as e:
+            print(f"Full text encoder compilation failed: {e}")
+            print("Try compiling vision encoder and language model separately.")
+            return False
+
+
+def run_in_subprocess(func_name, args):
+    """Run a compilation function in a separate subprocess to avoid XLA conflicts."""
+    import subprocess
+    import sys
+
+    cmd = [
+        sys.executable, __file__,
+        "--mode", "separate",
+        "--image_size", str(args.image_size),
+        "--max_sequence_length", str(args.max_sequence_length),
+        "--compiler_workdir", args.compiler_workdir,
+        "--compiled_models_dir", args.compiled_models_dir,
+    ]
+
+    if func_name == "vision":
+        cmd.append("--vision_only")
+    elif func_name == "language":
+        cmd.append("--language_only")
+
+    result = subprocess.run(cmd, capture_output=False)
+    return result.returncode == 0
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", type=str, default="separate",
+                        choices=["separate", "full"],
+                        help="Compilation mode: 'separate' compiles vision and language separately, "
+                             "'full' compiles the entire text encoder together")
+    parser.add_argument("--max_sequence_length", type=int, default=512,
+                        help="Max text sequence length")
+    parser.add_argument("--image_size", type=int, default=448,
+                        help="Image size for vision encoder. Must be divisible by 14 (patch_size) "
+                             "and result in even grid for spatial merge. Valid: 224, 336, 448, 560")
+    parser.add_argument("--compiler_workdir", type=str, default="compiler_workdir",
+                        help="Directory for compiler artifacts")
+    parser.add_argument("--compiled_models_dir", type=str, default="compiled_models",
+                        help="Directory for compiled models")
+    parser.add_argument("--vision_only", action="store_true",
+                        help="Only compile vision encoder")
+    parser.add_argument("--language_only", action="store_true",
+                        help="Only compile language model")
+    parser.add_argument("--use_subprocess", action="store_true",
+                        help="Run each compilation in separate subprocess (avoids XLA conflicts)")
+    args = parser.parse_args()
+
+    if args.mode == "separate":
+        # If specific component requested, run directly
+        if args.vision_only:
+            print("\n[Vision Only] Compiling Vision Encoder...")
+            compile_vision_encoder(args)
+        elif args.language_only:
+            print("\n[Language Only] Compiling Language Model...")
+            compile_language_model(args)
+        elif args.use_subprocess:
+            # Run in separate subprocesses to avoid XLA initialization conflicts
+            print("\n[Step 1] Compiling Vision Encoder (subprocess)...")
+            vision_success = run_in_subprocess("vision", args)
+
+            print("\n[Step 2] Compiling Language Model (subprocess)...")
+            lang_success = run_in_subprocess("language", args)
+
+            if vision_success and lang_success:
+                print("\n" + "=" * 50)
+                print("Text Encoder Compilation Complete!")
+                print("=" * 50)
+        else:
+            # Default: try sequential but warn about XLA issue
+            print("\nNOTE: If language model compilation fails with 'Runtime is already initialized',")
+            print("      run with --use_subprocess flag or compile separately:")
+            print("      python compile_text_encoder.py --vision_only")
+            print("      python compile_text_encoder.py --language_only")
+            print("")
+
+            print("\n[Step 1] Compiling Vision Encoder...")
+            vision_success = compile_vision_encoder(args)
+
+            print("\n[Step 2] Compiling Language Model...")
+            lang_success = compile_language_model(args)
+
+            if vision_success and lang_success:
+                print("\n" + "=" * 50)
+                print("Text Encoder Compilation Complete!")
+                print("=" * 50)
+    else:
+        compile_text_encoder_full(args)
