@@ -104,11 +104,11 @@ echo "      --patch_multiplier ${PATCH_MULTIPLIER} \\"
 echo "      --max_sequence_length ${MAX_SEQ_LEN}"
 echo ""
 
-# batch_size=1 (无 CFG，默认)                                                                                                                                                                                           
-python run_qwen_image_edit.py --images image1.png --prompt "把女生变成男生" --transformer_batch_size 1                                                                                                                  
+# # batch_size=1 (无 CFG，默认)                                                                                                                                                                                           
+# python run_qwen_image_edit.py --images image1.png --prompt "把女生变成男生" --transformer_batch_size 1                                                                                                                  
                                                                                                                                                                                                                         
-# batch_size=2 (有 CFG，需要用 batch_size=2 编译 transformer)                                                                                                                                                           
-python run_qwen_image_edit.py --images image1.png --prompt "把女生变成男生" --transformer_batch_size 2 --guidance_scale 7.5
+# # batch_size=2 (有 CFG，需要用 batch_size=2 编译 transformer)                                                                                                                                                           
+# python run_qwen_image_edit.py --images image1.png --prompt "把女生变成男生" --transformer_batch_size 2 --guidance_scale 7.5
 
-# batch_size=1 (无 CFG，默认) 多图输入示例
-python run_qwen_image_edit.py --images image1.png image2.png --prompt "根据这图1中女性和图2中的男性，生成一组结婚照，并遵循以下描述：新郎穿着红色的中式马褂，新娘穿着精致的秀禾服，头戴金色凤冠。他们并肩站立在古老的朱红色宫墙前，背景是雕花的木窗。光线明亮柔和，构图对称，氛围喜庆而隆重。" --transformer_batch_size 1                                                                                                                  
+# # batch_size=1 (无 CFG，默认) 多图输入示例
+# python run_qwen_image_edit.py --images image1.png image2.png --prompt "根据这图1中女性和图2中的男性，生成一组结婚照，并遵循以下描述：新郎穿着红色的中式马褂，新娘穿着精致的秀禾服，头戴金色凤冠。他们并肩站立在古老的朱红色宫墙前，背景是雕花的木窗。光线明亮柔和，构图对称，氛围喜庆而隆重。" --transformer_batch_size 1                                                                                                                  

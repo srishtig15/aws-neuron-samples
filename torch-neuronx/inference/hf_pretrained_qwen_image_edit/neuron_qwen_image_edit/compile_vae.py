@@ -117,7 +117,7 @@ def compile_vae(args):
             encoder_input,
             compiler_workdir=f"{compiler_workdir}/vae_encoder",
             compiler_args=compiler_flags,
-            inline_weights_to_neff=False)
+            inline_weights_to_neff=True)
 
         encoder_dir = f"{compiled_models_dir}/vae_encoder"
         if not os.path.exists(encoder_dir):
@@ -141,7 +141,7 @@ def compile_vae(args):
             decoder_input,
             compiler_workdir=f"{compiler_workdir}/vae_decoder",
             compiler_args=compiler_flags,
-            inline_weights_to_neff=False)
+            inline_weights_to_neff=True)
 
         decoder_dir = f"{compiled_models_dir}/vae_decoder"
         if not os.path.exists(decoder_dir):
@@ -160,7 +160,7 @@ def compile_vae(args):
                 quant_input,
                 compiler_workdir=f"{compiler_workdir}/quant_conv",
                 compiler_args=compiler_flags,
-                inline_weights_to_neff=False)
+                inline_weights_to_neff=True)
             quant_dir = f"{compiled_models_dir}/quant_conv"
             if not os.path.exists(quant_dir):
                 os.makedirs(quant_dir)
@@ -177,54 +177,12 @@ def compile_vae(args):
                 post_quant_input,
                 compiler_workdir=f"{compiler_workdir}/post_quant_conv",
                 compiler_args=compiler_flags,
-                inline_weights_to_neff=False)
+                inline_weights_to_neff=True)
             post_quant_dir = f"{compiled_models_dir}/post_quant_conv"
             if not os.path.exists(post_quant_dir):
                 os.makedirs(post_quant_dir)
             torch.jit.save(compiled_post_quant, f"{post_quant_dir}/model.pt")
             print(f"post_quant_conv compiled and saved to {post_quant_dir}")
-
-
-def compile_vae_encoder_only(args):
-    """
-    Compile only VAE encoder (decoder uses F.interpolate which is not supported).
-    """
-    temporal_frames = args.temporal_frames
-    compiler_workdir = args.compiler_workdir
-    compiled_models_dir = args.compiled_models_dir
-    batch_size = 1
-    dtype = torch.bfloat16
-
-    pipe = QwenImageEditPlusPipeline.from_pretrained(
-        MODEL_ID,
-        cache_dir=CACHE_DIR,
-        local_files_only=True,
-        torch_dtype=dtype)
-
-    # Compile VAE Encoder only
-    print("Compiling VAE encoder...")
-    print(f"  Input shape: ({batch_size}, 3, {temporal_frames}, {args.height}, {args.width})")
-    encoder = pipe.vae.encoder
-    encoder.eval()
-    upcast_norms_to_f32(encoder)
-
-    with torch.no_grad():
-        encoder_input = torch.rand(
-            (batch_size, 3, temporal_frames, args.height, args.width), dtype=dtype)
-        compiled_encoder = torch_neuronx.trace(
-            encoder,
-            encoder_input,
-            compiler_workdir=f"{compiler_workdir}/vae_encoder",
-            compiler_args=compiler_flags,
-            inline_weights_to_neff=False)
-
-        encoder_dir = f"{compiled_models_dir}/vae_encoder"
-        if not os.path.exists(encoder_dir):
-            os.makedirs(encoder_dir)
-        torch.jit.save(compiled_encoder, f"{encoder_dir}/model.pt")
-        print(f"VAE encoder compiled and saved to {encoder_dir}")
-        print("\nNote: VAE decoder cannot be compiled due to F.interpolate operations.")
-        print("The decoder will run on CPU during inference.")
 
 
 if __name__ == "__main__":
@@ -239,13 +197,6 @@ if __name__ == "__main__":
                         help="Directory for compiler artifacts")
     parser.add_argument("--compiled_models_dir", type=str, default="compiled_models",
                         help="Directory for compiled models")
-    parser.add_argument("--compile_encoder_only", action="store_true",
-                        help="Only compile encoder (decoder not supported)")
     args = parser.parse_args()
 
-    if args.compile_encoder_only:
-        compile_vae_encoder_only(args)
-    else:
-        print("Warning: Full VAE compilation may fail due to F.interpolate in decoder.")
-        print("Use --compile_encoder_only for encoder-only compilation.")
-        compile_vae(args)
+    compile_vae(args)

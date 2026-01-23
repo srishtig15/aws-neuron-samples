@@ -248,7 +248,7 @@ def compile_vision_encoder(args):
                 (sample_pixel_values, sample_grid_thw),
                 compiler_workdir=f"{compiler_workdir}/vision_encoder",
                 compiler_args=compiler_flags,
-                inline_weights_to_neff=False
+                inline_weights_to_neff=True
             )
 
             vision_dir = f"{compiled_models_dir}/vision_encoder"
@@ -306,7 +306,7 @@ def compile_language_model(args):
                 compiler_workdir=f"{compiler_workdir}/language_model",
                 compiler_args=compiler_flags,
                 tp_degree=tp_degree,
-                inline_weights_to_neff=False
+                inline_weights_to_neff=True
             )
 
             lang_model_dir = f"{compiled_models_dir}/language_model"
@@ -401,7 +401,7 @@ def compile_text_encoder_full(args):
                 compiler_workdir=f"{compiler_workdir}/text_encoder",
                 compiler_args=compiler_flags,
                 tp_degree=tp_degree,
-                inline_weights_to_neff=False
+                inline_weights_to_neff=True
             )
 
             encoder_dir = f"{compiled_models_dir}/text_encoder"
