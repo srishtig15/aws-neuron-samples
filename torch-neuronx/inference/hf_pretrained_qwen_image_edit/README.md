@@ -191,13 +191,32 @@ def apply_rotary_pos_emb_neuron(x, cos, sin):
     return torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1).flatten(-2)
 ```
 
+#### 6. BFloat16 for Parallel Layers (Critical!)
+
+The `neuronx_distributed` parallel layers (`ColumnParallelLinear`, `RowParallelLinear`) default to `float32`, which doubles the model size. Solution: explicitly set `dtype=torch.bfloat16`.
+
+```python
+# neuron_parallel_utils.py
+# WRONG - defaults to float32, doubles model size!
+attn.to_q = ColumnParallelLinear(in_features, out_features, ...)
+
+# CORRECT - use bfloat16
+attn.to_q = ColumnParallelLinear(dtype=torch.bfloat16, in_features, out_features, ...)
+```
+
+**Impact**: Without this fix, the compiled transformer grows from ~35GB to ~128GB!
+
 ### Memory Optimization
 
-The full model is large (~24GB). Current configuration runs:
-- **On Neuron**: Transformer (TP=8), Language Model (TP=8)
-- **On CPU**: VAE, Vision Encoder (temporary OOM workaround)
+The full model runs entirely on Trainium2:
+- **Transformer**: TP=8, ~4GB per shard (with bfloat16)
+- **Language Model**: TP=8, ~1.7GB per shard
+- **Vision Encoder**: Single device, ~1.4GB
+- **VAE**: DP=8, ~320MB total
 
-To enable full Neuron execution, uncomment the VAE/Vision Encoder loading code in `run_qwen_image_edit.py` and use `inline_weights_to_neff=True` during compilation.
+Key optimizations:
+1. **Use `dtype=torch.bfloat16`** for all parallel layers (critical!)
+2. **Use `inline_weights_to_neff=True`** during compilation to embed weights in NEFF
 
 ## Compilation Options
 

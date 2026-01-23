@@ -117,7 +117,7 @@ def compile_vae(args):
             encoder_input,
             compiler_workdir=f"{compiler_workdir}/vae_encoder",
             compiler_args=compiler_flags,
-            inline_weights_to_neff=True)
+            inline_weights_to_neff=False)
 
         encoder_dir = f"{compiled_models_dir}/vae_encoder"
         if not os.path.exists(encoder_dir):
@@ -141,7 +141,7 @@ def compile_vae(args):
             decoder_input,
             compiler_workdir=f"{compiler_workdir}/vae_decoder",
             compiler_args=compiler_flags,
-            inline_weights_to_neff=True)
+            inline_weights_to_neff=False)
 
         decoder_dir = f"{compiled_models_dir}/vae_decoder"
         if not os.path.exists(decoder_dir):
@@ -160,7 +160,7 @@ def compile_vae(args):
                 quant_input,
                 compiler_workdir=f"{compiler_workdir}/quant_conv",
                 compiler_args=compiler_flags,
-                inline_weights_to_neff=True)
+                inline_weights_to_neff=False)
             quant_dir = f"{compiled_models_dir}/quant_conv"
             if not os.path.exists(quant_dir):
                 os.makedirs(quant_dir)
@@ -177,7 +177,7 @@ def compile_vae(args):
                 post_quant_input,
                 compiler_workdir=f"{compiler_workdir}/post_quant_conv",
                 compiler_args=compiler_flags,
-                inline_weights_to_neff=True)
+                inline_weights_to_neff=False)
             post_quant_dir = f"{compiled_models_dir}/post_quant_conv"
             if not os.path.exists(post_quant_dir):
                 os.makedirs(post_quant_dir)

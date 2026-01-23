@@ -168,7 +168,7 @@ def compile_transformer(args):
             compiler_workdir=f"{compiler_workdir}/transformer",
             compiler_args=compiler_flags,
             tp_degree=tp_degree,
-            inline_weights_to_neff=True,
+            inline_weights_to_neff=False,
         )
 
         compiled_model_dir = f"{compiled_models_dir}/transformer"

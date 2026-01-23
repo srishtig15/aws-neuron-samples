@@ -70,7 +70,7 @@ def shard_qwen_attention(tp_degree: int, attn: Attention):
 
     # Shard image attention projections (to_q, to_k, to_v)
     orig_q = attn.to_q
-    attn.to_q = ColumnParallelLinear(
+    attn.to_q = ColumnParallelLinear(dtype=torch.bfloat16,
         attn.to_q.in_features,
         attn.to_q.out_features,
         bias=(attn.to_q.bias is not None),
@@ -81,7 +81,7 @@ def shard_qwen_attention(tp_degree: int, attn: Attention):
     del orig_q
 
     orig_k = attn.to_k
-    attn.to_k = ColumnParallelLinear(
+    attn.to_k = ColumnParallelLinear(dtype=torch.bfloat16,
         attn.to_k.in_features,
         attn.to_k.out_features,
         bias=(attn.to_k.bias is not None),
@@ -92,7 +92,7 @@ def shard_qwen_attention(tp_degree: int, attn: Attention):
     del orig_k
 
     orig_v = attn.to_v
-    attn.to_v = ColumnParallelLinear(
+    attn.to_v = ColumnParallelLinear(dtype=torch.bfloat16,
         attn.to_v.in_features,
         attn.to_v.out_features,
         bias=(attn.to_v.bias is not None),
@@ -104,7 +104,7 @@ def shard_qwen_attention(tp_degree: int, attn: Attention):
 
     # Shard output projection
     orig_out = attn.to_out[0]
-    attn.to_out[0] = RowParallelLinear(
+    attn.to_out[0] = RowParallelLinear(dtype=torch.bfloat16,
         attn.to_out[0].in_features,
         attn.to_out[0].out_features,
         bias=(attn.to_out[0].bias is not None),
@@ -117,7 +117,7 @@ def shard_qwen_attention(tp_degree: int, attn: Attention):
     # Shard text attention projections (add_q_proj, add_k_proj, add_v_proj)
     if hasattr(attn, 'add_q_proj') and attn.add_q_proj is not None:
         orig_add_q = attn.add_q_proj
-        attn.add_q_proj = ColumnParallelLinear(
+        attn.add_q_proj = ColumnParallelLinear(dtype=torch.bfloat16,
             orig_add_q.in_features,
             orig_add_q.out_features,
             bias=(orig_add_q.bias is not None),
@@ -129,7 +129,7 @@ def shard_qwen_attention(tp_degree: int, attn: Attention):
 
     if hasattr(attn, 'add_k_proj') and attn.add_k_proj is not None:
         orig_add_k = attn.add_k_proj
-        attn.add_k_proj = ColumnParallelLinear(
+        attn.add_k_proj = ColumnParallelLinear(dtype=torch.bfloat16,
             orig_add_k.in_features,
             orig_add_k.out_features,
             bias=(orig_add_k.bias is not None),
@@ -141,7 +141,7 @@ def shard_qwen_attention(tp_degree: int, attn: Attention):
 
     if hasattr(attn, 'add_v_proj') and attn.add_v_proj is not None:
         orig_add_v = attn.add_v_proj
-        attn.add_v_proj = ColumnParallelLinear(
+        attn.add_v_proj = ColumnParallelLinear(dtype=torch.bfloat16,
             orig_add_v.in_features,
             orig_add_v.out_features,
             bias=(orig_add_v.bias is not None),
@@ -154,7 +154,7 @@ def shard_qwen_attention(tp_degree: int, attn: Attention):
     # Shard to_add_out
     if hasattr(attn, 'to_add_out') and attn.to_add_out is not None:
         orig_add_out = attn.to_add_out
-        attn.to_add_out = RowParallelLinear(
+        attn.to_add_out = RowParallelLinear(dtype=torch.bfloat16,
             orig_add_out.in_features,
             orig_add_out.out_features,
             bias=(orig_add_out.bias is not None),
@@ -178,7 +178,7 @@ def shard_feedforward(ff: FeedForward) -> FeedForward:
     """Shard FeedForward module for tensor parallelism."""
     # Shard the first linear layer (GELU projection)
     orig_proj = ff.net[0].proj
-    ff.net[0].proj = ColumnParallelLinear(
+    ff.net[0].proj = ColumnParallelLinear(dtype=torch.bfloat16,
         ff.net[0].proj.in_features,
         ff.net[0].proj.out_features,
         bias=(ff.net[0].proj.bias is not None),
@@ -190,7 +190,7 @@ def shard_feedforward(ff: FeedForward) -> FeedForward:
 
     # Shard the output linear layer
     orig_linear = ff.net[2]
-    ff.net[2] = RowParallelLinear(
+    ff.net[2] = RowParallelLinear(dtype=torch.bfloat16,
         ff.net[2].in_features,
         ff.net[2].out_features,
         bias=(ff.net[2].bias is not None),
@@ -310,7 +310,7 @@ def shard_qwen2_attention(tp_degree: int, self_attn):
             q_bias_padded = torch.cat([orig_q.bias.data, q_bias_padding], dim=0)
 
     # Now create ColumnParallelLinear with padded dimensions
-    self_attn.q_proj = ColumnParallelLinear(
+    self_attn.q_proj = ColumnParallelLinear(dtype=torch.bfloat16,
         orig_q.in_features,
         padded_q_out_features,  # Use padded out_features
         bias=(orig_q.bias is not None),
@@ -340,7 +340,7 @@ def shard_qwen2_attention(tp_degree: int, self_attn):
             self_attn.k_proj.bias.data = get_sharded_data_with_replication(
                 orig_k.bias.data, 0, num_kv_heads, tp_degree)
     else:
-        self_attn.k_proj = ColumnParallelLinear(
+        self_attn.k_proj = ColumnParallelLinear(dtype=torch.bfloat16,
             orig_k.in_features,
             orig_k.out_features,
             bias=(orig_k.bias is not None),
@@ -365,7 +365,7 @@ def shard_qwen2_attention(tp_degree: int, self_attn):
             self_attn.v_proj.bias.data = get_sharded_data_with_replication(
                 orig_v.bias.data, 0, num_kv_heads, tp_degree)
     else:
-        self_attn.v_proj = ColumnParallelLinear(
+        self_attn.v_proj = ColumnParallelLinear(dtype=torch.bfloat16,
             orig_v.in_features,
             orig_v.out_features,
             bias=(orig_v.bias is not None),
@@ -391,7 +391,7 @@ def shard_qwen2_attention(tp_degree: int, self_attn):
             device=orig_o.weight.device)
         o_weight_padded = torch.cat([orig_o.weight.data, o_weight_padding], dim=1)
 
-    self_attn.o_proj = RowParallelLinear(
+    self_attn.o_proj = RowParallelLinear(dtype=torch.bfloat16,
         padded_q_out_features,  # Use padded in_features
         orig_o.out_features,
         bias=(orig_o.bias is not None),
@@ -416,7 +416,7 @@ def shard_vision_attention(tp_degree: int, attn):
     orig_proj = attn.proj
 
     # Shard fused QKV projection
-    attn.qkv = ColumnParallelLinear(
+    attn.qkv = ColumnParallelLinear(dtype=torch.bfloat16,
         orig_qkv.in_features,
         orig_qkv.out_features,
         bias=(orig_qkv.bias is not None),
@@ -427,7 +427,7 @@ def shard_vision_attention(tp_degree: int, attn):
     del orig_qkv
 
     # Shard output projection
-    attn.proj = RowParallelLinear(
+    attn.proj = RowParallelLinear(dtype=torch.bfloat16,
         orig_proj.in_features,
         orig_proj.out_features,
         bias=(orig_proj.bias is not None),
@@ -451,7 +451,7 @@ def shard_vision_mlp(mlp):
     orig_down = mlp.down_proj
 
     # Shard gate projection
-    mlp.gate_proj = ColumnParallelLinear(
+    mlp.gate_proj = ColumnParallelLinear(dtype=torch.bfloat16,
         orig_gate.in_features,
         orig_gate.out_features,
         bias=(orig_gate.bias is not None),
@@ -462,7 +462,7 @@ def shard_vision_mlp(mlp):
     del orig_gate
 
     # Shard up projection
-    mlp.up_proj = ColumnParallelLinear(
+    mlp.up_proj = ColumnParallelLinear(dtype=torch.bfloat16,
         orig_up.in_features,
         orig_up.out_features,
         bias=(orig_up.bias is not None),
@@ -473,7 +473,7 @@ def shard_vision_mlp(mlp):
     del orig_up
 
     # Shard down projection
-    mlp.down_proj = RowParallelLinear(
+    mlp.down_proj = RowParallelLinear(dtype=torch.bfloat16,
         orig_down.in_features,
         orig_down.out_features,
         bias=(orig_down.bias is not None),
@@ -495,7 +495,7 @@ def shard_qwen2_mlp(mlp):
     orig_down = mlp.down_proj
 
     # Shard gate projection
-    mlp.gate_proj = ColumnParallelLinear(
+    mlp.gate_proj = ColumnParallelLinear(dtype=torch.bfloat16,
         orig_gate.in_features,
         orig_gate.out_features,
         bias=(orig_gate.bias is not None),
@@ -506,7 +506,7 @@ def shard_qwen2_mlp(mlp):
     del orig_gate
 
     # Shard up projection
-    mlp.up_proj = ColumnParallelLinear(
+    mlp.up_proj = ColumnParallelLinear(dtype=torch.bfloat16,
         orig_up.in_features,
         orig_up.out_features,
         bias=(orig_up.bias is not None),
@@ -517,7 +517,7 @@ def shard_qwen2_mlp(mlp):
     del orig_up
 
     # Shard down projection
-    mlp.down_proj = RowParallelLinear(
+    mlp.down_proj = RowParallelLinear(dtype=torch.bfloat16,
         orig_down.in_features,
         orig_down.out_features,
         bias=(orig_down.bias is not None),
