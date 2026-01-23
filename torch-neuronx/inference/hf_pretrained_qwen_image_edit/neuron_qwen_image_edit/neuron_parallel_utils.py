@@ -220,6 +220,9 @@ def shard_modulation(mod: nn.Sequential) -> nn.Sequential:
     18432 = 6 * 3072 (for 6 modulation outputs: shift, scale for 3 different targets)
 
     We shard the output dimension (18432) across TP ranks.
+
+    IMPORTANT: When gather_output=True, the output is gathered to full size BEFORE
+    adding the bias. So we must NOT shard the bias - it needs to be full size (18432).
     """
     # mod[0] is SiLU (no weights)
     # mod[1] is Linear(3072, 18432)
@@ -231,9 +234,12 @@ def shard_modulation(mod: nn.Sequential) -> nn.Sequential:
         bias=(orig_linear.bias is not None),
         gather_output=True,  # Need to gather for modulation to work correctly
         dtype=torch.bfloat16)
+    # Shard weights across output dimension
     mod[1].weight.data = get_sharded_data(orig_linear.weight.data, 0)
+    # IMPORTANT: Do NOT shard bias when gather_output=True!
+    # The bias is added after gathering, so it needs full size
     if orig_linear.bias is not None:
-        mod[1].bias.data = get_sharded_data(orig_linear.bias.data, 0)
+        mod[1].bias.data = orig_linear.bias.data.clone().to(torch.bfloat16)
     del orig_linear
 
     return mod
