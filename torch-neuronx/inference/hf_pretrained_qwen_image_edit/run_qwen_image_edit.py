@@ -10,7 +10,11 @@ Components:
 - VAE: Encoder and Decoder
 
 Usage:
-    python run_qwen_image_edit.py --source_image input.jpg --prompt "change the sky to sunset"
+    # Single image editing:
+    python run_qwen_image_edit.py --images input.jpg --prompt "change the sky to sunset"
+
+    # Multi-image editing (1-3 images):
+    python run_qwen_image_edit.py --images img1.jpg img2.jpg --prompt "combine these images"
 """
 
 import os
@@ -155,6 +159,12 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     Load ALL compiled models for Trainium2 inference.
     Every component MUST be compiled and loaded.
 
+    Parallel configuration:
+    - VAE: DataParallel (DP=8) - single-device compiled, replicated across 8 devices
+    - Transformer: Tensor Parallel (TP=8) - sharded across 8 devices
+    - Vision Encoder: DataParallel (DP=8) - single-device compiled, replicated
+    - Language Model: Tensor Parallel (TP=4) - sharded across 4 devices
+
     Args:
         compiled_models_dir: Directory containing compiled model artifacts
         pipe: Original pipeline
@@ -166,6 +176,11 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     print("\n" + "=" * 60)
     print("Loading Compiled Models for Trainium2")
     print("=" * 60)
+    print("Parallel configuration:")
+    print("  - VAE: DP=8")
+    print("  - Transformer: TP=8")
+    print("  - Vision Encoder: DP=8")
+    print("  - Language Model: TP=4")
 
     # ========================================
     # 1. Load Text Encoder Components
@@ -180,6 +195,7 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
             "Please run: python neuron_qwen_image_edit/compile_text_encoder.py --vision_only"
         )
     print(f"  Loading vision encoder from {vision_encoder_path}...")
+    # Vision encoder uses [num_patches, channels] input (not batch), so no DataParallel
     compiled_vision_encoder = torch.jit.load(vision_encoder_path)
     print("  Vision encoder loaded!")
 
@@ -194,7 +210,7 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     compiled_language_model = neuronx_distributed.trace.parallel_model_load(
         language_model_path
     )
-    print("  Language model loaded!")
+    print("  Language model loaded (TP=4)!")
 
     # Create Text Encoder Wrapper
     pipe.text_encoder = NeuronTextEncoderWrapper(
@@ -207,7 +223,7 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     print("  Text encoder wrapper created!")
 
     # ========================================
-    # 2. Load Transformer (TP=4)
+    # 2. Load Transformer
     # ========================================
     print("\n[2/3] Loading Transformer...")
 
@@ -264,8 +280,14 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
             "Please run: python neuron_qwen_image_edit/compile_vae.py"
         )
     print(f"  Loading VAE encoder from {vae_encoder_path}...")
-    compiled_encoder = torch.jit.load(vae_encoder_path)
-    print("  VAE encoder loaded!")
+    vae_encoder_jit = torch.jit.load(vae_encoder_path)
+    # Wrap with DataParallel (DP=8)
+    compiled_encoder = torch_neuronx.DataParallel(
+        vae_encoder_jit,
+        device_ids=[0, 1, 2, 3, 4, 5, 6, 7],
+        set_dynamic_batching=False
+    )
+    print("  VAE encoder loaded (DP=8)!")
 
     # Load compiled decoder
     vae_decoder_path = f"{compiled_models_dir}/vae_decoder/model.pt"
@@ -275,21 +297,37 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
             "Please run: python neuron_qwen_image_edit/compile_vae.py"
         )
     print(f"  Loading VAE decoder from {vae_decoder_path}...")
-    compiled_decoder = torch.jit.load(vae_decoder_path)
-    print("  VAE decoder loaded!")
+    vae_decoder_jit = torch.jit.load(vae_decoder_path)
+    # Wrap with DataParallel (DP=8)
+    compiled_decoder = torch_neuronx.DataParallel(
+        vae_decoder_jit,
+        device_ids=[0, 1, 2, 3, 4, 5, 6, 7],
+        set_dynamic_batching=False
+    )
+    print("  VAE decoder loaded (DP=8)!")
 
-    # Load quant_conv and post_quant_conv if they exist
+    # Load quant_conv and post_quant_conv if they exist (also with DP=8)
     compiled_quant_conv = None
     quant_conv_path = f"{compiled_models_dir}/quant_conv/model.pt"
     if os.path.exists(quant_conv_path):
         print(f"  Loading quant_conv from {quant_conv_path}...")
-        compiled_quant_conv = torch.jit.load(quant_conv_path)
+        quant_conv_jit = torch.jit.load(quant_conv_path)
+        compiled_quant_conv = torch_neuronx.DataParallel(
+            quant_conv_jit,
+            device_ids=[0, 1, 2, 3, 4, 5, 6, 7],
+            set_dynamic_batching=False
+        )
 
     compiled_post_quant_conv = None
     post_quant_conv_path = f"{compiled_models_dir}/post_quant_conv/model.pt"
     if os.path.exists(post_quant_conv_path):
         print(f"  Loading post_quant_conv from {post_quant_conv_path}...")
-        compiled_post_quant_conv = torch.jit.load(post_quant_conv_path)
+        post_quant_conv_jit = torch.jit.load(post_quant_conv_path)
+        compiled_post_quant_conv = torch_neuronx.DataParallel(
+            post_quant_conv_jit,
+            device_ids=[0, 1, 2, 3, 4, 5, 6, 7],
+            set_dynamic_batching=False
+        )
 
     # Create VAE Wrapper
     pipe.vae = NeuronVAEWrapper(
@@ -300,6 +338,11 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
         compiled_post_quant_conv=compiled_post_quant_conv
     )
     print("  VAE wrapper created!")
+
+    # Fix missing _execution_device property
+    # The pipeline expects this to determine where to run operations
+    # Override the property with a lambda that returns CPU device
+    type(pipe)._execution_device = property(lambda self: torch.device("cpu"))
 
     print("\n" + "=" * 60)
     print("All Models Loaded on Trainium2!")
@@ -335,13 +378,19 @@ def run_inference(args):
     # Load ALL compiled models - everything runs on Trainium2
     pipe = load_all_compiled_models(args.compiled_models_dir, pipe, args)
 
-    # Load source image
-    print(f"\nLoading source image: {args.source_image}")
-    source_image = load_image(args.source_image)
+    # Load source images (1-3 images supported)
+    print(f"\nLoading {len(args.images)} source image(s)...")
+    source_images = []
+    for img_path in args.images:
+        print(f"  Loading: {img_path}")
+        img = load_image(img_path)
+        # Resize to match compiled dimensions
+        img = img.resize((args.width, args.height))
+        source_images.append(img)
+    print(f"All images resized to: {args.width}x{args.height}")
 
-    # Resize to match compiled dimensions
-    source_image = source_image.resize((args.width, args.height))
-    print(f"Resized to: {args.width}x{args.height}")
+    # Use single image or list based on count
+    input_images = source_images[0] if len(source_images) == 1 else source_images
 
     # Create generator for reproducibility
     generator = torch.Generator().manual_seed(args.seed)
@@ -354,7 +403,7 @@ def run_inference(args):
         warmup_generator = torch.Generator().manual_seed(args.seed + 1000)
         start = time.time()
         _ = pipe(
-            image=source_image,
+            image=input_images,
             prompt=args.prompt,
             negative_prompt=args.negative_prompt,
             height=args.height,
@@ -375,7 +424,7 @@ def run_inference(args):
     generator = torch.Generator().manual_seed(args.seed)
     start = time.time()
     output = pipe(
-        image=source_image,
+        image=input_images,
         prompt=args.prompt,
         negative_prompt=args.negative_prompt,
         height=args.height,
@@ -396,9 +445,12 @@ def run_inference(args):
 
     # Save comparison
     if args.save_comparison:
-        comparison = Image.new('RGB', (source_image.width * 2, source_image.height))
-        comparison.paste(source_image, (0, 0))
-        comparison.paste(output_image, (source_image.width, 0))
+        # Create comparison with all input images + output
+        num_images = len(source_images) + 1  # inputs + output
+        comparison = Image.new('RGB', (args.width * num_images, args.height))
+        for i, img in enumerate(source_images):
+            comparison.paste(img, (args.width * i, 0))
+        comparison.paste(output_image, (args.width * len(source_images), 0))
         comparison_path = output_path.replace('.png', '_comparison.png')
         comparison.save(comparison_path)
         print(f"Comparison saved to: {comparison_path}")
@@ -412,8 +464,8 @@ if __name__ == "__main__":
     )
 
     # Input/Output
-    parser.add_argument("--source_image", type=str, required=True,
-                        help="Path to source image for editing")
+    parser.add_argument("--images", type=str, nargs="+", required=True,
+                        help="Path(s) to source image(s) for editing (1-3 images supported)")
     parser.add_argument("--prompt", type=str, required=True,
                         help="Edit instruction prompt")
     parser.add_argument("--negative_prompt", type=str, default="",
@@ -428,9 +480,9 @@ if __name__ == "__main__":
                         help="Image width (must match compiled model)")
 
     # Text encoder settings - MUST match compilation settings
-    parser.add_argument("--image_size", type=int, default=448,
+    parser.add_argument("--image_size", type=int, default=224,
                         help="Vision encoder image size (must match compiled model)")
-    parser.add_argument("--max_sequence_length", type=int, default=128,
+    parser.add_argument("--max_sequence_length", type=int, default=512,
                         help="Max text sequence length (must match compiled model)")
 
     # Inference settings
@@ -452,5 +504,9 @@ if __name__ == "__main__":
                         help="Save side-by-side comparison image")
 
     args = parser.parse_args()
+
+    # Validate number of images (1-3 supported by Qwen-Image-Edit)
+    if len(args.images) > 3:
+        parser.error("Qwen-Image-Edit supports 1-3 images, but {} were provided".format(len(args.images)))
 
     run_inference(args)

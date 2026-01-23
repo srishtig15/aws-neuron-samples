@@ -12,7 +12,7 @@ COMPILER_WORKDIR="compiler_workdir"
 # Parse arguments
 HEIGHT=${1:-512}
 WIDTH=${2:-512}
-IMAGE_SIZE=${3:-448}  # Vision encoder image size (must be divisible by 14 and result in even grid)
+IMAGE_SIZE=${3:-224}  # Vision encoder image size (must be divisible by 14 and result in even grid)
 
 echo "============================================"
 echo "Qwen-Image-Edit-2509 Compilation for Neuron"
@@ -79,8 +79,9 @@ echo "  - vision_encoder/"
 echo "  - language_model/"
 echo ""
 echo "To run inference on Trainium2:"
+echo "  export NEURON_RT_NUM_CORES=8"
 echo "  python run_qwen_image_edit.py \\"
-echo "      --source_image input.jpg \\"
+echo "      --images input.jpg \\"
 echo "      --prompt \"your edit instruction\" \\"
 echo "      --height ${HEIGHT} \\"
 echo "      --width ${WIDTH} \\"

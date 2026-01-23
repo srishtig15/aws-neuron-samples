@@ -89,11 +89,34 @@ class NeuronTextEncoderWrapper(nn.Module):
         if self.compiled_vision_encoder is not None and self.compiled_language_model is not None:
             # Step 1: Process images through vision encoder
             if pixel_values is not None:
-                image_embeds = self.compiled_vision_encoder(pixel_values, image_grid_thw)
+                # Ensure pixel_values is bfloat16 and correct shape
+                pixel_values = pixel_values.to(torch.bfloat16)
 
-                # Apply merger if exists (spatial merge)
-                if self.visual_merger is not None:
-                    image_embeds = self.visual_merger(image_embeds)
+                # Check if we need to pad/reshape to expected size
+                expected_patches = (self.image_size // self.patch_size) ** 2  # 1024 for 448x448
+                actual_patches = pixel_values.shape[0]
+
+                if actual_patches != expected_patches:
+                    # Pad or truncate to expected size
+                    if actual_patches < expected_patches:
+                        # Pad with zeros
+                        padding = torch.zeros(
+                            expected_patches - actual_patches,
+                            pixel_values.shape[1],
+                            dtype=pixel_values.dtype,
+                            device=pixel_values.device
+                        )
+                        pixel_values = torch.cat([pixel_values, padding], dim=0)
+                    else:
+                        # Truncate
+                        pixel_values = pixel_values[:expected_patches]
+
+                    # Update image_grid_thw to match
+                    grid_size = self.image_size // self.patch_size
+                    image_grid_thw = torch.tensor([[1, grid_size, grid_size]], dtype=torch.int64)
+
+                image_embeds = self.compiled_vision_encoder(pixel_values, image_grid_thw)
+                # Note: merger is already included in compiled_vision_encoder
             else:
                 image_embeds = None
 

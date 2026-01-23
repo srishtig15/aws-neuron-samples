@@ -268,11 +268,12 @@ def compile_language_model(args):
     Compile the Language Model component with tensor parallelism.
 
     The language model processes text tokens combined with vision embeddings.
+    Note: Qwen2.5-VL has num_key_value_heads=4, so TP must divide 4 evenly.
     """
     batch_size = 1
     sequence_length = args.max_sequence_length
     hidden_size = 3584  # Qwen2.5-VL hidden size
-    tp_degree = 4
+    tp_degree = 4  # Must divide num_key_value_heads (4) evenly
 
     os.environ["LOCAL_WORLD_SIZE"] = str(tp_degree)
 
@@ -341,7 +342,7 @@ def compile_text_encoder_full(args):
     num_image_tokens = merged_h * merged_w
 
     total_seq_len = text_seq_len + num_image_tokens
-    tp_degree = 4
+    tp_degree = 4  # Must divide num_key_value_heads (4) evenly
 
     os.environ["LOCAL_WORLD_SIZE"] = str(tp_degree)
 
@@ -449,7 +450,7 @@ if __name__ == "__main__":
                              "'full' compiles the entire text encoder together")
     parser.add_argument("--max_sequence_length", type=int, default=512,
                         help="Max text sequence length")
-    parser.add_argument("--image_size", type=int, default=448,
+    parser.add_argument("--image_size", type=int, default=224,
                         help="Image size for vision encoder. Must be divisible by 14 (patch_size) "
                              "and result in even grid for spatial merge. Valid: 224, 336, 448, 560")
     parser.add_argument("--compiler_workdir", type=str, default="compiler_workdir",
