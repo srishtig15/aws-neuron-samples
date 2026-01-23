@@ -366,16 +366,21 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     # ========================================
     print("\n[2/3] Loading Text Encoder...")
 
-    # Load Vision Encoder (single device, not TP)
-    vision_encoder_path = f"{compiled_models_dir}/vision_encoder/model.pt"
-    if not os.path.exists(vision_encoder_path):
-        raise FileNotFoundError(
-            f"Vision encoder not found at {vision_encoder_path}\n"
-            "Please run: python neuron_qwen_image_edit/compile_text_encoder.py --vision_only"
-        )
-    print(f"  Loading vision encoder from {vision_encoder_path}...")
-    compiled_vision_encoder = torch.jit.load(vision_encoder_path)
-    print("  Vision encoder loaded!")
+    # ---- Vision Encoder on CPU (temporary to avoid OOM) ----
+    # Comment out the Neuron loading and use CPU version instead
+    print("  NOTE: Vision encoder will run on CPU (to avoid OOM)")
+    compiled_vision_encoder = None  # Will use CPU fallback in wrapper
+
+    # # Load Vision Encoder (single device, not TP) - COMMENTED OUT FOR OOM TESTING
+    # vision_encoder_path = f"{compiled_models_dir}/vision_encoder/model.pt"
+    # if not os.path.exists(vision_encoder_path):
+    #     raise FileNotFoundError(
+    #         f"Vision encoder not found at {vision_encoder_path}\n"
+    #         "Please run: python neuron_qwen_image_edit/compile_text_encoder.py --vision_only"
+    #     )
+    # print(f"  Loading vision encoder from {vision_encoder_path}...")
+    # compiled_vision_encoder = torch.jit.load(vision_encoder_path)
+    # print("  Vision encoder loaded!")
 
     # Load Language Model (TP=8 with KV head replication)
     # Both Transformer and Language Model use TP=8 for consistent world_size
@@ -406,8 +411,10 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     # ========================================
     print("\n[3/3] Loading VAE...")
 
-    # First replace with Neuron-compatible VAE architecture
-    print("  Creating Neuron-compatible VAE...")
+    # ---- VAE on CPU (temporary to avoid OOM) ----
+    # Use the original VAE on CPU instead of compiled Neuron version
+    print("  NOTE: VAE will run on CPU (to avoid OOM)")
+    print("  Creating Neuron-compatible VAE for CPU...")
     original_vae_config = pipe.vae.config
     neuron_vae = NeuronAutoencoder(
         base_dim=original_vae_config.base_dim,
@@ -422,75 +429,96 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
         latents_std=original_vae_config.latents_std,
     )
     neuron_vae.load_state_dict(pipe.vae.state_dict())
+    neuron_vae = neuron_vae.to(torch.bfloat16)
+    pipe.vae = neuron_vae  # Use CPU VAE directly
+    print("  VAE running on CPU!")
 
-    # Load compiled encoder
-    vae_encoder_path = f"{compiled_models_dir}/vae_encoder/model.pt"
-    if not os.path.exists(vae_encoder_path):
-        raise FileNotFoundError(
-            f"VAE encoder not found at {vae_encoder_path}\n"
-            "Please run: python neuron_qwen_image_edit/compile_vae.py"
-        )
-    print(f"  Loading VAE encoder from {vae_encoder_path}...")
-    vae_encoder_jit = torch.jit.load(vae_encoder_path)
-    # Wrap with DataParallel (DP=8)
-    compiled_encoder = torch_neuronx.DataParallel(
-        vae_encoder_jit,
-        device_ids=[0, 1, 2, 3, 4, 5, 6, 7],
-        set_dynamic_batching=False
-    )
-    print("  VAE encoder loaded (DP=8)!")
+    # # ----- COMMENTED OUT: Neuron VAE loading (for OOM testing) -----
+    # # First replace with Neuron-compatible VAE architecture
+    # print("  Creating Neuron-compatible VAE...")
+    # original_vae_config = pipe.vae.config
+    # neuron_vae = NeuronAutoencoder(
+    #     base_dim=original_vae_config.base_dim,
+    #     z_dim=original_vae_config.z_dim,
+    #     dim_mult=original_vae_config.dim_mult,
+    #     num_res_blocks=original_vae_config.num_res_blocks,
+    #     attn_scales=original_vae_config.attn_scales,
+    #     temperal_downsample=original_vae_config.temperal_downsample,
+    #     dropout=original_vae_config.dropout,
+    #     input_channels=original_vae_config.input_channels,
+    #     latents_mean=original_vae_config.latents_mean,
+    #     latents_std=original_vae_config.latents_std,
+    # )
+    # neuron_vae.load_state_dict(pipe.vae.state_dict())
 
-    # Load compiled decoder
-    vae_decoder_path = f"{compiled_models_dir}/vae_decoder/model.pt"
-    if not os.path.exists(vae_decoder_path):
-        raise FileNotFoundError(
-            f"VAE decoder not found at {vae_decoder_path}\n"
-            "Please run: python neuron_qwen_image_edit/compile_vae.py"
-        )
-    print(f"  Loading VAE decoder from {vae_decoder_path}...")
-    vae_decoder_jit = torch.jit.load(vae_decoder_path)
-    # Wrap with DataParallel (DP=8)
-    compiled_decoder = torch_neuronx.DataParallel(
-        vae_decoder_jit,
-        device_ids=[0, 1, 2, 3, 4, 5, 6, 7],
-        set_dynamic_batching=False
-    )
-    print("  VAE decoder loaded (DP=8)!")
+    # # Load compiled encoder
+    # vae_encoder_path = f"{compiled_models_dir}/vae_encoder/model.pt"
+    # if not os.path.exists(vae_encoder_path):
+    #     raise FileNotFoundError(
+    #         f"VAE encoder not found at {vae_encoder_path}\n"
+    #         "Please run: python neuron_qwen_image_edit/compile_vae.py"
+    #     )
+    # print(f"  Loading VAE encoder from {vae_encoder_path}...")
+    # vae_encoder_jit = torch.jit.load(vae_encoder_path)
+    # # Wrap with DataParallel (DP=8)
+    # compiled_encoder = torch_neuronx.DataParallel(
+    #     vae_encoder_jit,
+    #     device_ids=[0, 1, 2, 3, 4, 5, 6, 7],
+    #     set_dynamic_batching=False
+    # )
+    # print("  VAE encoder loaded (DP=8)!")
 
-    # Load quant_conv and post_quant_conv if they exist (also with DP=8)
-    compiled_quant_conv = None
-    quant_conv_path = f"{compiled_models_dir}/quant_conv/model.pt"
-    if os.path.exists(quant_conv_path):
-        print(f"  Loading quant_conv from {quant_conv_path}...")
-        quant_conv_jit = torch.jit.load(quant_conv_path)
-        compiled_quant_conv = torch_neuronx.DataParallel(
-            quant_conv_jit,
-            device_ids=[0, 1, 2, 3, 4, 5, 6, 7],
-            set_dynamic_batching=False
-        )
+    # # Load compiled decoder
+    # vae_decoder_path = f"{compiled_models_dir}/vae_decoder/model.pt"
+    # if not os.path.exists(vae_decoder_path):
+    #     raise FileNotFoundError(
+    #         f"VAE decoder not found at {vae_decoder_path}\n"
+    #         "Please run: python neuron_qwen_image_edit/compile_vae.py"
+    #     )
+    # print(f"  Loading VAE decoder from {vae_decoder_path}...")
+    # vae_decoder_jit = torch.jit.load(vae_decoder_path)
+    # # Wrap with DataParallel (DP=8)
+    # compiled_decoder = torch_neuronx.DataParallel(
+    #     vae_decoder_jit,
+    #     device_ids=[0, 1, 2, 3, 4, 5, 6, 7],
+    #     set_dynamic_batching=False
+    # )
+    # print("  VAE decoder loaded (DP=8)!")
 
-    compiled_post_quant_conv = None
-    post_quant_conv_path = f"{compiled_models_dir}/post_quant_conv/model.pt"
-    if os.path.exists(post_quant_conv_path):
-        print(f"  Loading post_quant_conv from {post_quant_conv_path}...")
-        post_quant_conv_jit = torch.jit.load(post_quant_conv_path)
-        compiled_post_quant_conv = torch_neuronx.DataParallel(
-            post_quant_conv_jit,
-            device_ids=[0, 1, 2, 3, 4, 5, 6, 7],
-            set_dynamic_batching=False
-        )
+    # # Load quant_conv and post_quant_conv if they exist (also with DP=8)
+    # compiled_quant_conv = None
+    # quant_conv_path = f"{compiled_models_dir}/quant_conv/model.pt"
+    # if os.path.exists(quant_conv_path):
+    #     print(f"  Loading quant_conv from {quant_conv_path}...")
+    #     quant_conv_jit = torch.jit.load(quant_conv_path)
+    #     compiled_quant_conv = torch_neuronx.DataParallel(
+    #         quant_conv_jit,
+    #         device_ids=[0, 1, 2, 3, 4, 5, 6, 7],
+    #         set_dynamic_batching=False
+    #     )
 
-    # Create VAE Wrapper
-    pipe.vae = NeuronVAEWrapper(
-        original_vae=neuron_vae,
-        compiled_encoder=compiled_encoder,
-        compiled_decoder=compiled_decoder,
-        compiled_quant_conv=compiled_quant_conv,
-        compiled_post_quant_conv=compiled_post_quant_conv,
-        expected_height=args.height,
-        expected_width=args.width
-    )
-    print("  VAE wrapper created!")
+    # compiled_post_quant_conv = None
+    # post_quant_conv_path = f"{compiled_models_dir}/post_quant_conv/model.pt"
+    # if os.path.exists(post_quant_conv_path):
+    #     print(f"  Loading post_quant_conv from {post_quant_conv_path}...")
+    #     post_quant_conv_jit = torch.jit.load(post_quant_conv_path)
+    #     compiled_post_quant_conv = torch_neuronx.DataParallel(
+    #         post_quant_conv_jit,
+    #         device_ids=[0, 1, 2, 3, 4, 5, 6, 7],
+    #         set_dynamic_batching=False
+    #     )
+
+    # # Create VAE Wrapper
+    # pipe.vae = NeuronVAEWrapper(
+    #     original_vae=neuron_vae,
+    #     compiled_encoder=compiled_encoder,
+    #     compiled_decoder=compiled_decoder,
+    #     compiled_quant_conv=compiled_quant_conv,
+    #     compiled_post_quant_conv=compiled_post_quant_conv,
+    #     expected_height=args.height,
+    #     expected_width=args.width
+    # )
+    # print("  VAE wrapper created!")
 
     # Fix missing _execution_device property
     # The pipeline expects this to determine where to run operations
@@ -498,8 +526,12 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     type(pipe)._execution_device = property(lambda self: torch.device("cpu"))
 
     print("\n" + "=" * 60)
-    print("All Models Loaded on Trainium2!")
+    print("All Models Loaded!")
     print("=" * 60)
+    print("  - Transformer: Neuron (TP=8)")
+    print("  - Language Model: Neuron (TP=8)")
+    print("  - Vision Encoder: CPU (OOM workaround)")
+    print("  - VAE: CPU (OOM workaround)")
 
     return pipe
 

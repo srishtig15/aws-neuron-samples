@@ -79,7 +79,7 @@ class NeuronTextEncoderWrapper(nn.Module):
         Forward pass combining vision encoder and language model.
 
         For Neuron inference, we run:
-        1. Vision encoder on compiled model
+        1. Vision encoder on compiled model (or CPU fallback)
         2. Combine image embeds with text embeds
         3. Pad to max_seq_len for compiled model
         4. Language model on compiled model
@@ -87,38 +87,45 @@ class NeuronTextEncoderWrapper(nn.Module):
         """
         batch_size = input_ids.shape[0] if input_ids is not None else 1
 
-        # If we have both compiled models, use them
-        if self.compiled_vision_encoder is not None and self.compiled_language_model is not None:
+        # If we have compiled language model (with optional vision encoder)
+        if self.compiled_language_model is not None:
             # Step 1: Process images through vision encoder
             if pixel_values is not None:
                 # Ensure pixel_values is bfloat16 and correct shape
                 pixel_values = pixel_values.to(torch.bfloat16)
 
-                # Check if we need to pad/reshape to expected size
-                expected_patches = (self.image_size // self.patch_size) ** 2  # 1024 for 448x448
-                actual_patches = pixel_values.shape[0]
+                # Use compiled vision encoder or CPU fallback
+                if self.compiled_vision_encoder is not None:
+                    # Check if we need to pad/reshape to expected size
+                    expected_patches = (self.image_size // self.patch_size) ** 2  # 1024 for 448x448
+                    actual_patches = pixel_values.shape[0]
 
-                if actual_patches != expected_patches:
-                    # Pad or truncate to expected size
-                    if actual_patches < expected_patches:
-                        # Pad with zeros
-                        padding = torch.zeros(
-                            expected_patches - actual_patches,
-                            pixel_values.shape[1],
-                            dtype=pixel_values.dtype,
-                            device=pixel_values.device
-                        )
-                        pixel_values = torch.cat([pixel_values, padding], dim=0)
-                    else:
-                        # Truncate
-                        pixel_values = pixel_values[:expected_patches]
+                    if actual_patches != expected_patches:
+                        # Pad or truncate to expected size
+                        if actual_patches < expected_patches:
+                            # Pad with zeros
+                            padding = torch.zeros(
+                                expected_patches - actual_patches,
+                                pixel_values.shape[1],
+                                dtype=pixel_values.dtype,
+                                device=pixel_values.device
+                            )
+                            pixel_values = torch.cat([pixel_values, padding], dim=0)
+                        else:
+                            # Truncate
+                            pixel_values = pixel_values[:expected_patches]
 
-                    # Update image_grid_thw to match
-                    grid_size = self.image_size // self.patch_size
-                    image_grid_thw = torch.tensor([[1, grid_size, grid_size]], dtype=torch.int64)
+                        # Update image_grid_thw to match
+                        grid_size = self.image_size // self.patch_size
+                        image_grid_thw = torch.tensor([[1, grid_size, grid_size]], dtype=torch.int64)
 
-                image_embeds = self.compiled_vision_encoder(pixel_values, image_grid_thw)
-                # Note: merger is already included in compiled_vision_encoder
+                    image_embeds = self.compiled_vision_encoder(pixel_values, image_grid_thw)
+                    # Note: merger is already included in compiled_vision_encoder
+                else:
+                    # CPU fallback: use original vision encoder
+                    print("  [CPU] Running vision encoder on CPU...")
+                    with torch.no_grad():
+                        image_embeds = self.original_text_encoder.model.visual(pixel_values, image_grid_thw)
             else:
                 image_embeds = None
 
