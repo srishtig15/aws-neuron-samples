@@ -336,7 +336,7 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     print("Loading Compiled Models for Trainium2")
     print("=" * 60)
     print("Parallel configuration:")
-    print("  - VAE: DP=8")
+    print("  - VAE: Single device (avoid collective conflict)")
     print("  - Transformer: TP=8")
     print(f"  - Vision Encoder: {vision_mode}")
     print("  - Language Model: TP=8 (KV head replication)")
@@ -496,13 +496,10 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
         )
     print(f"  Loading VAE encoder from {vae_encoder_path}...")
     vae_encoder_jit = torch.jit.load(vae_encoder_path)
-    # Wrap with DataParallel (DP=8)
-    compiled_encoder = torch_neuronx.DataParallel(
-        vae_encoder_jit,
-        device_ids=[0, 1, 2, 3, 4, 5, 6, 7],
-        set_dynamic_batching=False
-    )
-    print("  VAE encoder loaded (DP=8)!")
+    # Use single device to avoid collective communication conflict with TP models
+    # VAE is small (~300M params), doesn't need parallelism
+    compiled_encoder = vae_encoder_jit
+    print("  VAE encoder loaded (single device)!")
 
     # Load compiled decoder
     vae_decoder_path = f"{compiled_models_dir}/vae_decoder/model.pt"
@@ -513,36 +510,23 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
         )
     print(f"  Loading VAE decoder from {vae_decoder_path}...")
     vae_decoder_jit = torch.jit.load(vae_decoder_path)
-    # Wrap with DataParallel (DP=8)
-    compiled_decoder = torch_neuronx.DataParallel(
-        vae_decoder_jit,
-        device_ids=[0, 1, 2, 3, 4, 5, 6, 7],
-        set_dynamic_batching=False
-    )
-    print("  VAE decoder loaded (DP=8)!")
+    # Use single device to avoid collective communication conflict with TP models
+    # VAE is small (~300M params), doesn't need parallelism
+    compiled_decoder = vae_decoder_jit
+    print("  VAE decoder loaded (single device)!")
 
-    # Load quant_conv and post_quant_conv if they exist (DP=8)
+    # Load quant_conv and post_quant_conv if they exist (single device)
     compiled_quant_conv = None
     quant_conv_path = f"{compiled_models_dir}/quant_conv/model.pt"
     if os.path.exists(quant_conv_path):
         print(f"  Loading quant_conv from {quant_conv_path}...")
-        quant_conv_jit = torch.jit.load(quant_conv_path)
-        compiled_quant_conv = torch_neuronx.DataParallel(
-            quant_conv_jit,
-            device_ids=[0, 1, 2, 3, 4, 5, 6, 7],
-            set_dynamic_batching=False
-        )
+        compiled_quant_conv = torch.jit.load(quant_conv_path)
 
     compiled_post_quant_conv = None
     post_quant_conv_path = f"{compiled_models_dir}/post_quant_conv/model.pt"
     if os.path.exists(post_quant_conv_path):
         print(f"  Loading post_quant_conv from {post_quant_conv_path}...")
-        post_quant_conv_jit = torch.jit.load(post_quant_conv_path)
-        compiled_post_quant_conv = torch_neuronx.DataParallel(
-            post_quant_conv_jit,
-            device_ids=[0, 1, 2, 3, 4, 5, 6, 7],
-            set_dynamic_batching=False
-        )
+        compiled_post_quant_conv = torch.jit.load(post_quant_conv_path)
 
     # Create VAE Wrapper
     pipe.vae = NeuronVAEWrapper(
@@ -571,7 +555,7 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     print("  - Transformer: Neuron (TP=8)")
     print("  - Language Model: Neuron (TP=8)")
     print(f"  - Vision Encoder: Neuron ({vision_mode})")
-    print("  - VAE: Neuron (DP=8)")
+    print("  - VAE: Neuron (single device)")
     print("")
     print("Memory optimization:")
     print("  - Original models deleted after wrapping (freed ~56GB CPU)")
