@@ -202,13 +202,53 @@ def shard_feedforward(ff: FeedForward) -> FeedForward:
     return ff
 
 
+def get_sharded_data_with_replication(data, dim, num_heads, tp_degree):
+    """
+    Shard data with head replication when num_heads < tp_degree.
+
+    For GQA models where num_kv_heads < tp_degree, we replicate KV heads
+    so each rank gets a copy. E.g., with 4 KV heads and TP=8:
+    - Heads are replicated 2x to make 8 virtual heads
+    - Each rank gets 1 virtual head (which is a copy of the original)
+    """
+    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    tp_size = parallel_state.get_tensor_model_parallel_size()
+
+    if num_heads >= tp_size:
+        # Normal sharding
+        return get_sharded_data(data, dim)
+    else:
+        # Replication mode: num_heads < tp_size
+        # Each head is replicated (tp_size // num_heads) times
+        replication_factor = tp_size // num_heads
+        # Map tp_rank to the original head index
+        original_head_idx = tp_rank // replication_factor
+
+        head_dim = data.shape[dim] // num_heads
+        if dim == 0:
+            start = original_head_idx * head_dim
+            end = (original_head_idx + 1) * head_dim
+            return data[start:end].clone()
+        elif dim == 1:
+            start = original_head_idx * head_dim
+            end = (original_head_idx + 1) * head_dim
+            return data[:, start:end].clone()
+
+
 def shard_qwen2_attention(tp_degree: int, self_attn):
     """
     Shard Qwen2/Qwen2.5-VL self attention module (used in text encoder).
 
     Handles GQA (Grouped Query Attention) where num_key_value_heads < num_heads.
     For Qwen2.5-VL: num_heads=28, num_key_value_heads=4
-    With tp_degree=4: num_heads_per_rank=7, num_kv_heads_per_rank=1
+
+    Supports two modes:
+    1. tp_degree <= num_kv_heads: Standard sharding (each rank gets subset of KV heads)
+    2. tp_degree > num_kv_heads: KV head replication (each rank gets replicated KV heads)
+
+    With tp_degree=8 and num_kv_heads=4:
+    - Q heads: 28 -> padded to 32 -> 4 per rank
+    - KV heads: 4 -> replicated to 8 -> 1 per rank (each pair of ranks shares same KV head)
     """
     # Get original dimensions
     orig_q = self_attn.q_proj
@@ -216,18 +256,33 @@ def shard_qwen2_attention(tp_degree: int, self_attn):
     orig_v = self_attn.v_proj
     orig_o = self_attn.o_proj
 
-    # Check if we can shard KV heads evenly
+    # Get KV head count
     num_kv_heads = getattr(self_attn, 'num_key_value_heads', self_attn.num_heads)
-    if num_kv_heads % tp_degree != 0:
-        raise ValueError(
-            f"num_key_value_heads ({num_kv_heads}) must be divisible by tp_degree ({tp_degree})")
+    num_q_heads = self_attn.num_heads
 
-    # Update number of heads
-    self_attn.num_heads = self_attn.num_heads // tp_degree
+    # Check if KV replication is needed
+    kv_replicate_mode = num_kv_heads < tp_degree
+    if kv_replicate_mode:
+        # Replication mode: tp_degree must be divisible by num_kv_heads
+        if tp_degree % num_kv_heads != 0:
+            raise ValueError(
+                f"For KV head replication, tp_degree ({tp_degree}) must be divisible by "
+                f"num_key_value_heads ({num_kv_heads})")
+        print(f"  Using KV head replication mode: {num_kv_heads} KV heads replicated across {tp_degree} ranks")
+
+    # Calculate padded heads for Q
+    total_padded_q_heads = num_q_heads + get_number_of_extra_heads(num_q_heads, tp_degree)
+
+    # Update number of heads per rank
+    self_attn.num_heads = neuronx_dist_utils.divide(total_padded_q_heads, tp_degree)
     if hasattr(self_attn, 'num_key_value_heads'):
-        self_attn.num_key_value_heads = self_attn.num_key_value_heads // tp_degree
+        if kv_replicate_mode:
+            # In replication mode, each rank effectively has 1 KV head (replicated)
+            self_attn.num_key_value_heads = 1
+        else:
+            self_attn.num_key_value_heads = self_attn.num_key_value_heads // tp_degree
 
-    # Shard Q projection
+    # Shard Q projection (always sharded, with padding if needed)
     self_attn.q_proj = ColumnParallelLinear(
         orig_q.in_features,
         orig_q.out_features,
@@ -238,29 +293,54 @@ def shard_qwen2_attention(tp_degree: int, self_attn):
         self_attn.q_proj.bias.data = get_sharded_data(orig_q.bias.data, 0)
     del orig_q
 
-    # Shard K projection (may have smaller out_features for GQA)
-    self_attn.k_proj = ColumnParallelLinear(
-        orig_k.in_features,
-        orig_k.out_features,
-        bias=(orig_k.bias is not None),
-        gather_output=False)
-    self_attn.k_proj.weight.data = get_sharded_data(orig_k.weight.data, 0)
-    if orig_k.bias is not None:
-        self_attn.k_proj.bias.data = get_sharded_data(orig_k.bias.data, 0)
+    # Shard K projection (replicated if kv_replicate_mode)
+    if kv_replicate_mode:
+        # Use replication: each rank gets a copy of its assigned KV head
+        self_attn.k_proj = ColumnParallelLinear(
+            orig_k.in_features,
+            orig_k.out_features,
+            bias=(orig_k.bias is not None),
+            gather_output=False)
+        self_attn.k_proj.weight.data = get_sharded_data_with_replication(
+            orig_k.weight.data, 0, num_kv_heads, tp_degree)
+        if orig_k.bias is not None:
+            self_attn.k_proj.bias.data = get_sharded_data_with_replication(
+                orig_k.bias.data, 0, num_kv_heads, tp_degree)
+    else:
+        self_attn.k_proj = ColumnParallelLinear(
+            orig_k.in_features,
+            orig_k.out_features,
+            bias=(orig_k.bias is not None),
+            gather_output=False)
+        self_attn.k_proj.weight.data = get_sharded_data(orig_k.weight.data, 0)
+        if orig_k.bias is not None:
+            self_attn.k_proj.bias.data = get_sharded_data(orig_k.bias.data, 0)
     del orig_k
 
-    # Shard V projection (may have smaller out_features for GQA)
-    self_attn.v_proj = ColumnParallelLinear(
-        orig_v.in_features,
-        orig_v.out_features,
-        bias=(orig_v.bias is not None),
-        gather_output=False)
-    self_attn.v_proj.weight.data = get_sharded_data(orig_v.weight.data, 0)
-    if orig_v.bias is not None:
-        self_attn.v_proj.bias.data = get_sharded_data(orig_v.bias.data, 0)
+    # Shard V projection (replicated if kv_replicate_mode)
+    if kv_replicate_mode:
+        self_attn.v_proj = ColumnParallelLinear(
+            orig_v.in_features,
+            orig_v.out_features,
+            bias=(orig_v.bias is not None),
+            gather_output=False)
+        self_attn.v_proj.weight.data = get_sharded_data_with_replication(
+            orig_v.weight.data, 0, num_kv_heads, tp_degree)
+        if orig_v.bias is not None:
+            self_attn.v_proj.bias.data = get_sharded_data_with_replication(
+                orig_v.bias.data, 0, num_kv_heads, tp_degree)
+    else:
+        self_attn.v_proj = ColumnParallelLinear(
+            orig_v.in_features,
+            orig_v.out_features,
+            bias=(orig_v.bias is not None),
+            gather_output=False)
+        self_attn.v_proj.weight.data = get_sharded_data(orig_v.weight.data, 0)
+        if orig_v.bias is not None:
+            self_attn.v_proj.bias.data = get_sharded_data(orig_v.bias.data, 0)
     del orig_v
 
-    # Shard O projection
+    # Shard O projection (always sharded based on Q heads)
     self_attn.o_proj = RowParallelLinear(
         orig_o.in_features,
         orig_o.out_features,

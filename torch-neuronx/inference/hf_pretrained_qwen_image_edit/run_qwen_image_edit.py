@@ -19,6 +19,7 @@ Usage:
 
 import os
 import argparse
+import contextlib
 import random
 import time
 
@@ -65,6 +66,12 @@ class NeuronTransformerWrapper(torch.nn.Module):
         self.compiled_transformer = compiled_transformer
         self.img_shapes = img_shapes
 
+    @contextlib.contextmanager
+    def cache_context(self, name: str):
+        """Dummy cache context for compatibility with pipeline.
+        Compiled models don't use dynamic caching."""
+        yield
+
     def forward(self, hidden_states, encoder_hidden_states=None,
                 timestep=None, img_shapes=None, return_dict=False, **kwargs):
         """
@@ -101,13 +108,13 @@ class NeuronVAEWrapper(torch.nn.Module):
         self.compiled_post_quant_conv = compiled_post_quant_conv
 
         # Scaling factors - convert to tensors for broadcasting
-        # Shape: (1, z_dim, 1, 1) for proper broadcasting with latents
+        # Shape: (1, z_dim, 1, 1, 1) for proper broadcasting with 5D latents (b, c, t, h, w)
         if isinstance(original_vae.latents_mean, list):
-            self.latents_mean = torch.tensor(original_vae.latents_mean).view(1, -1, 1, 1)
+            self.latents_mean = torch.tensor(original_vae.latents_mean).view(1, -1, 1, 1, 1)
         else:
             self.latents_mean = original_vae.latents_mean
         if isinstance(original_vae.latents_std, list):
-            self.latents_std = torch.tensor(original_vae.latents_std).view(1, -1, 1, 1)
+            self.latents_std = torch.tensor(original_vae.latents_std).view(1, -1, 1, 1, 1)
         else:
             self.latents_std = original_vae.latents_std
 
@@ -167,15 +174,13 @@ class NeuronVAEWrapper(torch.nn.Module):
         # Split into mean and logvar
         mean, logvar = moments.chunk(2, dim=1)
 
-        # Sample from distribution
+        # Sample from distribution (for sample() method)
         std = torch.exp(0.5 * logvar)
         sample = mean + std * torch.randn_like(std)
 
-        # Scale latents
-        sample = (sample - self.latents_mean) / self.latents_std
-
-        # Scale the mean as well for mode()
-        scaled_mean = (mean - self.latents_mean) / self.latents_std
+        # NOTE: Do NOT scale latents here!
+        # The pipeline's _encode_vae_image will apply scaling with latents_mean/std
+        # If we scale here, it will be applied twice and produce wrong results
 
         if return_dict:
             # Create a proper class for latent distribution
@@ -195,13 +200,13 @@ class NeuronVAEWrapper(torch.nn.Module):
                 def __init__(self, latent_dist):
                     self.latent_dist = latent_dist
 
-            return EncoderOutput(LatentDist(sample, scaled_mean))
+            return EncoderOutput(LatentDist(sample, mean))
         return sample
 
     def decode(self, z, return_dict=True):
         """Decode latents to images on Neuron."""
-        # Unscale latents
-        z = z * self.latents_std + self.latents_mean
+        # NOTE: Do NOT unscale latents here!
+        # The pipeline already unscales latents before calling decode (lines 865-873 in pipeline)
 
         # Apply post_quant_conv if compiled
         if self.compiled_post_quant_conv is not None:
@@ -213,7 +218,7 @@ class NeuronVAEWrapper(torch.nn.Module):
         if return_dict:
             from diffusers.models.autoencoders.vae import DecoderOutput
             return DecoderOutput(sample=dec)
-        return dec
+        return (dec,)
 
 
 def load_all_compiled_models(compiled_models_dir: str, pipe, args):
@@ -225,7 +230,7 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     - VAE: DataParallel (DP=8) - single-device compiled, replicated across 8 devices
     - Transformer: Tensor Parallel (TP=8) - sharded across 8 devices
     - Vision Encoder: DataParallel (DP=8) - single-device compiled, replicated
-    - Language Model: Tensor Parallel (TP=4) - sharded across 4 devices
+    - Language Model: Tensor Parallel (TP=8) - sharded with KV head replication
 
     Args:
         compiled_models_dir: Directory containing compiled model artifacts
@@ -241,53 +246,16 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     print("Parallel configuration:")
     print("  - VAE: DP=8")
     print("  - Transformer: TP=8")
-    print("  - Vision Encoder: DP=8")
-    print("  - Language Model: TP=4")
+    print("  - Vision Encoder: single device")
+    print("  - Language Model: TP=8 (KV head replication)")
+    print("\nNOTE: Both Transformer and Language Model use TP=8 for consistent world_size")
 
     # ========================================
-    # 1. Load Text Encoder Components
+    # 1. Load Transformer FIRST (TP=8)
     # ========================================
-    print("\n[1/3] Loading Text Encoder...")
-
-    # Load Vision Encoder
-    vision_encoder_path = f"{compiled_models_dir}/vision_encoder/model.pt"
-    if not os.path.exists(vision_encoder_path):
-        raise FileNotFoundError(
-            f"Vision encoder not found at {vision_encoder_path}\n"
-            "Please run: python neuron_qwen_image_edit/compile_text_encoder.py --vision_only"
-        )
-    print(f"  Loading vision encoder from {vision_encoder_path}...")
-    # Vision encoder uses [num_patches, channels] input (not batch), so no DataParallel
-    compiled_vision_encoder = torch.jit.load(vision_encoder_path)
-    print("  Vision encoder loaded!")
-
-    # Load Language Model (TP=4)
-    language_model_path = f"{compiled_models_dir}/language_model"
-    if not os.path.exists(language_model_path):
-        raise FileNotFoundError(
-            f"Language model not found at {language_model_path}\n"
-            "Please run: python neuron_qwen_image_edit/compile_text_encoder.py --language_only"
-        )
-    print(f"  Loading language model from {language_model_path}...")
-    compiled_language_model = neuronx_distributed.trace.parallel_model_load(
-        language_model_path
-    )
-    print("  Language model loaded (TP=4)!")
-
-    # Create Text Encoder Wrapper
-    pipe.text_encoder = NeuronTextEncoderWrapper(
-        original_text_encoder=pipe.text_encoder,
-        compiled_vision_encoder=compiled_vision_encoder,
-        compiled_language_model=compiled_language_model,
-        image_size=args.image_size,
-        max_seq_len=args.max_sequence_length
-    )
-    print("  Text encoder wrapper created!")
-
-    # ========================================
-    # 2. Load Transformer
-    # ========================================
-    print("\n[2/3] Loading Transformer...")
+    # IMPORTANT: Must load the largest TP model first to initialize
+    # the communicator with the correct world size
+    print("\n[1/3] Loading Transformer (TP=8)...")
 
     transformer_path = f"{compiled_models_dir}/transformer"
     if not os.path.exists(transformer_path):
@@ -312,6 +280,46 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
         pipe.transformer, compiled_transformer, img_shapes
     )
     print("  Transformer loaded (TP=8)!")
+
+    # ========================================
+    # 2. Load Text Encoder Components
+    # ========================================
+    print("\n[2/3] Loading Text Encoder...")
+
+    # Load Vision Encoder (single device, not TP)
+    vision_encoder_path = f"{compiled_models_dir}/vision_encoder/model.pt"
+    if not os.path.exists(vision_encoder_path):
+        raise FileNotFoundError(
+            f"Vision encoder not found at {vision_encoder_path}\n"
+            "Please run: python neuron_qwen_image_edit/compile_text_encoder.py --vision_only"
+        )
+    print(f"  Loading vision encoder from {vision_encoder_path}...")
+    compiled_vision_encoder = torch.jit.load(vision_encoder_path)
+    print("  Vision encoder loaded!")
+
+    # Load Language Model (TP=8 with KV head replication)
+    # Both Transformer and Language Model use TP=8 for consistent world_size
+    language_model_path = f"{compiled_models_dir}/language_model"
+    if not os.path.exists(language_model_path):
+        raise FileNotFoundError(
+            f"Language model not found at {language_model_path}\n"
+            "Please run: python neuron_qwen_image_edit/compile_text_encoder.py --language_only --tp_degree 8"
+        )
+    print(f"  Loading language model from {language_model_path}...")
+    compiled_language_model = neuronx_distributed.trace.parallel_model_load(
+        language_model_path
+    )
+    print("  Language model loaded (TP=8 with KV head replication)!")
+
+    # Create Text Encoder Wrapper
+    pipe.text_encoder = NeuronTextEncoderWrapper(
+        original_text_encoder=pipe.text_encoder,
+        compiled_vision_encoder=compiled_vision_encoder,
+        compiled_language_model=compiled_language_model,
+        image_size=args.image_size,
+        max_seq_len=args.max_sequence_length
+    )
+    print("  Text encoder wrapper created!")
 
     # ========================================
     # 3. Load VAE (Encoder + Decoder)

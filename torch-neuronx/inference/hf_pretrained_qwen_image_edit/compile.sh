@@ -79,7 +79,6 @@ echo "  - vision_encoder/"
 echo "  - language_model/"
 echo ""
 echo "To run inference on Trainium2:"
-echo "  export NEURON_RT_NUM_CORES=8"
 echo "  python run_qwen_image_edit.py \\"
 echo "      --images input.jpg \\"
 echo "      --prompt \"your edit instruction\" \\"
@@ -88,6 +87,7 @@ echo "      --width ${WIDTH} \\"
 echo "      --image_size ${IMAGE_SIZE} \\"
 echo "      --warmup"
 echo ""
+
 
 # batch_size=1 (无 CFG，默认)                                                                                                                                                                                           
 python run_qwen_image_edit.py --images image1.png --prompt "把女生变成男生" --transformer_batch_size 1                                                                                                                  

@@ -99,8 +99,8 @@ def get_transformer_model(tp_degree: int, img_shapes: list):
 
 
 def compile_transformer(args):
-    tp_degree = 8  # Tensor parallel degree for trn2
-    os.environ["LOCAL_WORLD_SIZE"] = "8"
+    tp_degree = args.tp_degree  # Tensor parallel degree
+    os.environ["LOCAL_WORLD_SIZE"] = str(tp_degree)
 
     latent_height = args.height // 8
     latent_width = args.width // 8
@@ -180,6 +180,8 @@ if __name__ == "__main__":
                         help="Max sequence length for text encoder")
     parser.add_argument("--batch_size", type=int, default=1,
                         help="Batch size (2 for CFG, 1 for smaller compilation)")
+    parser.add_argument("--tp_degree", type=int, default=4,
+                        help="Tensor parallel degree (4 to match language model, or 8)")
     parser.add_argument("--compiler_workdir", type=str, default="compiler_workdir",
                         help="Directory for compiler artifacts")
     parser.add_argument("--compiled_models_dir", type=str, default="compiled_models",

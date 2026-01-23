@@ -268,12 +268,12 @@ def compile_language_model(args):
     Compile the Language Model component with tensor parallelism.
 
     The language model processes text tokens combined with vision embeddings.
-    Note: Qwen2.5-VL has num_key_value_heads=4, so TP must divide 4 evenly.
+    Qwen2.5-VL has num_key_value_heads=4. With TP=8, KV heads are replicated.
     """
     batch_size = 1
     sequence_length = args.max_sequence_length
     hidden_size = 3584  # Qwen2.5-VL hidden size
-    tp_degree = 4  # Must divide num_key_value_heads (4) evenly
+    tp_degree = args.tp_degree  # Use configurable TP degree (default=8 for consistency with transformer)
 
     os.environ["LOCAL_WORLD_SIZE"] = str(tp_degree)
 
@@ -342,7 +342,7 @@ def compile_text_encoder_full(args):
     num_image_tokens = merged_h * merged_w
 
     total_seq_len = text_seq_len + num_image_tokens
-    tp_degree = 4  # Must divide num_key_value_heads (4) evenly
+    tp_degree = args.tp_degree  # Use configurable TP degree (default=8)
 
     os.environ["LOCAL_WORLD_SIZE"] = str(tp_degree)
 
@@ -431,6 +431,7 @@ def run_in_subprocess(func_name, args):
         "--max_sequence_length", str(args.max_sequence_length),
         "--compiler_workdir", args.compiler_workdir,
         "--compiled_models_dir", args.compiled_models_dir,
+        "--tp_degree", str(args.tp_degree),
     ]
 
     if func_name == "vision":
@@ -463,6 +464,8 @@ if __name__ == "__main__":
                         help="Only compile language model")
     parser.add_argument("--use_subprocess", action="store_true",
                         help="Run each compilation in separate subprocess (avoids XLA conflicts)")
+    parser.add_argument("--tp_degree", type=int, default=8,
+                        help="Tensor parallel degree (default=8 to match transformer)")
     args = parser.parse_args()
 
     if args.mode == "separate":
