@@ -6,7 +6,7 @@ os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "2"  # For trn2
 os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2"  # For trn2
 
 # Compiler flags based on wan2.2 reference
-compiler_flags = """ --target=trn2 --lnc=2 --internal-hlo2tensorizer-options='--fuse-dot-logistic=false' --model-type=transformer --enable-fast-loading-neuron-binaries """
+compiler_flags = """ --target=trn2 --lnc=2 --internal-hlo2tensorizer-options='--fuse-dot-logistic=false' --model-type=transformer --enable-fast-loading-neuron-binaries """  #  --verbose=INFO
 os.environ["NEURON_CC_FLAGS"] = os.environ.get("NEURON_CC_FLAGS", "") + compiler_flags
 
 import torch
@@ -118,11 +118,11 @@ def compile_transformer(args):
     # Note: height/width here are in patch space (latent_h // patch_size)
     patch_h = latent_height // patch_size
     patch_w = latent_width // patch_size
-    img_shapes = [(temporal_frames, patch_h, patch_w)] * 2  # batch_size=2
+    img_shapes = [(temporal_frames, patch_h, patch_w)] * args.batch_size
 
     compiler_workdir = args.compiler_workdir
     compiled_models_dir = args.compiled_models_dir
-    batch_size = 2  # For CFG (conditional + unconditional)
+    batch_size = args.batch_size  # 2 for CFG, 1 for smaller compilation
 
     print(f"Compiling transformer with:")
     print(f"  Image size: {args.height}x{args.width}")
@@ -178,6 +178,8 @@ if __name__ == "__main__":
                         help="Width of generated image")
     parser.add_argument("--max_sequence_length", type=int, default=512,
                         help="Max sequence length for text encoder")
+    parser.add_argument("--batch_size", type=int, default=1,
+                        help="Batch size (2 for CFG, 1 for smaller compilation)")
     parser.add_argument("--compiler_workdir", type=str, default="compiler_workdir",
                         help="Directory for compiler artifacts")
     parser.add_argument("--compiled_models_dir", type=str, default="compiled_models",

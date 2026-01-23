@@ -88,7 +88,8 @@ class NeuronVAEWrapper(torch.nn.Module):
     Wrapper for VAE with compiled encoder and decoder on Trainium2.
     """
     def __init__(self, original_vae, compiled_encoder, compiled_decoder,
-                 compiled_quant_conv=None, compiled_post_quant_conv=None):
+                 compiled_quant_conv=None, compiled_post_quant_conv=None,
+                 expected_height=512, expected_width=512):
         super().__init__()
         self.config = original_vae.config
         self.dtype = original_vae.dtype
@@ -99,15 +100,61 @@ class NeuronVAEWrapper(torch.nn.Module):
         self.compiled_quant_conv = compiled_quant_conv
         self.compiled_post_quant_conv = compiled_post_quant_conv
 
-        # Scaling factors
-        self.latents_mean = original_vae.latents_mean
-        self.latents_std = original_vae.latents_std
+        # Scaling factors - convert to tensors for broadcasting
+        # Shape: (1, z_dim, 1, 1) for proper broadcasting with latents
+        if isinstance(original_vae.latents_mean, list):
+            self.latents_mean = torch.tensor(original_vae.latents_mean).view(1, -1, 1, 1)
+        else:
+            self.latents_mean = original_vae.latents_mean
+        if isinstance(original_vae.latents_std, list):
+            self.latents_std = torch.tensor(original_vae.latents_std).view(1, -1, 1, 1)
+        else:
+            self.latents_std = original_vae.latents_std
 
         # z_dim for shape calculations
         self.z_dim = original_vae.config.z_dim
 
+        # Expected input size for compiled model
+        self.expected_height = expected_height
+        self.expected_width = expected_width
+
     def encode(self, x, return_dict=True):
         """Encode images to latents on Neuron."""
+        # Check and resize input if needed
+        # x shape: (batch, channels, temporal, height, width) or (batch, channels, height, width)
+        if len(x.shape) == 5:
+            # Video format: (batch, channels, temporal, height, width)
+            b, c, t, h, w = x.shape
+            if h != self.expected_height or w != self.expected_width:
+                # Resize: squeeze temporal, interpolate, unsqueeze back
+                # This works for t=1, for multiple frames we'd need to loop
+                if t == 1:
+                    x_squeezed = x.squeeze(2)  # (b, c, h, w)
+                    x_resized = torch.nn.functional.interpolate(
+                        x_squeezed, size=(self.expected_height, self.expected_width),
+                        mode='bilinear', align_corners=False
+                    )
+                    x = x_resized.unsqueeze(2)  # (b, c, 1, h', w')
+                else:
+                    # For multiple frames, process each frame
+                    frames = []
+                    for i in range(t):
+                        frame = x[:, :, i, :, :]  # (b, c, h, w)
+                        frame_resized = torch.nn.functional.interpolate(
+                            frame, size=(self.expected_height, self.expected_width),
+                            mode='bilinear', align_corners=False
+                        )
+                        frames.append(frame_resized)
+                    x = torch.stack(frames, dim=2)  # (b, c, t, h', w')
+        elif len(x.shape) == 4:
+            # Image format: (batch, channels, height, width)
+            b, c, h, w = x.shape
+            if h != self.expected_height or w != self.expected_width:
+                x = torch.nn.functional.interpolate(
+                    x, size=(self.expected_height, self.expected_width),
+                    mode='bilinear', align_corners=False
+                )
+
         # Run encoder on Neuron
         h = self.compiled_encoder(x)
 
@@ -127,13 +174,28 @@ class NeuronVAEWrapper(torch.nn.Module):
         # Scale latents
         sample = (sample - self.latents_mean) / self.latents_std
 
+        # Scale the mean as well for mode()
+        scaled_mean = (mean - self.latents_mean) / self.latents_std
+
         if return_dict:
-            return type('EncoderOutput', (), {
-                'latent_dist': type('DiagonalGaussian', (), {
-                    'sample': lambda: sample,
-                    'mean': mean
-                })()
-            })()
+            # Create a proper class for latent distribution
+            class LatentDist:
+                def __init__(self, sample_val, mean_val):
+                    self._sample = sample_val
+                    self._mean = mean_val
+                def sample(self):
+                    return self._sample
+                def mode(self):
+                    return self._mean
+                @property
+                def mean(self):
+                    return self._mean
+
+            class EncoderOutput:
+                def __init__(self, latent_dist):
+                    self.latent_dist = latent_dist
+
+            return EncoderOutput(LatentDist(sample, scaled_mean))
         return sample
 
     def decode(self, z, return_dict=True):
@@ -243,7 +305,8 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     latent_w = args.width // 8
     patch_h = latent_h // 2
     patch_w = latent_w // 2
-    img_shapes = [(1, patch_h, patch_w)] * 2  # batch_size=2 for CFG
+    # batch_size: 2 for CFG (conditional + unconditional), 1 for no CFG
+    img_shapes = [(1, patch_h, patch_w)] * args.transformer_batch_size
 
     pipe.transformer = NeuronTransformerWrapper(
         pipe.transformer, compiled_transformer, img_shapes
@@ -335,7 +398,9 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
         compiled_encoder=compiled_encoder,
         compiled_decoder=compiled_decoder,
         compiled_quant_conv=compiled_quant_conv,
-        compiled_post_quant_conv=compiled_post_quant_conv
+        compiled_post_quant_conv=compiled_post_quant_conv,
+        expected_height=args.height,
+        expected_width=args.width
     )
     print("  VAE wrapper created!")
 
@@ -395,6 +460,13 @@ def run_inference(args):
     # Create generator for reproducibility
     generator = torch.Generator().manual_seed(args.seed)
 
+    # Handle CFG based on transformer_batch_size
+    guidance_scale = args.guidance_scale
+    if args.transformer_batch_size == 1:
+        if args.guidance_scale != 1.0:
+            print(f"  WARNING: transformer_batch_size=1, forcing guidance_scale=1.0 (no CFG)")
+        guidance_scale = 1.0  # CFG requires batch_size=2
+
     # Warmup run
     if args.warmup:
         print("\n" + "-" * 40)
@@ -408,7 +480,7 @@ def run_inference(args):
             negative_prompt=args.negative_prompt,
             height=args.height,
             width=args.width,
-            guidance_scale=args.guidance_scale,
+            guidance_scale=guidance_scale,
             num_inference_steps=min(5, args.num_inference_steps),
             generator=warmup_generator,
         )
@@ -429,7 +501,7 @@ def run_inference(args):
         negative_prompt=args.negative_prompt,
         height=args.height,
         width=args.width,
-        guidance_scale=args.guidance_scale,
+        guidance_scale=guidance_scale,
         num_inference_steps=args.num_inference_steps,
         generator=generator,
     )
@@ -484,6 +556,8 @@ if __name__ == "__main__":
                         help="Vision encoder image size (must match compiled model)")
     parser.add_argument("--max_sequence_length", type=int, default=512,
                         help="Max text sequence length (must match compiled model)")
+    parser.add_argument("--transformer_batch_size", type=int, default=1,
+                        help="Transformer batch size (1=no CFG, 2=with CFG, must match compiled model)")
 
     # Inference settings
     parser.add_argument("--num_inference_steps", type=int, default=50,

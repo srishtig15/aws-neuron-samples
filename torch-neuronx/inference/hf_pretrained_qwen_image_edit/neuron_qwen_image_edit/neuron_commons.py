@@ -81,7 +81,9 @@ class NeuronTextEncoderWrapper(nn.Module):
         For Neuron inference, we run:
         1. Vision encoder on compiled model
         2. Combine image embeds with text embeds
-        3. Language model on compiled model
+        3. Pad to max_seq_len for compiled model
+        4. Language model on compiled model
+        5. Remove padding from output
         """
         batch_size = input_ids.shape[0] if input_ids is not None else 1
 
@@ -136,8 +138,41 @@ class NeuronTextEncoderWrapper(nn.Module):
             else:
                 inputs_embeds = text_embeds
 
-            # Step 4: Run language model
+            # Step 4: Pad inputs_embeds and attention_mask to max_seq_len
+            original_seq_len = inputs_embeds.shape[1]
+            hidden_size = inputs_embeds.shape[2]
+
+            if original_seq_len < self.max_seq_len:
+                # Pad inputs_embeds with zeros
+                pad_len = self.max_seq_len - original_seq_len
+                embed_padding = torch.zeros(
+                    batch_size, pad_len, hidden_size,
+                    dtype=inputs_embeds.dtype,
+                    device=inputs_embeds.device
+                )
+                inputs_embeds = torch.cat([inputs_embeds, embed_padding], dim=1)
+
+                # Pad attention_mask with zeros (masked positions)
+                if attention_mask is not None:
+                    mask_padding = torch.zeros(
+                        batch_size, pad_len,
+                        dtype=attention_mask.dtype,
+                        device=attention_mask.device
+                    )
+                    attention_mask = torch.cat([attention_mask, mask_padding], dim=1)
+            elif original_seq_len > self.max_seq_len:
+                # Truncate if too long
+                print(f"  WARNING: Sequence length {original_seq_len} > max_seq_len {self.max_seq_len}, truncating")
+                inputs_embeds = inputs_embeds[:, :self.max_seq_len, :]
+                if attention_mask is not None:
+                    attention_mask = attention_mask[:, :self.max_seq_len]
+                original_seq_len = self.max_seq_len
+
+            # Step 5: Run language model
             hidden_states = self.compiled_language_model(inputs_embeds, attention_mask)
+
+            # Step 6: Remove padding from output (restore original sequence length)
+            hidden_states = hidden_states[:, :original_seq_len, :]
 
             # Create output similar to original
             if return_dict:

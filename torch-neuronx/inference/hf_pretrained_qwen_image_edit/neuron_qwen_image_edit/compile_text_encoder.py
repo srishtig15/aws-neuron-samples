@@ -14,7 +14,7 @@ os.environ["NEURON_CUSTOM_SILU"] = "1"
 os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "2"  # For trn2
 os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2"  # For trn2
 
-compiler_flags = """ --verbose=INFO --target=trn2 --lnc=2 --model-type=transformer --enable-fast-loading-neuron-binaries """
+compiler_flags = """ --target=trn2 --lnc=2 --model-type=transformer --enable-fast-loading-neuron-binaries """  #  --verbose=INFO
 os.environ["NEURON_CC_FLAGS"] = os.environ.get("NEURON_CC_FLAGS", "") + compiler_flags
 
 import torch
