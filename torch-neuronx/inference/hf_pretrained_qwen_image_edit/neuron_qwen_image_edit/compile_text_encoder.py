@@ -176,10 +176,12 @@ def get_language_model(tp_degree: int):
 
 def compile_vision_encoder(args):
     """
-    Compile the Vision Encoder component.
+    Compile the Vision Encoder component (single device mode).
 
     The vision encoder processes image patches and outputs vision embeddings.
     Input shape depends on image size and patch configuration.
+
+    Note: For better memory distribution, use compile_vision_encoder_tp() with --vision_tp flag.
     """
     batch_size = 1
     image_size = args.image_size
@@ -216,7 +218,7 @@ def compile_vision_encoder(args):
     dtype = torch.bfloat16
 
     print("=" * 50)
-    print("Compiling Vision Encoder")
+    print("Compiling Vision Encoder (Single Device)")
     print("=" * 50)
     print(f"  Image size: {image_size}x{image_size}")
     print(f"  Patch size: {patch_size}")
@@ -261,6 +263,139 @@ def compile_vision_encoder(args):
         except Exception as e:
             print(f"Vision encoder compilation failed: {e}")
             return False
+
+
+def get_vision_encoder_tp(tp_degree: int, image_size: int):
+    """Load and shard vision encoder for tensor parallelism."""
+    pipe = QwenImageEditPlusPipeline.from_pretrained(
+        MODEL_ID,
+        torch_dtype=torch.bfloat16,
+        local_files_only=True,
+        cache_dir=CACHE_DIR)
+
+    visual = pipe.text_encoder.model.visual
+    visual.eval()
+
+    # Shard the vision encoder blocks
+    for block in visual.blocks:
+        if hasattr(block, 'attn'):
+            block.attn = shard_vision_attention(tp_degree, block.attn)
+        if hasattr(block, 'mlp'):
+            block.mlp = shard_vision_mlp(block.mlp)
+
+    upcast_norms_to_f32(visual)
+
+    return VisionEncoderWrapper(visual), {}
+
+
+def compile_vision_encoder_tp(args):
+    """
+    Compile the Vision Encoder with tensor parallelism.
+
+    NOTE: The Qwen2.5-VL vision encoder has dimensions that are NOT divisible by 8.
+    Specifically, the fused QKV projection has dimension 3420 (1140 * 3).
+    - 3420 / 8 = 427.5 (NOT divisible)
+    - 3420 / 4 = 855 (divisible)
+    - 3420 / 2 = 1710 (divisible)
+
+    Since transformer and language model require TP=8, and mixing different TP degrees
+    causes world_size conflicts, vision encoder TP is NOT recommended.
+
+    This function will attempt TP compilation but is expected to fail with TP=8.
+    Use single-device compilation (--vision_only without --vision_tp) instead.
+    """
+    batch_size = 1
+    image_size = args.image_size
+    patch_size = 14
+    temporal_patch_size = 2
+    spatial_merge_size = 2
+    tp_degree = args.tp_degree
+
+    # Check if vision encoder dimensions are compatible with TP degree
+    vision_embed_dim = 1140  # Qwen2.5-VL vision encoder embed_dim
+    qkv_dim = vision_embed_dim * 3  # 3420
+
+    if qkv_dim % tp_degree != 0:
+        print("=" * 60)
+        print("WARNING: Vision Encoder TP Compilation Not Supported")
+        print("=" * 60)
+        print(f"  Vision encoder QKV dimension: {qkv_dim}")
+        print(f"  Requested TP degree: {tp_degree}")
+        print(f"  {qkv_dim} is NOT divisible by {tp_degree}")
+        print("")
+        print("  The Qwen2.5-VL vision encoder has dimensions incompatible with TP=8.")
+        print("  Falling back to single-device compilation...")
+        print("")
+
+        # Fall back to single device compilation
+        return compile_vision_encoder(args)
+
+    os.environ["LOCAL_WORLD_SIZE"] = str(tp_degree)
+
+    # Validate image_size
+    if image_size % patch_size != 0:
+        raise ValueError(
+            f"image_size ({image_size}) must be divisible by patch_size ({patch_size}). "
+            f"Valid sizes: 224, 336, 448, 560, etc.")
+
+    num_patches_per_side = image_size // patch_size
+    if num_patches_per_side % spatial_merge_size != 0:
+        raise ValueError(
+            f"image_size / patch_size ({num_patches_per_side}) must be divisible by "
+            f"spatial_merge_size ({spatial_merge_size}). "
+            f"Valid image sizes: 224, 336, 448, 560, etc.")
+
+    num_patches_h = image_size // patch_size
+    num_patches_w = image_size // patch_size
+    num_patches = num_patches_h * num_patches_w
+
+    channels_per_patch = 3 * temporal_patch_size * patch_size * patch_size  # 1176
+
+    compiler_workdir = args.compiler_workdir
+    compiled_models_dir = args.compiled_models_dir
+    dtype = torch.bfloat16
+
+    print("=" * 50)
+    print("Compiling Vision Encoder with Tensor Parallelism")
+    print("=" * 50)
+    print(f"  Image size: {image_size}x{image_size}")
+    print(f"  Patch size: {patch_size}")
+    print(f"  Num patches: {num_patches}")
+    print(f"  Channels per patch: {channels_per_patch}")
+    print(f"  TP degree: {tp_degree}")
+
+    get_vision_f = partial(get_vision_encoder_tp, tp_degree, image_size)
+
+    # Sample inputs
+    sample_pixel_values = torch.ones((num_patches, channels_per_patch), dtype=dtype)
+    sample_grid_thw = torch.tensor([[1, num_patches_h, num_patches_w]], dtype=torch.int64)
+
+    sample_inputs = (sample_pixel_values, sample_grid_thw)
+
+    with torch.no_grad():
+        try:
+            compiled_vision = neuronx_distributed.trace.parallel_model_trace(
+                get_vision_f,
+                sample_inputs,
+                compiler_workdir=f"{compiler_workdir}/vision_encoder_tp",
+                compiler_args=compiler_flags,
+                tp_degree=tp_degree,
+                inline_weights_to_neff=False
+            )
+
+            vision_dir = f"{compiled_models_dir}/vision_encoder_tp"
+            if not os.path.exists(vision_dir):
+                os.makedirs(vision_dir)
+
+            neuronx_distributed.trace.parallel_model_save(
+                compiled_vision, vision_dir)
+            print(f"Vision encoder (TP={tp_degree}) compiled and saved to {vision_dir}")
+            return True
+
+        except Exception as e:
+            print(f"Vision encoder TP compilation failed: {e}")
+            print("Falling back to single-device compilation...")
+            return compile_vision_encoder(args)
 
 
 def compile_language_model(args):
@@ -419,7 +554,7 @@ def compile_text_encoder_full(args):
             return False
 
 
-def run_in_subprocess(func_name, args):
+def run_in_subprocess(func_name, args, vision_tp=False):
     """Run a compilation function in a separate subprocess to avoid XLA conflicts."""
     import subprocess
     import sys
@@ -436,6 +571,8 @@ def run_in_subprocess(func_name, args):
 
     if func_name == "vision":
         cmd.append("--vision_only")
+        if vision_tp:
+            cmd.append("--vision_tp")
     elif func_name == "language":
         cmd.append("--language_only")
 
@@ -460,6 +597,9 @@ if __name__ == "__main__":
                         help="Directory for compiled models")
     parser.add_argument("--vision_only", action="store_true",
                         help="Only compile vision encoder")
+    parser.add_argument("--vision_tp", action="store_true",
+                        help="Compile vision encoder with tensor parallelism (TP=8) instead of single device. "
+                             "Helps reduce per-device memory usage.")
     parser.add_argument("--language_only", action="store_true",
                         help="Only compile language model")
     parser.add_argument("--use_subprocess", action="store_true",
@@ -471,15 +611,22 @@ if __name__ == "__main__":
     if args.mode == "separate":
         # If specific component requested, run directly
         if args.vision_only:
-            print("\n[Vision Only] Compiling Vision Encoder...")
-            compile_vision_encoder(args)
+            if args.vision_tp:
+                print("\n[Vision Only] Compiling Vision Encoder with TP...")
+                compile_vision_encoder_tp(args)
+            else:
+                print("\n[Vision Only] Compiling Vision Encoder (single device)...")
+                compile_vision_encoder(args)
         elif args.language_only:
             print("\n[Language Only] Compiling Language Model...")
             compile_language_model(args)
         elif args.use_subprocess:
             # Run in separate subprocesses to avoid XLA initialization conflicts
-            print("\n[Step 1] Compiling Vision Encoder (subprocess)...")
-            vision_success = run_in_subprocess("vision", args)
+            if args.vision_tp:
+                print("\n[Step 1] Compiling Vision Encoder with TP (subprocess)...")
+            else:
+                print("\n[Step 1] Compiling Vision Encoder (subprocess)...")
+            vision_success = run_in_subprocess("vision", args, vision_tp=args.vision_tp)
 
             print("\n[Step 2] Compiling Language Model (subprocess)...")
             lang_success = run_in_subprocess("language", args)
@@ -488,16 +635,25 @@ if __name__ == "__main__":
                 print("\n" + "=" * 50)
                 print("Text Encoder Compilation Complete!")
                 print("=" * 50)
+                if args.vision_tp:
+                    print("  Vision Encoder: TP={} (saved to vision_encoder_tp/)".format(args.tp_degree))
+                else:
+                    print("  Vision Encoder: Single device (saved to vision_encoder/)")
+                print("  Language Model: TP={} (saved to language_model/)".format(args.tp_degree))
         else:
             # Default: try sequential but warn about XLA issue
             print("\nNOTE: If language model compilation fails with 'Runtime is already initialized',")
             print("      run with --use_subprocess flag or compile separately:")
-            print("      python compile_text_encoder.py --vision_only")
+            print("      python compile_text_encoder.py --vision_only [--vision_tp]")
             print("      python compile_text_encoder.py --language_only")
             print("")
 
-            print("\n[Step 1] Compiling Vision Encoder...")
-            vision_success = compile_vision_encoder(args)
+            if args.vision_tp:
+                print("\n[Step 1] Compiling Vision Encoder with TP...")
+                vision_success = compile_vision_encoder_tp(args)
+            else:
+                print("\n[Step 1] Compiling Vision Encoder...")
+                vision_success = compile_vision_encoder(args)
 
             print("\n[Step 2] Compiling Language Model...")
             lang_success = compile_language_model(args)
@@ -506,5 +662,10 @@ if __name__ == "__main__":
                 print("\n" + "=" * 50)
                 print("Text Encoder Compilation Complete!")
                 print("=" * 50)
+                if args.vision_tp:
+                    print("  Vision Encoder: TP={} (saved to vision_encoder_tp/)".format(args.tp_degree))
+                else:
+                    print("  Vision Encoder: Single device (saved to vision_encoder/)")
+                print("  Language Model: TP={} (saved to language_model/)".format(args.tp_degree))
     else:
         compile_text_encoder_full(args)

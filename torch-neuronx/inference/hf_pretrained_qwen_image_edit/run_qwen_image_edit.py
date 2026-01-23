@@ -18,6 +18,26 @@ Usage:
 """
 
 import os
+
+# ============================================================================
+# CRITICAL: Set Neuron environment variables BEFORE any other imports!
+# These MUST match the compilation settings.
+# ============================================================================
+TP_DEGREE = 8  # Must match compile_transformer.py and compile_text_encoder.py
+
+# Set tensor parallel world size
+os.environ["LOCAL_WORLD_SIZE"] = str(TP_DEGREE)
+
+# Neuron runtime settings - MUST match compilation
+os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "2"  # For trn2 LNC=2
+os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2"     # For trn2 LNC=2
+
+# Neuron compiler settings (for any runtime compilation)
+os.environ["NEURON_FUSE_SOFTMAX"] = "1"
+os.environ["NEURON_CUSTOM_SILU"] = "1"
+
+print(f"Neuron runtime configured: TP={TP_DEGREE}, LNC=2")
+
 import argparse
 import contextlib
 import random
@@ -291,7 +311,7 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     Parallel configuration:
     - VAE: DataParallel (DP=8) - single-device compiled, replicated across 8 devices
     - Transformer: Tensor Parallel (TP=8) - sharded across 8 devices
-    - Vision Encoder: DataParallel (DP=8) - single-device compiled, replicated
+    - Vision Encoder: Single device OR TP=8 (use --vision_tp flag for TP mode)
     - Language Model: Tensor Parallel (TP=8) - sharded with KV head replication
 
     IMPORTANT: This function replaces original models with compiled versions
@@ -307,15 +327,20 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     """
     import gc
 
+    # Check for vision encoder mode
+    vision_encoder_tp_path = f"{compiled_models_dir}/vision_encoder_tp"
+    use_vision_tp = args.vision_tp if hasattr(args, 'vision_tp') else False
+    vision_mode = "TP=8" if (use_vision_tp or os.path.exists(vision_encoder_tp_path)) else "single device"
+
     print("\n" + "=" * 60)
     print("Loading Compiled Models for Trainium2")
     print("=" * 60)
     print("Parallel configuration:")
     print("  - VAE: DP=8")
     print("  - Transformer: TP=8")
-    print("  - Vision Encoder: single device")
+    print(f"  - Vision Encoder: {vision_mode}")
     print("  - Language Model: TP=8 (KV head replication)")
-    print("\nNOTE: Both Transformer and Language Model use TP=8 for consistent world_size")
+    print("\nNOTE: All TP models use TP=8 for consistent world_size")
 
     # ========================================
     # 1. Load Transformer FIRST (TP=8)
@@ -377,16 +402,38 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     # ========================================
     print("\n[2/3] Loading Text Encoder...")
 
-    # Load Vision Encoder (single device, not TP)
-    vision_encoder_path = f"{compiled_models_dir}/vision_encoder/model.pt"
-    if not os.path.exists(vision_encoder_path):
-        raise FileNotFoundError(
-            f"Vision encoder not found at {vision_encoder_path}\n"
-            "Please run: python neuron_qwen_image_edit/compile_text_encoder.py --vision_only"
+    # Load Vision Encoder
+    # Check for TP version first (better memory distribution), then single device
+    # Note: vision_encoder_tp_path and use_vision_tp are defined at the top of this function
+    vision_encoder_single_path = f"{compiled_models_dir}/vision_encoder/model.pt"
+
+    if use_vision_tp or (os.path.exists(vision_encoder_tp_path) and not os.path.exists(vision_encoder_single_path)):
+        # Load TP-compiled vision encoder
+        if not os.path.exists(vision_encoder_tp_path):
+            raise FileNotFoundError(
+                f"Vision encoder (TP) not found at {vision_encoder_tp_path}\n"
+                "Please run: python neuron_qwen_image_edit/compile_text_encoder.py --vision_only --vision_tp"
+            )
+        print(f"  Loading vision encoder (TP={TP_DEGREE}) from {vision_encoder_tp_path}...")
+        compiled_vision_encoder = neuronx_distributed.trace.parallel_model_load(
+            vision_encoder_tp_path
         )
-    print(f"  Loading vision encoder from {vision_encoder_path}...")
-    compiled_vision_encoder = torch.jit.load(vision_encoder_path)
-    print("  Vision encoder loaded!")
+        print(f"  Vision encoder loaded (TP={TP_DEGREE})!")
+    else:
+        # Load single-device vision encoder
+        if not os.path.exists(vision_encoder_single_path):
+            raise FileNotFoundError(
+                f"Vision encoder not found at {vision_encoder_single_path}\n"
+                "Please run: python neuron_qwen_image_edit/compile_text_encoder.py --vision_only\n"
+                "Or for TP version: python neuron_qwen_image_edit/compile_text_encoder.py --vision_only --vision_tp"
+            )
+        print(f"  Loading vision encoder from {vision_encoder_single_path}...")
+        vision_encoder_jit = torch.jit.load(vision_encoder_single_path)
+        # Vision encoder input is (num_patches, channels), NOT (batch, ...)
+        # DataParallel would incorrectly split on patches dimension
+        # Must use single device
+        compiled_vision_encoder = vision_encoder_jit
+        print("  Vision encoder loaded (single device - input is patches, not batch)!")
 
     # Load Language Model (TP=8 with KV head replication)
     # Both Transformer and Language Model use TP=8 for consistent world_size
@@ -474,7 +521,7 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     )
     print("  VAE decoder loaded (DP=8)!")
 
-    # Load quant_conv and post_quant_conv if they exist (also with DP=8)
+    # Load quant_conv and post_quant_conv if they exist (DP=8)
     compiled_quant_conv = None
     quant_conv_path = f"{compiled_models_dir}/quant_conv/model.pt"
     if os.path.exists(quant_conv_path):
@@ -517,16 +564,17 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     # Override the property with a lambda that returns CPU device
     type(pipe)._execution_device = property(lambda self: torch.device("cpu"))
 
+    # Use vision_mode defined at the top of the function
     print("\n" + "=" * 60)
     print("All Models Loaded on Trainium2!")
     print("=" * 60)
     print("  - Transformer: Neuron (TP=8)")
     print("  - Language Model: Neuron (TP=8)")
-    print("  - Vision Encoder: Neuron (single device)")
+    print(f"  - Vision Encoder: Neuron ({vision_mode})")
     print("  - VAE: Neuron (DP=8)")
     print("")
-    print("Memory optimization: Original models deleted after wrapping.")
-    print("  - Freed ~40GB (transformer) + ~16GB (text encoder) = ~56GB CPU memory")
+    print("Memory optimization:")
+    print("  - Original models deleted after wrapping (freed ~56GB CPU)")
 
     return pipe
 
@@ -681,6 +729,9 @@ if __name__ == "__main__":
                         help="Max text sequence length (must match compiled model)")
     parser.add_argument("--transformer_batch_size", type=int, default=1,
                         help="Transformer batch size (1=no CFG, 2=with CFG, must match compiled model)")
+    parser.add_argument("--vision_tp", action="store_true",
+                        help="Use TP-compiled vision encoder (from vision_encoder_tp/). "
+                             "Default is to auto-detect based on available compiled models.")
 
     # Inference settings
     parser.add_argument("--num_inference_steps", type=int, default=50,
