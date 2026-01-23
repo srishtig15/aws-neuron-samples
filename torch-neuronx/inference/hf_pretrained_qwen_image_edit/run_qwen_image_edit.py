@@ -58,13 +58,16 @@ class NeuronTransformerWrapper(torch.nn.Module):
     """
     Wrapper for compiled transformer model on Trainium2.
     """
-    def __init__(self, original_transformer, compiled_transformer, img_shapes):
+    def __init__(self, original_transformer, compiled_transformer, img_shapes,
+                 expected_num_patches=1024, expected_seq_len=512):
         super().__init__()
         self.config = original_transformer.config
         self.dtype = original_transformer.dtype
         self.device = original_transformer.device
         self.compiled_transformer = compiled_transformer
         self.img_shapes = img_shapes
+        self.expected_num_patches = expected_num_patches
+        self.expected_seq_len = expected_seq_len
 
     @contextlib.contextmanager
     def cache_context(self, name: str):
@@ -76,13 +79,72 @@ class NeuronTransformerWrapper(torch.nn.Module):
                 timestep=None, img_shapes=None, return_dict=False, **kwargs):
         """
         Forward pass using compiled transformer on Neuron.
+        Handles shape padding and dtype conversion for compiled model.
         """
+        batch_size = hidden_states.shape[0]
+
+        # Debug: Print shapes on first call
+        if not hasattr(self, '_debug_printed'):
+            print(f"DEBUG Transformer input shapes:")
+            print(f"  hidden_states: {hidden_states.shape}")
+            print(f"  encoder_hidden_states: {encoder_hidden_states.shape}")
+            print(f"  timestep: {timestep.shape}, dtype={timestep.dtype}")
+            print(f"  img_shapes: {img_shapes}")
+            print(f"  Expected: num_patches={self.expected_num_patches}, seq_len={self.expected_seq_len}")
+            self._debug_printed = True
+
+        # 1. Handle hidden_states shape (num_patches dimension)
+        # Compiled model expects (batch, expected_num_patches, 64)
+        actual_patches = hidden_states.shape[1]
+        if actual_patches != self.expected_num_patches:
+            if actual_patches < self.expected_num_patches:
+                # Pad with zeros
+                pad_size = self.expected_num_patches - actual_patches
+                padding = torch.zeros(
+                    (batch_size, pad_size, hidden_states.shape[2]),
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device
+                )
+                hidden_states = torch.cat([hidden_states, padding], dim=1)
+            else:
+                # Truncate - This is problematic! The model was compiled for fewer patches.
+                # This likely means the transformer needs to be recompiled with correct shape.
+                print(f"ERROR: hidden_states has {actual_patches} patches but model expects {self.expected_num_patches}")
+                print(f"  You may need to recompile the transformer with correct dimensions.")
+                print(f"  Truncating will produce incorrect results!")
+                hidden_states = hidden_states[:, :self.expected_num_patches, :]
+
+        # 2. Handle encoder_hidden_states shape (sequence length)
+        # Compiled model expects (batch, expected_seq_len, 3584)
+        actual_seq_len = encoder_hidden_states.shape[1]
+        if actual_seq_len != self.expected_seq_len:
+            if actual_seq_len < self.expected_seq_len:
+                # Pad with zeros
+                pad_size = self.expected_seq_len - actual_seq_len
+                padding = torch.zeros(
+                    (batch_size, pad_size, encoder_hidden_states.shape[2]),
+                    dtype=encoder_hidden_states.dtype,
+                    device=encoder_hidden_states.device
+                )
+                encoder_hidden_states = torch.cat([encoder_hidden_states, padding], dim=1)
+            else:
+                # Truncate
+                print(f"WARNING: Truncating encoder_hidden_states from {actual_seq_len} to {self.expected_seq_len}")
+                encoder_hidden_states = encoder_hidden_states[:, :self.expected_seq_len, :]
+
+        # 3. Convert timestep to float32 (compiled model expects float32)
+        timestep = timestep.to(torch.float32)
+
         # Run on compiled Neuron model
         output = self.compiled_transformer(
             hidden_states,
             encoder_hidden_states,
             timestep
         )
+
+        # 4. Remove padding from output if we padded hidden_states
+        if actual_patches < self.expected_num_patches:
+            output = (output[0][:, :actual_patches, :],) + output[1:]
 
         if return_dict:
             from diffusers.models.modeling_outputs import Transformer2DModelOutput
@@ -268,18 +330,36 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
         transformer_path
     )
 
-    # Calculate img_shapes for the compiled model
-    latent_h = args.height // 8
-    latent_w = args.width // 8
-    patch_h = latent_h // 2
-    patch_w = latent_w // 2
-    # batch_size: 2 for CFG (conditional + unconditional), 1 for no CFG
-    img_shapes = [(1, patch_h, patch_w)] * args.transformer_batch_size
+    # Calculate expected shapes for the COMPILED model
+    # These must match what was used during compilation (compile.sh defaults to 512x512)
+    compiled_height = args.compiled_height
+    compiled_width = args.compiled_width
+    compiled_latent_h = compiled_height // 8
+    compiled_latent_w = compiled_width // 8
+    compiled_patch_h = compiled_latent_h // 2
+    compiled_patch_w = compiled_latent_w // 2
+    base_num_patches = compiled_patch_h * compiled_patch_w  # 32*32=1024 for 512x512
+
+    # For IMAGE EDITING, patches are doubled (source + noise latents concatenated)
+    # This is handled by using temporal_frames = patch_multiplier
+    # - patch_multiplier=1 (generation): temporal_frames=1, patches = 1 * 32 * 32 = 1024
+    # - patch_multiplier=2 (editing): temporal_frames=2, patches = 2 * 32 * 32 = 2048
+    temporal_frames = args.patch_multiplier
+    expected_num_patches = temporal_frames * base_num_patches
+    print(f"  Expected num_patches: {expected_num_patches} (temporal_frames={temporal_frames}, base={base_num_patches})")
+
+    # img_shapes for the wrapper - must match compiled model
+    # Use compiled dimensions and temporal_frames = patch_multiplier
+    patch_h = compiled_patch_h
+    patch_w = compiled_patch_w
+    img_shapes = [(temporal_frames, patch_h, patch_w)] * args.transformer_batch_size
 
     pipe.transformer = NeuronTransformerWrapper(
-        pipe.transformer, compiled_transformer, img_shapes
+        pipe.transformer, compiled_transformer, img_shapes,
+        expected_num_patches=expected_num_patches,
+        expected_seq_len=args.max_sequence_length
     )
-    print("  Transformer loaded (TP=8)!")
+    print(f"  Transformer loaded (TP=8)! Expected patches={expected_num_patches}, seq_len={args.max_sequence_length}")
 
     # ========================================
     # 2. Load Text Encoder Components
@@ -431,8 +511,7 @@ def run_inference(args):
     print("\n" + "=" * 60)
     print("Qwen-Image-Edit Inference on Trainium2")
     print("=" * 60)
-    print(f"  Height: {args.height}")
-    print(f"  Width: {args.width}")
+    print(f"  Compiled dimensions: {args.compiled_height}x{args.compiled_width}")
     print(f"  Steps: {args.num_inference_steps}")
     print(f"  Guidance scale: {args.guidance_scale}")
 
@@ -452,15 +531,16 @@ def run_inference(args):
     pipe = load_all_compiled_models(args.compiled_models_dir, pipe, args)
 
     # Load source images (1-3 images supported)
+    # IMPORTANT: Images must be resized to COMPILED dimensions for the transformer
     print(f"\nLoading {len(args.images)} source image(s)...")
     source_images = []
     for img_path in args.images:
         print(f"  Loading: {img_path}")
         img = load_image(img_path)
-        # Resize to match compiled dimensions
-        img = img.resize((args.width, args.height))
+        # Resize to match COMPILED dimensions (not inference dimensions)
+        img = img.resize((args.compiled_width, args.compiled_height))
         source_images.append(img)
-    print(f"All images resized to: {args.width}x{args.height}")
+    print(f"All images resized to: {args.compiled_width}x{args.compiled_height} (compiled dimensions)")
 
     # Use single image or list based on count
     input_images = source_images[0] if len(source_images) == 1 else source_images
@@ -486,8 +566,8 @@ def run_inference(args):
             image=input_images,
             prompt=args.prompt,
             negative_prompt=args.negative_prompt,
-            height=args.height,
-            width=args.width,
+            height=args.compiled_height,  # Use compiled dimensions
+            width=args.compiled_width,
             guidance_scale=guidance_scale,
             num_inference_steps=min(5, args.num_inference_steps),
             generator=warmup_generator,
@@ -507,8 +587,8 @@ def run_inference(args):
         image=input_images,
         prompt=args.prompt,
         negative_prompt=args.negative_prompt,
-        height=args.height,
-        width=args.width,
+        height=args.compiled_height,  # Use compiled dimensions
+        width=args.compiled_width,
         guidance_scale=guidance_scale,
         num_inference_steps=args.num_inference_steps,
         generator=generator,
@@ -527,10 +607,10 @@ def run_inference(args):
     if args.save_comparison:
         # Create comparison with all input images + output
         num_images = len(source_images) + 1  # inputs + output
-        comparison = Image.new('RGB', (args.width * num_images, args.height))
+        comparison = Image.new('RGB', (args.compiled_width * num_images, args.compiled_height))
         for i, img in enumerate(source_images):
-            comparison.paste(img, (args.width * i, 0))
-        comparison.paste(output_image, (args.width * len(source_images), 0))
+            comparison.paste(img, (args.compiled_width * i, 0))
+        comparison.paste(output_image, (args.compiled_width * len(source_images), 0))
         comparison_path = output_path.replace('.png', '_comparison.png')
         comparison.save(comparison_path)
         print(f"Comparison saved to: {comparison_path}")
@@ -553,11 +633,19 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=str, default=None,
                         help="Output image path (default: output_edited.png)")
 
-    # Image settings - MUST match compilation settings
+    # Image settings for inference
     parser.add_argument("--height", type=int, default=512,
-                        help="Image height (must match compiled model)")
+                        help="Image height for inference")
     parser.add_argument("--width", type=int, default=512,
-                        help="Image width (must match compiled model)")
+                        help="Image width for inference")
+
+    # Compiled model dimensions (what the model was compiled with)
+    parser.add_argument("--compiled_height", type=int, default=512,
+                        help="Height used during model compilation (default: 512)")
+    parser.add_argument("--compiled_width", type=int, default=512,
+                        help="Width used during model compilation (default: 512)")
+    parser.add_argument("--patch_multiplier", type=int, default=2,
+                        help="Patch multiplier (2 for image editing, 1 for generation)")
 
     # Text encoder settings - MUST match compilation settings
     parser.add_argument("--image_size", type=int, default=224,

@@ -108,16 +108,26 @@ def compile_transformer(args):
     text_hidden_size = 3584  # Text encoder hidden size
     in_channels = 64  # QwenImage transformer in_channels
     patch_size = 2  # QwenImage patch size
-    temporal_frames = 1  # For single image
+
+    # For IMAGE EDITING, the pipeline concatenates source image latents with noise latents.
+    # This is handled by increasing temporal_frames to match patch_multiplier.
+    # - patch_multiplier=1 (generation): temporal_frames=1, patches = 1 * 32 * 32 = 1024
+    # - patch_multiplier=2 (editing): temporal_frames=2, patches = 2 * 32 * 32 = 2048
+    temporal_frames = args.patch_multiplier
 
     # Calculate number of patches
     # QwenImage uses patch_size=2, so num_patches = T * (H/8/2) * (W/8/2)
-    num_patches = temporal_frames * (latent_height // patch_size) * (latent_width // patch_size)
+    patch_h = latent_height // patch_size
+    patch_w = latent_width // patch_size
+    num_patches = temporal_frames * patch_h * patch_w
+
+    if args.patch_multiplier > 1:
+        print(f"  NOTE: Image editing mode with patch_multiplier={args.patch_multiplier}")
+        print(f"  Using temporal_frames={temporal_frames} to generate RoPE for {num_patches} patches")
 
     # img_shapes: List of (frame, height, width) for each batch item
     # Note: height/width here are in patch space (latent_h // patch_size)
-    patch_h = latent_height // patch_size
-    patch_w = latent_width // patch_size
+    # temporal_frames is set to patch_multiplier to match the concatenated patches
     img_shapes = [(temporal_frames, patch_h, patch_w)] * args.batch_size
 
     compiler_workdir = args.compiler_workdir
@@ -172,16 +182,18 @@ def compile_transformer(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--height", type=int, default=1024,
+    parser.add_argument("--height", type=int, default=512,
                         help="Height of generated image")
-    parser.add_argument("--width", type=int, default=1024,
+    parser.add_argument("--width", type=int, default=512,
                         help="Width of generated image")
     parser.add_argument("--max_sequence_length", type=int, default=512,
                         help="Max sequence length for text encoder")
     parser.add_argument("--batch_size", type=int, default=1,
                         help="Batch size (2 for CFG, 1 for smaller compilation)")
-    parser.add_argument("--tp_degree", type=int, default=4,
-                        help="Tensor parallel degree (4 to match language model, or 8)")
+    parser.add_argument("--tp_degree", type=int, default=8,
+                        help="Tensor parallel degree (8 to match language model)")
+    parser.add_argument("--patch_multiplier", type=int, default=2,
+                        help="Patch multiplier for image editing (2 for src+noise concat, 1 for generation)")
     parser.add_argument("--compiler_workdir", type=str, default="compiler_workdir",
                         help="Directory for compiler artifacts")
     parser.add_argument("--compiled_models_dir", type=str, default="compiled_models",

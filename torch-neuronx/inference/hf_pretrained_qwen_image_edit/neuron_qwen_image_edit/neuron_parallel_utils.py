@@ -271,7 +271,13 @@ def shard_qwen2_attention(tp_degree: int, self_attn):
         print(f"  Using KV head replication mode: {num_kv_heads} KV heads replicated across {tp_degree} ranks")
 
     # Calculate padded heads for Q
-    total_padded_q_heads = num_q_heads + get_number_of_extra_heads(num_q_heads, tp_degree)
+    extra_q_heads = get_number_of_extra_heads(num_q_heads, tp_degree)
+    total_padded_q_heads = num_q_heads + extra_q_heads
+    q_head_dim = orig_q.out_features // num_q_heads  # 3584 / 28 = 128
+    padded_q_out_features = total_padded_q_heads * q_head_dim  # 32 * 128 = 4096
+
+    print(f"  Q heads: {num_q_heads} -> padded to {total_padded_q_heads}, "
+          f"out_features: {orig_q.out_features} -> {padded_q_out_features}")
 
     # Update number of heads per rank
     self_attn.num_heads = neuronx_dist_utils.divide(total_padded_q_heads, tp_degree)
@@ -282,25 +288,52 @@ def shard_qwen2_attention(tp_degree: int, self_attn):
         else:
             self_attn.num_key_value_heads = self_attn.num_key_value_heads // tp_degree
 
-    # Shard Q projection (always sharded, with padding if needed)
+    # Shard Q projection (with padding if needed)
+    # Need to pad weights before sharding when num_heads is not divisible by tp_degree
+    q_weight_padded = orig_q.weight.data
+    q_bias_padded = orig_q.bias.data if orig_q.bias is not None else None
+
+    if extra_q_heads > 0:
+        # Pad Q weights with zeros for extra heads
+        padding_size = extra_q_heads * q_head_dim
+        q_weight_padding = torch.zeros(
+            (padding_size, orig_q.in_features),
+            dtype=orig_q.weight.dtype,
+            device=orig_q.weight.device)
+        q_weight_padded = torch.cat([orig_q.weight.data, q_weight_padding], dim=0)
+
+        if orig_q.bias is not None:
+            q_bias_padding = torch.zeros(
+                padding_size,
+                dtype=orig_q.bias.dtype,
+                device=orig_q.bias.device)
+            q_bias_padded = torch.cat([orig_q.bias.data, q_bias_padding], dim=0)
+
+    # Now create ColumnParallelLinear with padded dimensions
     self_attn.q_proj = ColumnParallelLinear(
         orig_q.in_features,
-        orig_q.out_features,
+        padded_q_out_features,  # Use padded out_features
         bias=(orig_q.bias is not None),
         gather_output=False)
-    self_attn.q_proj.weight.data = get_sharded_data(orig_q.weight.data, 0)
+    self_attn.q_proj.weight.data = get_sharded_data(q_weight_padded, 0)
     if orig_q.bias is not None:
-        self_attn.q_proj.bias.data = get_sharded_data(orig_q.bias.data, 0)
+        self_attn.q_proj.bias.data = get_sharded_data(q_bias_padded, 0)
     del orig_q
 
     # Shard K projection (replicated if kv_replicate_mode)
+    # Get head_dim for KV
+    kv_head_dim = orig_k.out_features // num_kv_heads  # 512 / 4 = 128
+
     if kv_replicate_mode:
-        # Use replication: each rank gets a copy of its assigned KV head
-        self_attn.k_proj = ColumnParallelLinear(
+        # In replication mode, use regular nn.Linear (not ColumnParallelLinear)
+        # because we want each rank to have 1 full KV head, not a fraction
+        # Each rank gets 1 KV head = head_dim features
+        kv_out_features_per_rank = kv_head_dim  # 128
+
+        self_attn.k_proj = nn.Linear(
             orig_k.in_features,
-            orig_k.out_features,
-            bias=(orig_k.bias is not None),
-            gather_output=False)
+            kv_out_features_per_rank,
+            bias=(orig_k.bias is not None))
         self_attn.k_proj.weight.data = get_sharded_data_with_replication(
             orig_k.weight.data, 0, num_kv_heads, tp_degree)
         if orig_k.bias is not None:
@@ -319,11 +352,13 @@ def shard_qwen2_attention(tp_degree: int, self_attn):
 
     # Shard V projection (replicated if kv_replicate_mode)
     if kv_replicate_mode:
-        self_attn.v_proj = ColumnParallelLinear(
+        # Same as K: use regular nn.Linear with replicated weights
+        kv_out_features_per_rank = kv_head_dim  # 128
+
+        self_attn.v_proj = nn.Linear(
             orig_v.in_features,
-            orig_v.out_features,
-            bias=(orig_v.bias is not None),
-            gather_output=False)
+            kv_out_features_per_rank,
+            bias=(orig_v.bias is not None))
         self_attn.v_proj.weight.data = get_sharded_data_with_replication(
             orig_v.weight.data, 0, num_kv_heads, tp_degree)
         if orig_v.bias is not None:
@@ -341,12 +376,27 @@ def shard_qwen2_attention(tp_degree: int, self_attn):
     del orig_v
 
     # Shard O projection (always sharded based on Q heads)
+    # O projection input comes from attention output, which has padded_q_out_features
+    # We need to pad the O weight's input dimension to match
+
+    o_weight_padded = orig_o.weight.data
+
+    if extra_q_heads > 0:
+        # Original O weight: (out_features, in_features) = (3584, 3584)
+        # Need to pad input dimension to padded_q_out_features = 4096
+        padding_size = extra_q_heads * q_head_dim
+        o_weight_padding = torch.zeros(
+            (orig_o.out_features, padding_size),
+            dtype=orig_o.weight.dtype,
+            device=orig_o.weight.device)
+        o_weight_padded = torch.cat([orig_o.weight.data, o_weight_padding], dim=1)
+
     self_attn.o_proj = RowParallelLinear(
-        orig_o.in_features,
+        padded_q_out_features,  # Use padded in_features
         orig_o.out_features,
         bias=(orig_o.bias is not None),
         input_is_parallel=True)
-    self_attn.o_proj.weight.data = get_sharded_data(orig_o.weight.data, 1)
+    self_attn.o_proj.weight.data = get_sharded_data(o_weight_padded, 1)
     if orig_o.bias is not None:
         self_attn.o_proj.bias.data = orig_o.bias.data.detach()
     del orig_o

@@ -229,9 +229,9 @@ def compile_vae_encoder_only(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--height", type=int, default=1024,
+    parser.add_argument("--height", type=int, default=512,
                         help="Height of generated image")
-    parser.add_argument("--width", type=int, default=1024,
+    parser.add_argument("--width", type=int, default=512,
                         help="Width of generated image")
     parser.add_argument("--temporal_frames", type=int, default=1,
                         help="Number of temporal frames (1 for single image)")
