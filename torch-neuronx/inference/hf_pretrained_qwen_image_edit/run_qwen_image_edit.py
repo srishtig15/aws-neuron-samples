@@ -244,6 +244,9 @@ class NeuronVAEWrapper(torch.nn.Module):
                     mode='bilinear', align_corners=False
                 )
 
+        # Convert to bfloat16 (compiled models expect bfloat16)
+        x = x.to(torch.bfloat16)
+
         # Run encoder on Neuron
         h = self.compiled_encoder(x)
 
@@ -289,6 +292,9 @@ class NeuronVAEWrapper(torch.nn.Module):
         """Decode latents to images on Neuron."""
         # NOTE: Do NOT unscale latents here!
         # The pipeline already unscales latents before calling decode (lines 865-873 in pipeline)
+
+        # Convert to bfloat16 (compiled models expect bfloat16)
+        z = z.to(torch.bfloat16)
 
         # Apply post_quant_conv if compiled
         if self.compiled_post_quant_conv is not None:
