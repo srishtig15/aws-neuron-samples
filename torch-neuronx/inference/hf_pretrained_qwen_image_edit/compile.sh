@@ -16,8 +16,8 @@ COMPILED_MODELS_DIR="compiled_models"
 COMPILER_WORKDIR="compiler_workdir"
 
 # Parse arguments
-HEIGHT=${1:-256}
-WIDTH=${2:-256}
+HEIGHT=${1:-512}
+WIDTH=${2:-512}
 IMAGE_SIZE=${3:-224}  # Vision encoder image size (must be divisible by 14 and result in even grid)
 TP_DEGREE=${4:-8}
 MAX_SEQ_LEN=${5:-512}

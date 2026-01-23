@@ -19,7 +19,7 @@ from diffusers import QwenImageEditPlusPipeline
 from diffusers.models.transformers.transformer_qwenimage import QwenImageTransformer2DModel
 
 from neuron_commons import attention_wrapper_for_transformer
-from neuron_parallel_utils import shard_qwen_attention, shard_feedforward
+from neuron_parallel_utils import shard_qwen_attention, shard_feedforward, shard_modulation
 from neuron_rope import patch_qwenimage_rope
 
 # Note: Do NOT override SDPA globally during compilation
@@ -78,6 +78,7 @@ def get_transformer_model(tp_degree: int, img_shapes: list):
         if block_idx == 0:
             print(f"Block 0 attention heads: {block.attn.heads}")
             print(f"Block 0 to_q shape: {block.attn.to_q.weight.shape}")
+            print(f"Block 0 img_mod shape: {block.img_mod[1].weight.shape}")
 
         # Shard attention
         block.attn = shard_qwen_attention(tp_degree, block.attn)
@@ -88,6 +89,14 @@ def get_transformer_model(tp_degree: int, img_shapes: list):
         # Shard feedforward (img_mlp and txt_mlp)
         block.img_mlp = shard_feedforward(block.img_mlp)
         block.txt_mlp = shard_feedforward(block.txt_mlp)
+
+        # Shard modulation layers (img_mod and txt_mod) - THIS WAS MISSING!
+        # These account for 6.8B params that were duplicated on every rank!
+        block.img_mod = shard_modulation(block.img_mod)
+        block.txt_mod = shard_modulation(block.txt_mod)
+
+        if block_idx == 0:
+            print(f"After sharding - Block 0 img_mod shape: {block.img_mod[1].weight.shape}")
 
         if (block_idx + 1) % 10 == 0:
             print(f"  Processed {block_idx + 1}/{num_blocks} blocks")

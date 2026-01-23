@@ -212,6 +212,33 @@ def shard_feedforward(ff: FeedForward) -> FeedForward:
     return ff
 
 
+def shard_modulation(mod: nn.Sequential) -> nn.Sequential:
+    """
+    Shard modulation layer (img_mod, txt_mod) for tensor parallelism.
+
+    Modulation layers are Sequential(SiLU, Linear) with shape [18432, 3072].
+    18432 = 6 * 3072 (for 6 modulation outputs: shift, scale for 3 different targets)
+
+    We shard the output dimension (18432) across TP ranks.
+    """
+    # mod[0] is SiLU (no weights)
+    # mod[1] is Linear(3072, 18432)
+    orig_linear = mod[1]
+
+    mod[1] = ColumnParallelLinear(
+        orig_linear.in_features,
+        orig_linear.out_features,
+        bias=(orig_linear.bias is not None),
+        gather_output=True,  # Need to gather for modulation to work correctly
+        dtype=torch.bfloat16)
+    mod[1].weight.data = get_sharded_data(orig_linear.weight.data, 0)
+    if orig_linear.bias is not None:
+        mod[1].bias.data = get_sharded_data(orig_linear.bias.data, 0)
+    del orig_linear
+
+    return mod
+
+
 def get_sharded_data_with_replication(data, dim, num_heads, tp_degree):
     """
     Shard data with head replication when num_heads < tp_degree.
