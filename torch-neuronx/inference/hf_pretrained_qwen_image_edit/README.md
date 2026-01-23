@@ -6,9 +6,9 @@ This project enables running the [Qwen-Image-Edit-2509](https://huggingface.co/Q
 
 Qwen-Image-Edit is a powerful image editing model that combines:
 - **Text Encoder**: Qwen2.5-VL (Vision-Language Model)
-  - Vision Encoder: 32 transformer blocks
-  - Language Model: 28 layers with GQA (Grouped Query Attention)
-- **Transformer**: QwenImageTransformer2DModel for diffusion
+  - Vision Encoder: 32 transformer blocks (~1.4GB)
+  - Language Model: 28 layers with GQA (~7B params)
+- **Transformer**: QwenImageTransformer2DModel for diffusion (~20.4B params)
 - **VAE**: 3D convolutional autoencoder for image encoding/decoding
 
 ## Requirements
@@ -116,25 +116,56 @@ hf_pretrained_qwen_image_edit/
 └── compiled_models/               # Output directory for compiled models
     ├── vae_encoder/
     ├── vae_decoder/
-    ├── transformer/
-    ├── vision_encoder/
-    └── language_model/
+    ├── transformer/               # TP=8 sharded transformer (~5GB per shard)
+    ├── vision_encoder/            # Single device
+    └── language_model/            # TP=8 sharded
 ```
 
 ## Technical Details
 
+### Model Size Analysis
+
+| Component | Total Params | Sharded Layers | Per-Shard Size (TP=8) |
+|-----------|-------------|----------------|----------------------|
+| Transformer | 20.43B | attention, mlp, modulation | ~5.2 GB |
+| Language Model | 7.07B | attention (GQA), mlp | ~1.8 GB |
+| Vision Encoder | ~1.4B | N/A (single device) | ~2.8 GB |
+| VAE | ~300M | N/A (DP=8) | ~600 MB |
+
 ### Tensor Parallelism Configuration
 
-| Component | TP Degree | Notes |
-|-----------|-----------|-------|
-| Transformer | 8 | Model too large for TP=4 |
-| Language Model | 8 | KV head replication (4 heads → 8 shards) |
-| Vision Encoder | 1 | Single device |
-| VAE | 1 (DP=8) | Data parallel across 8 devices |
+| Component | Parallelism | Notes |
+|-----------|-------------|-------|
+| Transformer | TP=8 | Full sharding including modulation layers |
+| Language Model | TP=8 | KV head replication (4 heads → 8 shards) |
+| Vision Encoder | Single device | Dimensions (3420) not divisible by 8 |
+| VAE | DP=8 | Data parallel across 8 devices |
 
 ### Key Technical Challenges & Solutions
 
-#### 1. KV Head Replication for GQA
+#### 1. Modulation Layer Sharding (Critical!)
+
+The transformer has `img_mod` and `txt_mod` modulation layers that were previously NOT sharded, causing 6.8B params to be duplicated on every TP rank!
+
+```python
+# Problem: Each block has modulation layers [18432, 3072]
+# 60 blocks × 2 mods × 56.6M params = 6.8B params duplicated!
+
+# Solution: Shard modulation layers (neuron_parallel_utils.py)
+def shard_modulation(mod: nn.Sequential) -> nn.Sequential:
+    """Shard img_mod/txt_mod with ColumnParallelLinear."""
+    orig_linear = mod[1]  # Sequential(SiLU, Linear)
+    mod[1] = ColumnParallelLinear(
+        orig_linear.in_features,
+        orig_linear.out_features,
+        gather_output=True,  # Need full output for modulation
+        dtype=torch.bfloat16)
+    ...
+```
+
+**Impact**: Reduces transformer size from ~17GB to ~5.2GB per shard!
+
+#### 2. KV Head Replication for GQA
 
 The Language Model uses Grouped Query Attention with only 4 KV heads, but we need TP=8. Solution: replicate KV heads across TP ranks.
 
@@ -151,7 +182,7 @@ def get_sharded_data_with_replication(data, dim, num_heads, tp_degree):
         ...
 ```
 
-#### 2. Q Head Padding
+#### 3. Q Head Padding
 
 The model has 28 attention heads which isn't divisible by 8. Solution: pad to 32 heads.
 
@@ -160,7 +191,7 @@ The model has 28 attention heads which isn't divisible by 8. Solution: pad to 32
 padded_num_heads = ((num_heads + tp_degree - 1) // tp_degree) * tp_degree
 ```
 
-#### 3. Image Editing Patch Multiplier
+#### 4. Image Editing Patch Multiplier
 
 For image editing, the pipeline concatenates source image latents with noise latents, doubling the patch count. This is handled via `patch_multiplier=2`.
 
@@ -170,7 +201,7 @@ temporal_frames = args.patch_multiplier  # 2 for editing, 1 for generation
 num_patches = temporal_frames * patch_h * patch_w  # 2 * 32 * 32 = 2048
 ```
 
-#### 4. Neuron-Compatible VAE
+#### 5. Neuron-Compatible VAE
 
 The original VAE uses `F.interpolate` with `mode='nearest-exact'` which isn't supported by Neuron. Solution: custom VAE with `mode='nearest'`.
 
@@ -179,7 +210,7 @@ The original VAE uses `F.interpolate` with `mode='nearest-exact'` which isn't su
 # Changed: mode="nearest-exact" → mode="nearest"
 ```
 
-#### 5. Neuron-Compatible RoPE
+#### 6. Neuron-Compatible RoPE
 
 The original RoPE implementation uses complex numbers which aren't supported. Solution: real-number implementation.
 
@@ -191,12 +222,11 @@ def apply_rotary_pos_emb_neuron(x, cos, sin):
     return torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1).flatten(-2)
 ```
 
-#### 6. BFloat16 for Parallel Layers (Critical!)
+#### 7. BFloat16 for Parallel Layers
 
 The `neuronx_distributed` parallel layers (`ColumnParallelLinear`, `RowParallelLinear`) default to `float32`, which doubles the model size. Solution: explicitly set `dtype=torch.bfloat16`.
 
 ```python
-# neuron_parallel_utils.py
 # WRONG - defaults to float32, doubles model size!
 attn.to_q = ColumnParallelLinear(in_features, out_features, ...)
 
@@ -204,19 +234,13 @@ attn.to_q = ColumnParallelLinear(in_features, out_features, ...)
 attn.to_q = ColumnParallelLinear(dtype=torch.bfloat16, in_features, out_features, ...)
 ```
 
-**Impact**: Without this fix, the compiled transformer grows from ~35GB to ~128GB!
+### Memory Optimization Summary
 
-### Memory Optimization
-
-The full model runs entirely on Trainium2:
-- **Transformer**: TP=8, ~4GB per shard (with bfloat16)
-- **Language Model**: TP=8, ~1.7GB per shard
-- **Vision Encoder**: Single device, ~1.4GB
-- **VAE**: DP=8, ~320MB total
-
-Key optimizations:
-1. **Use `dtype=torch.bfloat16`** for all parallel layers (critical!)
-2. **Use `inline_weights_to_neff=True`** during compilation to embed weights in NEFF
+| Optimization | Before | After | Savings |
+|-------------|--------|-------|---------|
+| Modulation sharding | 17 GB/shard | 5.2 GB/shard | 70% |
+| BFloat16 dtype | 2x size | 1x size | 50% |
+| Proper weight sharding | Duplicated | 1/8 per rank | 87.5% |
 
 ## Compilation Options
 
@@ -258,8 +282,8 @@ ERROR: hidden_states has X patches but model expects Y
 Failed to allocate X bytes
 ```
 **Solution**:
-1. Use `inline_weights_to_neff=True` during compilation
-2. Run VAE/Vision Encoder on CPU (current default)
+1. Ensure modulation layers are sharded (check for `shard_modulation` in compile_transformer.py)
+2. Use `dtype=torch.bfloat16` for all parallel layers
 3. Reduce image size or sequence length
 
 ### RoPE Dimension Mismatch
@@ -274,10 +298,16 @@ Process group already initialized with different world_size
 ```
 **Solution**: Both Transformer and Language Model must use the same TP degree (8).
 
+### Vision Encoder TP Not Supported
+```
+3420 is not divisible by 8
+```
+**Solution**: Vision encoder uses single device (dimensions not compatible with TP=8).
+
 ## Known Limitations
 
 1. **Fixed dimensions**: Models are compiled for specific dimensions. Different sizes require recompilation.
-2. **Memory constraints**: Full Neuron execution may cause OOM on some configurations.
+2. **Vision encoder**: Must run on single device (hidden dim 3420 not divisible by 8).
 3. **Sequence length**: Must match between compilation and inference.
 
 ## References
