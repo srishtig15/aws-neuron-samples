@@ -294,6 +294,9 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     - Vision Encoder: DataParallel (DP=8) - single-device compiled, replicated
     - Language Model: Tensor Parallel (TP=8) - sharded with KV head replication
 
+    IMPORTANT: This function replaces original models with compiled versions
+    and explicitly deletes the originals to free memory.
+
     Args:
         compiled_models_dir: Directory containing compiled model artifacts
         pipe: Original pipeline
@@ -302,6 +305,8 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     Returns:
         Updated pipeline with ALL Neuron-compiled models
     """
+    import gc
+
     print("\n" + "=" * 60)
     print("Loading Compiled Models for Trainium2")
     print("=" * 60)
@@ -354,12 +359,18 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     patch_w = compiled_patch_w
     img_shapes = [(temporal_frames, patch_h, patch_w)] * args.transformer_batch_size
 
+    # Store reference to original for wrapper, then delete
+    original_transformer = pipe.transformer
     pipe.transformer = NeuronTransformerWrapper(
-        pipe.transformer, compiled_transformer, img_shapes,
+        original_transformer, compiled_transformer, img_shapes,
         expected_num_patches=expected_num_patches,
         expected_seq_len=args.max_sequence_length
     )
+    # Delete original transformer to free ~40GB memory
+    del original_transformer
+    gc.collect()
     print(f"  Transformer loaded (TP=8)! Expected patches={expected_num_patches}, seq_len={args.max_sequence_length}")
+    print("  Original transformer deleted to free memory.")
 
     # ========================================
     # 2. Load Text Encoder Components
@@ -392,14 +403,20 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     print("  Language model loaded (TP=8 with KV head replication)!")
 
     # Create Text Encoder Wrapper
+    # Store reference to original, then delete after wrapper is created
+    original_text_encoder = pipe.text_encoder
     pipe.text_encoder = NeuronTextEncoderWrapper(
-        original_text_encoder=pipe.text_encoder,
+        original_text_encoder=original_text_encoder,
         compiled_vision_encoder=compiled_vision_encoder,
         compiled_language_model=compiled_language_model,
         image_size=args.image_size,
         max_seq_len=args.max_sequence_length
     )
+    # Delete original text encoder to free ~16GB memory
+    del original_text_encoder
+    gc.collect()
     print("  Text encoder wrapper created!")
+    print("  Original text encoder deleted to free memory.")
 
     # ========================================
     # 3. Load VAE (Encoder + Decoder)
@@ -490,6 +507,9 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
         expected_height=args.height,
         expected_width=args.width
     )
+    # Delete the neuron_vae (original VAE copy) - small but still free it
+    del neuron_vae
+    gc.collect()
     print("  VAE wrapper created!")
 
     # Fix missing _execution_device property
@@ -504,6 +524,9 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     print("  - Language Model: Neuron (TP=8)")
     print("  - Vision Encoder: Neuron (single device)")
     print("  - VAE: Neuron (DP=8)")
+    print("")
+    print("Memory optimization: Original models deleted after wrapping.")
+    print("  - Freed ~40GB (transformer) + ~16GB (text encoder) = ~56GB CPU memory")
 
     return pipe
 

@@ -45,23 +45,45 @@ class NeuronTextEncoderWrapper(nn.Module):
     Combines separately compiled vision encoder and language model.
     This wrapper handles the embedding combination logic that normally
     happens inside the original text encoder.
+
+    IMPORTANT: This wrapper COPIES necessary components and does NOT keep
+    references to the original model, to avoid memory bloat.
     """
     def __init__(self, original_text_encoder, compiled_vision_encoder=None,
                  compiled_language_model=None, image_size=448, max_seq_len=512):
         super().__init__()
+        # Copy config (small object)
         self.config = original_text_encoder.config
         self.dtype = torch.bfloat16
 
-        # Store original components for embedding operations
-        self.embed_tokens = original_text_encoder.model.language_model.embed_tokens
-        self.visual_merger = original_text_encoder.model.visual.merger if hasattr(original_text_encoder.model.visual, 'merger') else None
+        # IMPORTANT: Copy embed_tokens weights instead of keeping reference!
+        # This allows the original model to be garbage collected.
+        orig_embed = original_text_encoder.model.language_model.embed_tokens
+        self.embed_tokens = nn.Embedding(
+            orig_embed.num_embeddings,
+            orig_embed.embedding_dim,
+            padding_idx=orig_embed.padding_idx,
+            dtype=torch.bfloat16
+        )
+        self.embed_tokens.weight.data = orig_embed.weight.data.clone().to(torch.bfloat16)
+        print(f"  Copied embed_tokens: {orig_embed.num_embeddings} x {orig_embed.embedding_dim} "
+              f"= {orig_embed.weight.numel() * 2 / 1e9:.2f} GB")
+
+        # Copy visual_merger if it exists (small module)
+        if hasattr(original_text_encoder.model.visual, 'merger'):
+            # Deep copy the merger module
+            import copy
+            self.visual_merger = copy.deepcopy(original_text_encoder.model.visual.merger)
+            self.visual_merger = self.visual_merger.to(torch.bfloat16)
+        else:
+            self.visual_merger = None
 
         # Compiled models
         self.compiled_vision_encoder = compiled_vision_encoder
         self.compiled_language_model = compiled_language_model
 
-        # Keep original for fallback
-        self.original_text_encoder = original_text_encoder
+        # DO NOT keep original_text_encoder - it's 16+ GB!
+        # self.original_text_encoder = original_text_encoder  # REMOVED!
 
         # Image processing parameters
         self.image_size = image_size
@@ -122,10 +144,11 @@ class NeuronTextEncoderWrapper(nn.Module):
                     image_embeds = self.compiled_vision_encoder(pixel_values, image_grid_thw)
                     # Note: merger is already included in compiled_vision_encoder
                 else:
-                    # CPU fallback: use original vision encoder
-                    print("  [CPU] Running vision encoder on CPU...")
-                    with torch.no_grad():
-                        image_embeds = self.original_text_encoder.model.visual(pixel_values, image_grid_thw)
+                    # No vision encoder compiled - this should not happen in full Neuron mode
+                    raise RuntimeError(
+                        "Vision encoder not compiled! Please compile the vision encoder first:\n"
+                        "  python neuron_qwen_image_edit/compile_text_encoder.py --vision_only"
+                    )
             else:
                 image_embeds = None
 
@@ -189,15 +212,10 @@ class NeuronTextEncoderWrapper(nn.Module):
                 })()
             return hidden_states
         else:
-            # Fallback to original
-            return self.original_text_encoder(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                pixel_values=pixel_values,
-                image_grid_thw=image_grid_thw,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-                **kwargs
+            # No compiled language model - this should not happen in full Neuron mode
+            raise RuntimeError(
+                "Language model not compiled! Please compile the language model first:\n"
+                "  python neuron_qwen_image_edit/compile_text_encoder.py --language_only"
             )
 
     def _merge_embeddings(self, text_embeds, image_embeds, input_ids, image_token_id):
