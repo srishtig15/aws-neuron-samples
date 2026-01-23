@@ -16,8 +16,8 @@ COMPILED_MODELS_DIR="compiled_models"
 COMPILER_WORKDIR="compiler_workdir"
 
 # Parse arguments
-HEIGHT=${1:-512}
-WIDTH=${2:-512}
+HEIGHT=${1:-256}
+WIDTH=${2:-256}
 IMAGE_SIZE=${3:-224}  # Vision encoder image size (must be divisible by 14 and result in even grid)
 TP_DEGREE=${4:-8}
 MAX_SEQ_LEN=${5:-512}
@@ -43,26 +43,26 @@ echo ""
 # Step 2: Compile VAE (encoder and decoder)
 echo "[Step 2/4] Compiling VAE..."
 echo "Using modified VAE with 'nearest' interpolation (Neuron doesn't support 'nearest-exact')"
-# python neuron_qwen_image_edit/compile_vae.py \
-#     --height ${HEIGHT} \
-#     --width ${WIDTH} \
-#     --temporal_frames 1 \
-#     --compiled_models_dir ${COMPILED_MODELS_DIR} \
-#     --compiler_workdir ${COMPILER_WORKDIR}
+python neuron_qwen_image_edit/compile_vae.py \
+    --height ${HEIGHT} \
+    --width ${WIDTH} \
+    --temporal_frames 1 \
+    --compiled_models_dir ${COMPILED_MODELS_DIR} \
+    --compiler_workdir ${COMPILER_WORKDIR}
 echo "VAE compiled successfully!"
 echo ""
 
 # Step 3: Compile Transformer
 echo "[Step 3/4] Compiling Transformer..."
 echo "  TP=${TP_DEGREE}, patch_multiplier=${PATCH_MULTIPLIER} (for image editing)"
-# python neuron_qwen_image_edit/compile_transformer.py \
-#     --height ${HEIGHT} \
-#     --width ${WIDTH} \
-#     --tp_degree ${TP_DEGREE} \
-#     --patch_multiplier ${PATCH_MULTIPLIER} \
-#     --max_sequence_length ${MAX_SEQ_LEN} \
-#     --compiled_models_dir ${COMPILED_MODELS_DIR} \
-#     --compiler_workdir ${COMPILER_WORKDIR}
+python neuron_qwen_image_edit/compile_transformer.py \
+    --height ${HEIGHT} \
+    --width ${WIDTH} \
+    --tp_degree ${TP_DEGREE} \
+    --patch_multiplier ${PATCH_MULTIPLIER} \
+    --max_sequence_length ${MAX_SEQ_LEN} \
+    --compiled_models_dir ${COMPILED_MODELS_DIR} \
+    --compiler_workdir ${COMPILER_WORKDIR}
 echo "Transformer compiled successfully!"
 echo ""
 

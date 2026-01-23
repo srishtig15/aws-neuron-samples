@@ -709,15 +709,15 @@ if __name__ == "__main__":
                         help="Output image path (default: output_edited.png)")
 
     # Image settings for inference
-    parser.add_argument("--height", type=int, default=512,
+    parser.add_argument("--height", type=int, default=256,
                         help="Image height for inference")
-    parser.add_argument("--width", type=int, default=512,
+    parser.add_argument("--width", type=int, default=256,
                         help="Image width for inference")
 
     # Compiled model dimensions (what the model was compiled with)
-    parser.add_argument("--compiled_height", type=int, default=512,
+    parser.add_argument("--compiled_height", type=int, default=256,
                         help="Height used during model compilation (default: 512)")
-    parser.add_argument("--compiled_width", type=int, default=512,
+    parser.add_argument("--compiled_width", type=int, default=256,
                         help="Width used during model compilation (default: 512)")
     parser.add_argument("--patch_multiplier", type=int, default=2,
                         help="Patch multiplier (2 for image editing, 1 for generation)")
