@@ -12,8 +12,8 @@
 set -e
 
 export PYTHONPATH=`pwd`:$PYTHONPATH
-COMPILED_MODELS_DIR="compiled_models"
-COMPILER_WORKDIR="compiler_workdir"
+COMPILED_MODELS_DIR="/opt/dlami/nvme/compiled_models"
+COMPILER_WORKDIR="/opt/dlami/nvme/compiler_workdir"
 
 # Parse arguments
 HEIGHT=${1:-512}
@@ -104,8 +104,8 @@ echo "      --patch_multiplier ${PATCH_MULTIPLIER} \\"
 echo "      --max_sequence_length ${MAX_SEQ_LEN}"
 echo ""
 
-# # batch_size=1 (无 CFG，默认)                                                                                                                                                                                           
-# NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png --prompt "把女生变成男生" --transformer_batch_size 1                                                                                                                  
+# batch_size=1 (无 CFG，默认)                                                                                                                                                                                           
+NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png --prompt "把女生变成男生" --transformer_batch_size 1                                                                                                                  
                                                                                                                                                                                                                         
 # # batch_size=2 (有 CFG，需要用 batch_size=2 编译 transformer)                                                                                                                                                           
 # NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png --prompt "把女生变成男生" --transformer_batch_size 1    python run_qwen_image_edit.py --images image1.png --prompt "把女生变成男生" --transformer_batch_size 2 --guidance_scale 7.5

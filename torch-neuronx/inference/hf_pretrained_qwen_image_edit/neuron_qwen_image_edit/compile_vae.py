@@ -1,6 +1,7 @@
 import os
 os.environ["NEURON_FUSE_SOFTMAX"] = "1"
 os.environ["NEURON_CUSTOM_SILU"] = "1"
+os.environ["XLA_DISABLE_FUNCTIONALIZATION"] = "0"
 os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "2"  # For trn2
 os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2"  # For trn2
 
@@ -22,7 +23,7 @@ from autoencoder_kl_qwenimage_neuron import AutoencoderKLQwenImage as NeuronAuto
 # Override SDPA
 torch.nn.functional.scaled_dot_product_attention = attention_wrapper
 
-CACHE_DIR = "qwen_image_edit_hf_cache_dir"
+CACHE_DIR = "/opt/dlami/nvme/qwen_image_edit_hf_cache_dir"
 MODEL_ID = "Qwen/Qwen-Image-Edit-2509"
 
 

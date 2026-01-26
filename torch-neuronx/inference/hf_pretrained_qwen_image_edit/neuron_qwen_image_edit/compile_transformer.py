@@ -26,7 +26,7 @@ from neuron_rope import patch_qwenimage_rope
 # The diffusers attention processor handles attention internally
 # torch.nn.functional.scaled_dot_product_attention = attention_wrapper_for_transformer
 
-CACHE_DIR = "qwen_image_edit_hf_cache_dir"
+CACHE_DIR = "/opt/dlami/nvme/qwen_image_edit_hf_cache_dir"
 MODEL_ID = "Qwen/Qwen-Image-Edit-2509"
 
 

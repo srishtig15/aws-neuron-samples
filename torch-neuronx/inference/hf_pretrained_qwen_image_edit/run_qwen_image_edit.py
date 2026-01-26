@@ -60,8 +60,8 @@ from neuron_qwen_image_edit.neuron_commons import NeuronTextEncoderWrapper
 
 
 # Constants
-COMPILED_MODELS_DIR = "compiled_models"
-HUGGINGFACE_CACHE_DIR = "qwen_image_edit_hf_cache_dir"
+COMPILED_MODELS_DIR = "/opt/dlami/nvme/compiled_models"
+HUGGINGFACE_CACHE_DIR = "/opt/dlami/nvme/qwen_image_edit_hf_cache_dir"
 MODEL_ID = "Qwen/Qwen-Image-Edit-2509"
 SEED = 42
 

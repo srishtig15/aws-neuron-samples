@@ -22,6 +22,26 @@ Qwen-Image-Edit is a powerful image editing model that combines:
 source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
 ```
 
+## Environment Setup
+
+### Mount NVMe Storage (trn2.48xlarge)
+
+trn2.48xlarge 实例配有 4 个 NVMe 设备，需要挂载后才能使用。模型文件和编译产物较大，建议挂载到 `/opt/dlami/nvme`：
+
+```bash
+# 运行挂载脚本（需要 sudo 权限）
+sudo ./setup_nvme.sh
+```
+
+脚本功能：
+- 自动检测所有可用的 NVMe 设备（排除系统盘）
+- 创建 RAID0 阵列以获得最大性能和容量（约 7.5TB）
+- 格式化为 ext4 文件系统
+- 挂载到 `/opt/dlami/nvme`
+- 设置正确的权限（ubuntu 用户可读写）
+
+**注意**：重启后需要重新运行脚本，或手动添加到 `/etc/fstab` 实现开机自动挂载。
+
 ## Quick Start
 
 ### 1. Download the Model
@@ -102,6 +122,7 @@ python run_qwen_image_edit.py \
 ```
 hf_pretrained_qwen_image_edit/
 ├── README.md                      # This file
+├── setup_nvme.sh                  # NVMe RAID0 mount script
 ├── compile.sh                     # Main compilation script
 ├── run_qwen_image_edit.py         # Inference script
 ├── neuron_qwen_image_edit/
@@ -113,6 +134,13 @@ hf_pretrained_qwen_image_edit/
 │   ├── neuron_parallel_utils.py   # Tensor parallelism utilities
 │   ├── neuron_rope.py             # Neuron-compatible RoPE implementation
 │   └── autoencoder_kl_qwenimage_neuron.py  # Neuron-compatible VAE
+├── tests/                         # Unit tests for debugging
+│   ├── run_all_tests.py           # Run all tests
+│   ├── test_vae.py                # VAE encoder/decoder tests
+│   ├── test_transformer.py        # Transformer tests
+│   ├── test_text_encoder.py       # Text encoder tests
+│   └── visualize_vae_diff.py      # VAE visual comparison
+├── test_outputs/                  # Test output images (auto-created)
 └── compiled_models/               # Output directory for compiled models
     ├── vae_encoder/
     ├── vae_decoder/
@@ -303,6 +331,85 @@ Process group already initialized with different world_size
 3420 is not divisible by 8
 ```
 **Solution**: Vision encoder uses single device (dimensions not compatible with TP=8).
+
+## Unit Tests (Debugging Blurry Output)
+
+如果推理输出的图片模糊，可以使用单元测试来定位问题。测试脚本会对比 Neuron 和 CPU 的推理结果差异。
+
+### 测试文件结构
+
+```
+tests/
+├── run_all_tests.py        # 运行所有测试
+├── test_vae.py             # VAE encoder/decoder 测试
+├── test_transformer.py     # Transformer 测试
+├── test_text_encoder.py    # Text Encoder 测试
+└── visualize_vae_diff.py   # VAE 输出可视化比较
+```
+
+### 运行所有测试
+
+```bash
+python tests/run_all_tests.py --compiled_models_dir /opt/dlami/nvme/compiled_models
+```
+
+### 单独测试各组件
+
+```bash
+# VAE 测试（推荐首先运行，最可能导致模糊）
+python tests/test_vae.py --test all --save_images
+
+# Transformer 测试
+python tests/test_transformer.py --test single
+
+# Text Encoder 测试
+python tests/test_text_encoder.py --test all
+```
+
+### VAE 可视化比较（推荐用于调试模糊问题）
+
+```bash
+# 使用测试图像
+python tests/visualize_vae_diff.py
+
+# 使用自定义图像
+python tests/visualize_vae_diff.py --input_image your_image.png
+```
+
+输出文件保存在 `test_outputs/` 目录：
+- `vae_comparison.png` - 四格对比图（原图、CPU解码、Neuron解码、差异图）
+- `vae_cpu_decoded.png` - CPU 解码结果
+- `vae_neuron_decoded.png` - Neuron 解码结果
+- `vae_diff_20x.png` - 差异放大 20 倍
+
+### 测试指标说明
+
+| 指标 | 含义 | 正常范围 |
+|------|------|----------|
+| Cosine Similarity | 余弦相似度 | > 0.99 正常，< 0.95 有问题 |
+| Max Absolute Error | 最大绝对误差 | < 0.1 正常 |
+| Mean Absolute Error | 平均绝对误差 | < 0.01 正常 |
+
+### 调试建议
+
+如果图片模糊，按以下顺序排查：
+
+1. **VAE Decoder**（最可能）
+   - 运行 `visualize_vae_diff.py` 查看差异图
+   - 检查 Cosine Similarity 是否 < 0.99
+   - 常见问题：插值模式不兼容、数值精度损失
+
+2. **Transformer**
+   - 检查多个 timestep 的累积误差
+   - 常见问题：RoPE 编码、注意力实现
+
+3. **Text Encoder**
+   - Vision encoder 误差影响条件生成
+   - 常见问题：embedding 层、注意力层
+
+4. **数值精度**
+   - 检查 bfloat16/float32 转换
+   - 检查 latent_mean/latent_std 缩放
 
 ## Known Limitations
 

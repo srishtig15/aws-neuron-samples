@@ -1,7 +1,7 @@
 import torch
 from diffusers import QwenImageEditPlusPipeline
 
-CACHE_DIR = "qwen_image_edit_hf_cache_dir"
+CACHE_DIR = "/opt/dlami/nvme/qwen_image_edit_hf_cache_dir"
 MODEL_ID = "Qwen/Qwen-Image-Edit-2509"
 
 if __name__ == "__main__":
