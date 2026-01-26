@@ -181,6 +181,8 @@ class NeuronTransformerWrapper(torch.nn.Module):
 class NeuronVAEWrapper(torch.nn.Module):
     """
     Wrapper for VAE with compiled encoder and decoder on Trainium2.
+
+    Supports tiled processing for images larger than the compiled tile size.
     """
     def __init__(self, original_vae, compiled_encoder, compiled_decoder,
                  compiled_quant_conv=None, compiled_post_quant_conv=None,
@@ -219,58 +221,83 @@ class NeuronVAEWrapper(torch.nn.Module):
         # z_dim for shape calculations
         self.z_dim = original_vae.config.z_dim
 
-        # Expected input size for compiled model
+        # Expected input size for compiled model (tile size)
         self.expected_height = expected_height
         self.expected_width = expected_width
 
-    def encode(self, x, return_dict=True):
-        """Encode images to latents on Neuron."""
-        # Check and resize input if needed
-        # x shape: (batch, channels, temporal, height, width) or (batch, channels, height, width)
-        if len(x.shape) == 5:
-            # Video format: (batch, channels, temporal, height, width)
-            b, c, t, h, w = x.shape
-            if h != self.expected_height or w != self.expected_width:
-                # Resize: squeeze temporal, interpolate, unsqueeze back
-                # This works for t=1, for multiple frames we'd need to loop
-                if t == 1:
-                    x_squeezed = x.squeeze(2)  # (b, c, h, w)
-                    x_resized = torch.nn.functional.interpolate(
-                        x_squeezed, size=(self.expected_height, self.expected_width),
-                        mode='bilinear', align_corners=False
-                    )
-                    x = x_resized.unsqueeze(2)  # (b, c, 1, h', w')
-                else:
-                    # For multiple frames, process each frame
-                    frames = []
-                    for i in range(t):
-                        frame = x[:, :, i, :, :]  # (b, c, h, w)
-                        frame_resized = torch.nn.functional.interpolate(
-                            frame, size=(self.expected_height, self.expected_width),
-                            mode='bilinear', align_corners=False
-                        )
-                        frames.append(frame_resized)
-                    x = torch.stack(frames, dim=2)  # (b, c, t, h', w')
-        elif len(x.shape) == 4:
-            # Image format: (batch, channels, height, width)
-            b, c, h, w = x.shape
-            if h != self.expected_height or w != self.expected_width:
-                x = torch.nn.functional.interpolate(
-                    x, size=(self.expected_height, self.expected_width),
-                    mode='bilinear', align_corners=False
-                )
+        # Tiling parameters for larger images
+        self.tile_sample_min_height = expected_height
+        self.tile_sample_min_width = expected_width
+        # Overlap between tiles (for blending)
+        self.tile_overlap = 64  # pixels of overlap
+        self.tile_sample_stride_height = expected_height - self.tile_overlap
+        self.tile_sample_stride_width = expected_width - self.tile_overlap
+        # Spatial compression ratio (8x for this VAE)
+        self.spatial_compression_ratio = 8
 
-        # Convert to bfloat16 (compiled models expect bfloat16)
-        x = x.to(torch.bfloat16)
+    def _needs_tiling(self, h, w):
+        """Check if image needs tiled processing."""
+        return h > self.expected_height or w > self.expected_width
 
-        # Run encoder on Neuron
+    def _blend_v(self, a, b, blend_extent):
+        """Blend two tensors vertically."""
+        blend_extent = min(a.shape[-2], b.shape[-2], blend_extent)
+        for y in range(blend_extent):
+            b[:, :, :, y, :] = a[:, :, :, -blend_extent + y, :] * (1 - y / blend_extent) + b[:, :, :, y, :] * (y / blend_extent)
+        return b
+
+    def _blend_h(self, a, b, blend_extent):
+        """Blend two tensors horizontally."""
+        blend_extent = min(a.shape[-1], b.shape[-1], blend_extent)
+        for x in range(blend_extent):
+            b[:, :, :, :, x] = a[:, :, :, :, -blend_extent + x] * (1 - x / blend_extent) + b[:, :, :, :, x] * (x / blend_extent)
+        return b
+
+    def _encode_tile(self, x):
+        """Encode a single tile through compiled encoder."""
         h = self.compiled_encoder(x)
-
-        # Apply quant_conv if compiled
         if self.compiled_quant_conv is not None:
             moments = self.compiled_quant_conv(h)
         else:
             moments = h
+        return moments
+
+    def _decode_tile(self, z):
+        """Decode a single tile through compiled decoder."""
+        if self.compiled_post_quant_conv is not None:
+            z = self.compiled_post_quant_conv(z)
+        return self.compiled_decoder(z)
+
+    def encode(self, x, return_dict=True):
+        """Encode images to latents on Neuron. Supports tiled encoding for large images."""
+        # Ensure 5D format: (batch, channels, temporal, height, width)
+        if len(x.shape) == 4:
+            x = x.unsqueeze(2)  # Add temporal dimension
+
+        b, c, t, h, w = x.shape
+
+        # Convert to bfloat16 (compiled models expect bfloat16)
+        x = x.to(torch.bfloat16)
+
+        # Check if tiling is needed
+        if self._needs_tiling(h, w):
+            print(f"  Using tiled encoding: {h}x{w} -> tiles of {self.expected_height}x{self.expected_width}")
+            moments = self._tiled_encode(x)
+        else:
+            # Pad to expected size if smaller
+            if h != self.expected_height or w != self.expected_width:
+                # Pad with zeros
+                pad_h = self.expected_height - h
+                pad_w = self.expected_width - w
+                x = torch.nn.functional.pad(x, (0, pad_w, 0, pad_h))
+
+            moments = self._encode_tile(x)
+
+            # Remove padding from latents if we padded
+            if h != self.expected_height or w != self.expected_width:
+                latent_h = h // self.spatial_compression_ratio
+                latent_w = w // self.spatial_compression_ratio
+                moments = moments[:, :, :, :latent_h, :latent_w]
 
         # Split into mean and logvar
         mean, logvar = moments.chunk(2, dim=1)
@@ -279,12 +306,7 @@ class NeuronVAEWrapper(torch.nn.Module):
         std = torch.exp(0.5 * logvar)
         sample = mean + std * torch.randn_like(std)
 
-        # NOTE: Do NOT scale latents here!
-        # The pipeline's _encode_vae_image will apply scaling with latents_mean/std
-        # If we scale here, it will be applied twice and produce wrong results
-
         if return_dict:
-            # Create a proper class for latent distribution
             class LatentDist:
                 def __init__(self, sample_val, mean_val):
                     self._sample = sample_val
@@ -304,35 +326,172 @@ class NeuronVAEWrapper(torch.nn.Module):
             return EncoderOutput(LatentDist(sample, mean))
         return sample
 
-    def decode(self, z, return_dict=True):
-        """Decode latents to images on Neuron (or CPU if cpu_decode=True)."""
-        # NOTE: Do NOT unscale latents here!
-        # The pipeline already unscales latents before calling decode (lines 865-873 in pipeline)
+    def _tiled_encode(self, x):
+        """Encode large image using tiled processing."""
+        b, c, t, h, w = x.shape
 
-        # Convert to bfloat16 (compiled models expect bfloat16)
+        # Latent dimensions
+        latent_h = h // self.spatial_compression_ratio
+        latent_w = w // self.spatial_compression_ratio
+        tile_latent_h = self.expected_height // self.spatial_compression_ratio
+        tile_latent_w = self.expected_width // self.spatial_compression_ratio
+        tile_latent_stride_h = self.tile_sample_stride_height // self.spatial_compression_ratio
+        tile_latent_stride_w = self.tile_sample_stride_width // self.spatial_compression_ratio
+
+        blend_h = tile_latent_h - tile_latent_stride_h
+        blend_w = tile_latent_w - tile_latent_stride_w
+
+        # Process tiles
+        rows = []
+        for i in range(0, h, self.tile_sample_stride_height):
+            row = []
+            for j in range(0, w, self.tile_sample_stride_width):
+                # Extract tile (with padding if at edge)
+                tile_h_end = min(i + self.tile_sample_min_height, h)
+                tile_w_end = min(j + self.tile_sample_min_width, w)
+                tile = x[:, :, :, i:tile_h_end, j:tile_w_end]
+
+                # Pad tile to expected size if needed
+                actual_h, actual_w = tile.shape[3], tile.shape[4]
+                if actual_h < self.expected_height or actual_w < self.expected_width:
+                    pad_h = self.expected_height - actual_h
+                    pad_w = self.expected_width - actual_w
+                    tile = torch.nn.functional.pad(tile, (0, pad_w, 0, pad_h))
+
+                # Encode tile
+                encoded_tile = self._encode_tile(tile)
+
+                # Crop encoded tile if we padded
+                if actual_h < self.expected_height or actual_w < self.expected_width:
+                    crop_h = actual_h // self.spatial_compression_ratio
+                    crop_w = actual_w // self.spatial_compression_ratio
+                    encoded_tile = encoded_tile[:, :, :, :crop_h, :crop_w]
+
+                row.append(encoded_tile)
+            rows.append(row)
+
+        # Blend tiles together
+        result_rows = []
+        for i, row in enumerate(rows):
+            result_row = []
+            for j, tile in enumerate(row):
+                if i > 0:
+                    tile = self._blend_v(rows[i - 1][j], tile, blend_h)
+                if j > 0:
+                    tile = self._blend_h(row[j - 1], tile, blend_w)
+                result_row.append(tile[:, :, :, :tile_latent_stride_h, :tile_latent_stride_w])
+            result_rows.append(torch.cat(result_row, dim=-1))
+
+        return torch.cat(result_rows, dim=3)[:, :, :, :latent_h, :latent_w]
+
+    def decode(self, z, return_dict=True):
+        """Decode latents to images on Neuron. Supports tiled decoding for large latents."""
+        # NOTE: Do NOT unscale latents here!
+        # The pipeline already unscales latents before calling decode
+
+        # Ensure 5D format
+        if len(z.shape) == 4:
+            z = z.unsqueeze(2)
+
+        b, c, t, latent_h, latent_w = z.shape
+
+        # Convert to bfloat16
         z = z.to(torch.bfloat16)
+
+        # Calculate output image size
+        output_h = latent_h * self.spatial_compression_ratio
+        output_w = latent_w * self.spatial_compression_ratio
 
         if self.cpu_decode:
             # CPU decode mode for debugging
-            # Convert to float32 for CPU operations (CPU models may have float32 weights)
             z_cpu = z.to(torch.float32)
             with torch.no_grad():
                 z_cpu = self.cpu_post_quant_conv(z_cpu)
                 dec = self.cpu_decoder(z_cpu)
-            # Convert back to bfloat16 for consistency
             dec = dec.to(torch.bfloat16)
+        elif self._needs_tiling(output_h, output_w):
+            print(f"  Using tiled decoding: latent {latent_h}x{latent_w} -> image {output_h}x{output_w}")
+            dec = self._tiled_decode(z)
         else:
-            # Apply post_quant_conv if compiled
-            if self.compiled_post_quant_conv is not None:
-                z = self.compiled_post_quant_conv(z)
+            # Check if latent needs padding to match compiled size
+            expected_latent_h = self.expected_height // self.spatial_compression_ratio
+            expected_latent_w = self.expected_width // self.spatial_compression_ratio
 
-            # Run decoder on Neuron
-            dec = self.compiled_decoder(z)
+            if latent_h != expected_latent_h or latent_w != expected_latent_w:
+                # Pad latents
+                pad_h = expected_latent_h - latent_h
+                pad_w = expected_latent_w - latent_w
+                z = torch.nn.functional.pad(z, (0, pad_w, 0, pad_h))
+
+            dec = self._decode_tile(z)
+
+            # Crop output if we padded
+            if latent_h != expected_latent_h or latent_w != expected_latent_w:
+                dec = dec[:, :, :, :output_h, :output_w]
 
         if return_dict:
             from diffusers.models.autoencoders.vae import DecoderOutput
             return DecoderOutput(sample=dec)
         return (dec,)
+
+    def _tiled_decode(self, z):
+        """Decode large latents using tiled processing."""
+        b, c, t, latent_h, latent_w = z.shape
+
+        # Calculate dimensions
+        output_h = latent_h * self.spatial_compression_ratio
+        output_w = latent_w * self.spatial_compression_ratio
+
+        tile_latent_h = self.expected_height // self.spatial_compression_ratio
+        tile_latent_w = self.expected_width // self.spatial_compression_ratio
+        tile_latent_stride_h = self.tile_sample_stride_height // self.spatial_compression_ratio
+        tile_latent_stride_w = self.tile_sample_stride_width // self.spatial_compression_ratio
+
+        blend_h = self.tile_sample_min_height - self.tile_sample_stride_height
+        blend_w = self.tile_sample_min_width - self.tile_sample_stride_width
+
+        # Process tiles
+        rows = []
+        for i in range(0, latent_h, tile_latent_stride_h):
+            row = []
+            for j in range(0, latent_w, tile_latent_stride_w):
+                # Extract latent tile (with padding if at edge)
+                tile_h_end = min(i + tile_latent_h, latent_h)
+                tile_w_end = min(j + tile_latent_w, latent_w)
+                tile = z[:, :, :, i:tile_h_end, j:tile_w_end]
+
+                # Pad tile to expected size if needed
+                actual_h, actual_w = tile.shape[3], tile.shape[4]
+                if actual_h < tile_latent_h or actual_w < tile_latent_w:
+                    pad_h = tile_latent_h - actual_h
+                    pad_w = tile_latent_w - actual_w
+                    tile = torch.nn.functional.pad(tile, (0, pad_w, 0, pad_h))
+
+                # Decode tile
+                decoded_tile = self._decode_tile(tile)
+
+                # Crop decoded tile if we padded
+                if actual_h < tile_latent_h or actual_w < tile_latent_w:
+                    crop_h = actual_h * self.spatial_compression_ratio
+                    crop_w = actual_w * self.spatial_compression_ratio
+                    decoded_tile = decoded_tile[:, :, :, :crop_h, :crop_w]
+
+                row.append(decoded_tile)
+            rows.append(row)
+
+        # Blend tiles together
+        result_rows = []
+        for i, row in enumerate(rows):
+            result_row = []
+            for j, tile in enumerate(row):
+                if i > 0:
+                    tile = self._blend_v(rows[i - 1][j], tile, blend_h)
+                if j > 0:
+                    tile = self._blend_h(row[j - 1], tile, blend_w)
+                result_row.append(tile[:, :, :, :self.tile_sample_stride_height, :self.tile_sample_stride_width])
+            result_rows.append(torch.cat(result_row, dim=-1))
+
+        return torch.cat(result_rows, dim=3)[:, :, :, :output_h, :output_w]
 
 
 def load_all_compiled_models(compiled_models_dir: str, pipe, args):
@@ -593,14 +752,16 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
 
     # Create VAE Wrapper
     cpu_decode = getattr(args, 'cpu_vae_decode', False)
+    # Use vae_tile_size for the compiled model's expected input size
+    vae_tile_size = getattr(args, 'vae_tile_size', 512)
     pipe.vae = NeuronVAEWrapper(
         original_vae=neuron_vae,
         compiled_encoder=compiled_encoder,
         compiled_decoder=compiled_decoder,
         compiled_quant_conv=compiled_quant_conv,
         compiled_post_quant_conv=compiled_post_quant_conv,
-        expected_height=args.height,
-        expected_width=args.width,
+        expected_height=vae_tile_size,
+        expected_width=vae_tile_size,
         cpu_decode=cpu_decode
     )
     # Delete the neuron_vae (original VAE copy) - small but still free it
@@ -621,15 +782,17 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     print("  - Transformer: Neuron (TP=8)")
     print(f"  - Language Model: {language_mode}")
     print(f"  - Vision Encoder: Neuron ({vision_mode})")
-    print("  - VAE: Neuron (single device)")
+    print(f"  - VAE: Neuron (tile size={vae_tile_size}x{vae_tile_size})")
+    print("")
+    print("Tiled VAE note:")
+    print(f"  - VAE compiled for {vae_tile_size}x{vae_tile_size} tiles")
+    print("  - Larger images will be processed in tiles automatically")
+    print("  - Example: 1024x1024 -> 4 tiles of 512x512 (with overlap)")
     print("")
     if use_cpu_language_model:
         print("Memory note:")
         print("  - Language Model on CPU (~8GB CPU memory)")
         print("  - Other components on Neuron")
-    else:
-        print("Memory optimization:")
-        print("  - Original models deleted after wrapping (freed ~56GB CPU)")
 
     return pipe
 
@@ -797,8 +960,8 @@ if __name__ == "__main__":
                              "Requires compiled model with correct TP degree (usually TP=4).")
 
     # Inference settings
-    parser.add_argument("--num_inference_steps", type=int, default=50,
-                        help="Number of denoising steps (default: 50)")
+    parser.add_argument("--num_inference_steps", type=int, default=40,
+                        help="Number of denoising steps (default: 40)")
     parser.add_argument("--guidance_scale", type=float, default=7.5,
                         help="Classifier-free guidance scale (default: 7.5)")
     parser.add_argument("--seed", type=int, default=SEED,
@@ -807,6 +970,9 @@ if __name__ == "__main__":
     # Model settings
     parser.add_argument("--compiled_models_dir", type=str, default=COMPILED_MODELS_DIR,
                         help="Directory containing compiled models")
+    parser.add_argument("--vae_tile_size", type=int, default=512,
+                        help="VAE tile size (must match compiled VAE size). "
+                             "For larger images, tiled VAE will process in this tile size.")
 
     # Other options
     parser.add_argument("--warmup", action="store_true",

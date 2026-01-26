@@ -189,9 +189,9 @@ def compile_vae(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--height", type=int, default=512,
-                        help="Height of generated image")
+                        help="Height of generated image (compile tile size)")
     parser.add_argument("--width", type=int, default=512,
-                        help="Width of generated image")
+                        help="Width of generated image (compile tile size)")
     parser.add_argument("--temporal_frames", type=int, default=1,
                         help="Number of temporal frames (1 for single image)")
     parser.add_argument("--compiler_workdir", type=str, default="compiler_workdir",
@@ -199,5 +199,15 @@ if __name__ == "__main__":
     parser.add_argument("--compiled_models_dir", type=str, default="compiled_models",
                         help="Directory for compiled models")
     args = parser.parse_args()
+
+    print("=" * 60)
+    print("VAE Compilation for Neuron")
+    print("=" * 60)
+    print(f"Compile tile size: {args.height}x{args.width}")
+    print("")
+    print("NOTE: For inference at larger resolutions (e.g., 1024x1024),")
+    print("      tiled VAE processing will be used automatically.")
+    print("      The VAE is compiled at this tile size for memory efficiency.")
+    print("")
 
     compile_vae(args)
