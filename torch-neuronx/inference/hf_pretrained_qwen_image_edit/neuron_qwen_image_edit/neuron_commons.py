@@ -175,7 +175,19 @@ class NeuronTextEncoderWrapper(nn.Module):
         else:
             inputs_embeds = text_embeds
 
-        # Step 4 & 5: Run language model (CPU or compiled)
+        # Step 4: Calculate 3D position_ids for M-RoPE (required by Qwen2.5-VL)
+        # For text-only input (no images), position_ids are simple cumulative positions
+        # Shape: [3, batch_size, seq_len] - same values for all 3 dimensions (t, h, w)
+        if attention_mask is not None:
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+        else:
+            seq_len = inputs_embeds.shape[1]
+            position_ids = torch.arange(seq_len, device=inputs_embeds.device)
+            position_ids = position_ids.view(1, 1, -1).expand(3, batch_size, -1)
+
+        # Step 5: Run language model (CPU or compiled)
         if self.use_cpu_language_model:
             # CPU Language Model mode - no padding needed, handles dynamic sequence lengths
             # This avoids GQA alignment issues that occur with TP != 4
@@ -183,6 +195,7 @@ class NeuronTextEncoderWrapper(nn.Module):
                 cpu_outputs = self.cpu_language_model(
                     inputs_embeds=inputs_embeds.to(torch.bfloat16),
                     attention_mask=attention_mask,
+                    position_ids=position_ids,  # Pass 3D position_ids for M-RoPE
                     output_hidden_states=True,
                     return_dict=True
                 )

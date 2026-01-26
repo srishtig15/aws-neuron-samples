@@ -470,6 +470,85 @@ def test_cpu_language_model_mode(args):
     print(f"  attention_mask shape: {text_inputs.attention_mask.shape}")
     print(f"  Non-padding tokens: {text_inputs.attention_mask.sum().item()}")
 
+    # ============================================
+    # DEBUG: Step-by-step comparison
+    # ============================================
+    print("\n" + "-"*40)
+    print("DEBUG: Step-by-step comparison")
+    print("-"*40)
+
+    # Step 1: Compare embed_tokens
+    print("\n[Step 1] Comparing embed_tokens...")
+    orig_embed = pipe.text_encoder.model.language_model.embed_tokens
+    wrapper_embed = neuron_text_encoder.embed_tokens
+
+    with torch.no_grad():
+        orig_embeds = orig_embed(text_inputs.input_ids)
+        wrapper_embeds = wrapper_embed(text_inputs.input_ids)
+
+    embed_diff = (orig_embeds.float() - wrapper_embeds.float()).abs()
+    print(f"  Original embed shape: {orig_embeds.shape}, dtype: {orig_embeds.dtype}")
+    print(f"  Wrapper embed shape: {wrapper_embeds.shape}, dtype: {wrapper_embeds.dtype}")
+    print(f"  Max difference: {embed_diff.max().item():.6e}")
+    print(f"  Mean difference: {embed_diff.mean().item():.6e}")
+
+    embed_cosine = F.cosine_similarity(
+        orig_embeds.flatten().unsqueeze(0).float(),
+        wrapper_embeds.flatten().unsqueeze(0).float()
+    ).item()
+    print(f"  Cosine similarity: {embed_cosine:.6f}")
+
+    # Step 2: Direct language model comparison (same inputs)
+    print("\n[Step 2] Direct Language Model comparison (same input embeds)...")
+    with torch.no_grad():
+        # Use original embeddings for both
+        direct_cpu_output = cpu_language_model(
+            inputs_embeds=orig_embeds,
+            attention_mask=text_inputs.attention_mask,
+            output_hidden_states=True,
+            return_dict=True
+        ).last_hidden_state
+
+    direct_cosine = F.cosine_similarity(
+        direct_cpu_output.flatten().unsqueeze(0).float(),
+        direct_cpu_output.flatten().unsqueeze(0).float()
+    ).item()
+    print(f"  Self-comparison cosine (sanity check): {direct_cosine:.6f}")
+
+    # Step 3: Compare wrapper's LM call vs direct LM call
+    print("\n[Step 3] Wrapper flow vs direct flow...")
+    with torch.no_grad():
+        # What the wrapper does internally
+        wrapper_embeds_bf16 = wrapper_embeds.to(torch.bfloat16)
+        wrapper_lm_output = cpu_language_model(
+            inputs_embeds=wrapper_embeds_bf16,
+            attention_mask=text_inputs.attention_mask,
+            output_hidden_states=True,
+            return_dict=True
+        ).last_hidden_state
+
+        # Direct with original embeds
+        orig_embeds_bf16 = orig_embeds.to(torch.bfloat16)
+        direct_lm_output = cpu_language_model(
+            inputs_embeds=orig_embeds_bf16,
+            attention_mask=text_inputs.attention_mask,
+            output_hidden_states=True,
+            return_dict=True
+        ).last_hidden_state
+
+    lm_cosine = F.cosine_similarity(
+        wrapper_lm_output.flatten().unsqueeze(0).float(),
+        direct_lm_output.flatten().unsqueeze(0).float()
+    ).item()
+    print(f"  Wrapper embeds -> LM vs Orig embeds -> LM cosine: {lm_cosine:.6f}")
+
+    # ============================================
+    # Original test flow
+    # ============================================
+    print("\n" + "-"*40)
+    print("Full pipeline comparison")
+    print("-"*40)
+
     # Run original CPU text encoder
     print("\nRunning original CPU text encoder...")
     with torch.no_grad():
@@ -495,6 +574,14 @@ def test_cpu_language_model_mode(args):
         )
     neuron_hidden = neuron_output.hidden_states[-1]
     print(f"  Neuron wrapper output shape: {neuron_hidden.shape}")
+
+    # Also compare with direct LM output
+    print("\n[Extra] Comparing direct LM output vs original text encoder...")
+    direct_vs_orig = F.cosine_similarity(
+        direct_lm_output.flatten().unsqueeze(0).float(),
+        cpu_hidden.flatten().unsqueeze(0).float()
+    ).item()
+    print(f"  Direct LM output vs Original text encoder: {direct_vs_orig:.6f}")
 
     # Compare outputs
     metrics = compute_metrics(cpu_hidden, neuron_hidden, "CPU LM Mode (Text Only)")
