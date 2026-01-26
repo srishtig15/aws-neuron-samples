@@ -386,6 +386,8 @@ def test_text_encoder_full(args):
 
     # Compare language model outputs
     lang_model = pipe.text_encoder.model.language_model
+    lang_model.eval()
+    upcast_norms_to_f32(lang_model)  # Must match compilation settings!
     with torch.no_grad():
         cpu_lang_output = lang_model(
             inputs_embeds=text_embeds.to(dtype),
@@ -395,6 +397,107 @@ def test_text_encoder_full(args):
         ).last_hidden_state
 
     metrics = compute_metrics(cpu_lang_output, neuron_lang_output, "Language Model (Text Only)")
+
+    return metrics
+
+
+def test_cpu_language_model_mode(args):
+    """Test CPU Language Model mode (what actual inference uses).
+
+    This tests the NeuronTextEncoderWrapper with:
+    - Compiled Vision Encoder (Neuron)
+    - CPU Language Model (NOT compiled)
+
+    This is the actual configuration used in run_qwen_image_edit.py.
+    """
+    print("\n" + "="*60)
+    print("Testing CPU Language Model Mode (Actual Inference Config)")
+    print("="*60)
+
+    dtype = torch.bfloat16
+
+    # Load original pipeline
+    print("\nLoading original pipeline...")
+    pipe = QwenImageEditPlusPipeline.from_pretrained(
+        MODEL_ID,
+        torch_dtype=dtype,
+        cache_dir=CACHE_DIR,
+        local_files_only=True,
+    )
+
+    # Check if compiled vision encoder exists
+    vision_path = f"{args.compiled_models_dir}/vision_encoder/model.pt"
+    if not os.path.exists(vision_path):
+        print(f"\nERROR: Vision encoder not found at {vision_path}")
+        return None
+
+    # Load compiled vision encoder
+    print(f"\nLoading compiled vision encoder from {vision_path}...")
+    compiled_vision_encoder = torch.jit.load(vision_path)
+
+    # Get CPU language model (this is what actual inference uses)
+    cpu_language_model = pipe.text_encoder.model.language_model
+    cpu_language_model.eval()
+
+    # Import and create NeuronTextEncoderWrapper
+    from neuron_qwen_image_edit.neuron_commons import NeuronTextEncoderWrapper
+
+    # Create wrapper with CPU language model (same as run_qwen_image_edit.py)
+    print("Creating NeuronTextEncoderWrapper with CPU Language Model...")
+    neuron_text_encoder = NeuronTextEncoderWrapper(
+        original_text_encoder=pipe.text_encoder,
+        compiled_vision_encoder=compiled_vision_encoder,
+        compiled_language_model=None,  # Not using compiled LM
+        cpu_language_model=cpu_language_model,
+        image_size=args.image_size,
+        max_seq_len=args.max_sequence_length
+    )
+
+    # Create test prompt
+    prompt = "A beautiful sunset over the ocean"
+    print(f"\nTest prompt: '{prompt}'")
+
+    # Get inputs from tokenizer
+    text_inputs = pipe.tokenizer(
+        prompt,
+        padding="max_length",
+        max_length=args.max_sequence_length,
+        truncation=True,
+        return_tensors="pt"
+    )
+
+    print(f"  input_ids shape: {text_inputs.input_ids.shape}")
+    print(f"  attention_mask shape: {text_inputs.attention_mask.shape}")
+    print(f"  Non-padding tokens: {text_inputs.attention_mask.sum().item()}")
+
+    # Run original CPU text encoder
+    print("\nRunning original CPU text encoder...")
+    with torch.no_grad():
+        cpu_output = pipe.text_encoder(
+            input_ids=text_inputs.input_ids,
+            attention_mask=text_inputs.attention_mask,
+            pixel_values=None,  # No image for text-only test
+            output_hidden_states=True,
+            return_dict=True
+        )
+    cpu_hidden = cpu_output.hidden_states[-1]
+    print(f"  CPU output shape: {cpu_hidden.shape}")
+
+    # Run NeuronTextEncoderWrapper (with CPU LM)
+    print("\nRunning NeuronTextEncoderWrapper (CPU LM mode)...")
+    with torch.no_grad():
+        neuron_output = neuron_text_encoder(
+            input_ids=text_inputs.input_ids,
+            attention_mask=text_inputs.attention_mask,
+            pixel_values=None,  # No image for text-only test
+            output_hidden_states=True,
+            return_dict=True
+        )
+    neuron_hidden = neuron_output.hidden_states[-1]
+    print(f"  Neuron wrapper output shape: {neuron_hidden.shape}")
+
+    # Compare outputs
+    metrics = compute_metrics(cpu_hidden, neuron_hidden, "CPU LM Mode (Text Only)")
 
     return metrics
 
@@ -447,8 +550,8 @@ def main():
                         default=COMPILED_MODELS_DIR,
                         help="Directory containing compiled models")
     parser.add_argument("--test", type=str, default="all",
-                        choices=["vision", "language", "full", "embedding", "all"],
-                        help="Which test to run")
+                        choices=["vision", "language", "full", "embedding", "cpu_lm", "all"],
+                        help="Which test to run (cpu_lm tests actual inference config)")
     args = parser.parse_args()
 
     print("="*60)
@@ -468,6 +571,9 @@ def main():
 
     if args.test in ["full", "all"]:
         results["full"] = test_text_encoder_full(args)
+
+    if args.test in ["cpu_lm", "all"]:
+        results["cpu_lm"] = test_cpu_language_model_mode(args)
 
     if args.test in ["embedding", "all"]:
         results["embedding"] = test_embedding_values(args)
