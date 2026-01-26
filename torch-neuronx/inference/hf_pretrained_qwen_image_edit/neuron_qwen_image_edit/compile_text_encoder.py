@@ -404,12 +404,30 @@ def compile_language_model(args):
     Compile the Language Model component with tensor parallelism.
 
     The language model processes text tokens combined with vision embeddings.
-    Qwen2.5-VL has num_key_value_heads=4. With TP=8, KV heads are replicated.
+
+    IMPORTANT: Qwen2.5-VL has a specific GQA configuration:
+    - 28 Q heads, 4 KV heads -> each KV head shared by 7 Q heads
+    - For TP to work correctly, Q head boundaries must align with KV head groups
+    - TP=4 is the ONLY TP degree that aligns correctly (7 Q heads per rank = 1 KV group)
+    - TP=8 causes 3/7 ranks to have misaligned Q-KV mapping, producing wrong results
     """
     batch_size = 1
     sequence_length = args.max_sequence_length
     hidden_size = 3584  # Qwen2.5-VL hidden size
-    tp_degree = args.tp_degree  # Use configurable TP degree (default=8 for consistency with transformer)
+
+    # Use language-specific TP degree (default=4 for correct GQA alignment)
+    tp_degree = getattr(args, 'language_tp_degree', 4)
+
+    # Warn if using non-optimal TP degree
+    if tp_degree != 4:
+        print("=" * 60)
+        print("WARNING: TP degree for Language Model")
+        print("=" * 60)
+        print(f"  Requested TP degree: {tp_degree}")
+        print(f"  Qwen2.5-VL has 28 Q heads, 4 KV heads (GQA group size = 7)")
+        print(f"  TP=4 is the ONLY degree that aligns Q heads with KV groups!")
+        print(f"  Using TP={tp_degree} will cause incorrect attention computation.")
+        print("=" * 60)
 
     os.environ["LOCAL_WORLD_SIZE"] = str(tp_degree)
 
@@ -568,6 +586,7 @@ def run_in_subprocess(func_name, args, vision_tp=False):
         "--compiler_workdir", args.compiler_workdir,
         "--compiled_models_dir", args.compiled_models_dir,
         "--tp_degree", str(args.tp_degree),
+        "--language_tp_degree", str(getattr(args, 'language_tp_degree', 4)),
     ]
 
     if func_name == "vision":
@@ -606,7 +625,11 @@ if __name__ == "__main__":
     parser.add_argument("--use_subprocess", action="store_true",
                         help="Run each compilation in separate subprocess (avoids XLA conflicts)")
     parser.add_argument("--tp_degree", type=int, default=8,
-                        help="Tensor parallel degree (default=8 to match transformer)")
+                        help="Tensor parallel degree for vision encoder TP mode (default=8)")
+    parser.add_argument("--language_tp_degree", type=int, default=4,
+                        help="Tensor parallel degree for language model. "
+                             "IMPORTANT: Must be 4 for Qwen2.5-VL due to GQA alignment. "
+                             "Using other values will produce incorrect results.")
     args = parser.parse_args()
 
     if args.mode == "separate":
@@ -640,7 +663,7 @@ if __name__ == "__main__":
                     print("  Vision Encoder: TP={} (saved to vision_encoder_tp/)".format(args.tp_degree))
                 else:
                     print("  Vision Encoder: Single device (saved to vision_encoder/)")
-                print("  Language Model: TP={} (saved to language_model/)".format(args.tp_degree))
+                print("  Language Model: TP={} (saved to language_model/)".format(args.language_tp_degree))
         else:
             # Default: try sequential but warn about XLA issue
             print("\nNOTE: If language model compilation fails with 'Runtime is already initialized',")
@@ -667,6 +690,6 @@ if __name__ == "__main__":
                     print("  Vision Encoder: TP={} (saved to vision_encoder_tp/)".format(args.tp_degree))
                 else:
                     print("  Vision Encoder: Single device (saved to vision_encoder/)")
-                print("  Language Model: TP={} (saved to language_model/)".format(args.tp_degree))
+                print("  Language Model: TP={} (saved to language_model/)".format(args.language_tp_degree))
     else:
         compile_text_encoder_full(args)

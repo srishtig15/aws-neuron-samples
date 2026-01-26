@@ -23,7 +23,13 @@ import os
 # CRITICAL: Set Neuron environment variables BEFORE any other imports!
 # These MUST match the compilation settings.
 # ============================================================================
-TP_DEGREE = 8  # Must match compile_transformer.py and compile_text_encoder.py
+# NOTE: Transformer uses TP=8. Language Model can run on:
+# - Neuron with TP=4 (correct GQA alignment, but requires separate process)
+# - CPU (slower but works in same process as TP=8 Transformer)
+#
+# GQA alignment issue: 28Q/4KV heads requires TP=4 for correct alignment,
+# but TP=4 causes OOM on Transformer. So we default to CPU Language Model.
+TP_DEGREE = 8  # For Transformer; Language Model runs on CPU by default
 
 # Set tensor parallel world size
 os.environ["LOCAL_WORLD_SIZE"] = str(TP_DEGREE)
@@ -178,7 +184,8 @@ class NeuronVAEWrapper(torch.nn.Module):
     """
     def __init__(self, original_vae, compiled_encoder, compiled_decoder,
                  compiled_quant_conv=None, compiled_post_quant_conv=None,
-                 expected_height=512, expected_width=512):
+                 expected_height=512, expected_width=512,
+                 cpu_decode=False):
         super().__init__()
         self.config = original_vae.config
         self.dtype = original_vae.dtype
@@ -188,6 +195,15 @@ class NeuronVAEWrapper(torch.nn.Module):
         self.compiled_decoder = compiled_decoder
         self.compiled_quant_conv = compiled_quant_conv
         self.compiled_post_quant_conv = compiled_post_quant_conv
+
+        # CPU decode mode for debugging
+        self.cpu_decode = cpu_decode
+        if cpu_decode:
+            print("  [DEBUG] VAE Decoder will run on CPU!")
+            # Keep CPU decoder and post_quant_conv
+            self.cpu_decoder = original_vae.decoder
+            self.cpu_post_quant_conv = original_vae.post_quant_conv
+            self.cpu_decoder.eval()
 
         # Scaling factors - convert to tensors for broadcasting
         # Shape: (1, z_dim, 1, 1, 1) for proper broadcasting with 5D latents (b, c, t, h, w)
@@ -289,19 +305,29 @@ class NeuronVAEWrapper(torch.nn.Module):
         return sample
 
     def decode(self, z, return_dict=True):
-        """Decode latents to images on Neuron."""
+        """Decode latents to images on Neuron (or CPU if cpu_decode=True)."""
         # NOTE: Do NOT unscale latents here!
         # The pipeline already unscales latents before calling decode (lines 865-873 in pipeline)
 
         # Convert to bfloat16 (compiled models expect bfloat16)
         z = z.to(torch.bfloat16)
 
-        # Apply post_quant_conv if compiled
-        if self.compiled_post_quant_conv is not None:
-            z = self.compiled_post_quant_conv(z)
+        if self.cpu_decode:
+            # CPU decode mode for debugging
+            # Convert to float32 for CPU operations (CPU models may have float32 weights)
+            z_cpu = z.to(torch.float32)
+            with torch.no_grad():
+                z_cpu = self.cpu_post_quant_conv(z_cpu)
+                dec = self.cpu_decoder(z_cpu)
+            # Convert back to bfloat16 for consistency
+            dec = dec.to(torch.bfloat16)
+        else:
+            # Apply post_quant_conv if compiled
+            if self.compiled_post_quant_conv is not None:
+                z = self.compiled_post_quant_conv(z)
 
-        # Run decoder on Neuron
-        dec = self.compiled_decoder(z)
+            # Run decoder on Neuron
+            dec = self.compiled_decoder(z)
 
         if return_dict:
             from diffusers.models.autoencoders.vae import DecoderOutput
@@ -341,12 +367,21 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     print("\n" + "=" * 60)
     print("Loading Compiled Models for Trainium2")
     print("=" * 60)
+    # Check if using CPU language model
+    # --neuron_language_model overrides --cpu_language_model
+    use_cpu_language_model = not getattr(args, 'neuron_language_model', False)
+    language_mode = "CPU" if use_cpu_language_model else "Neuron (compiled)"
+
     print("Parallel configuration:")
     print("  - VAE: Single device (avoid collective conflict)")
     print("  - Transformer: TP=8")
     print(f"  - Vision Encoder: {vision_mode}")
-    print("  - Language Model: TP=8 (KV head replication)")
-    print("\nNOTE: All TP models use TP=8 for consistent world_size")
+    print(f"  - Language Model: {language_mode}")
+    if use_cpu_language_model:
+        print("\nNOTE: Language Model on CPU due to GQA alignment issue with TP=8")
+        print("      (28 Q heads / 4 KV heads requires TP=4, which causes OOM on Transformer)")
+    else:
+        print("\nNOTE: All TP models use TP=8 for consistent world_size")
 
     # ========================================
     # 1. Load Transformer FIRST (TP=8)
@@ -441,19 +476,33 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
         compiled_vision_encoder = vision_encoder_jit
         print("  Vision encoder loaded (single device - input is patches, not batch)!")
 
-    # Load Language Model (TP=8 with KV head replication)
-    # Both Transformer and Language Model use TP=8 for consistent world_size
-    language_model_path = f"{compiled_models_dir}/language_model"
-    if not os.path.exists(language_model_path):
-        raise FileNotFoundError(
-            f"Language model not found at {language_model_path}\n"
-            "Please run: python neuron_qwen_image_edit/compile_text_encoder.py --language_only --tp_degree 8"
+    # Load Language Model
+    compiled_language_model = None
+    cpu_language_model = None
+
+    if use_cpu_language_model:
+        # CPU Language Model mode - keeps original model on CPU
+        # This avoids GQA alignment issues that occur with TP != 4
+        print("  Using CPU Language Model (avoids GQA alignment issue)...")
+        # Extract language model from text encoder BEFORE creating wrapper
+        cpu_language_model = pipe.text_encoder.model.language_model
+        cpu_language_model.eval()
+        # Keep it in bfloat16 for memory efficiency
+        cpu_language_model = cpu_language_model.to(torch.bfloat16)
+        print("  Language model prepared on CPU!")
+    else:
+        # Neuron compiled Language Model mode (TP=8 with KV head replication)
+        language_model_path = f"{compiled_models_dir}/language_model"
+        if not os.path.exists(language_model_path):
+            raise FileNotFoundError(
+                f"Language model not found at {language_model_path}\n"
+                "Please run: python neuron_qwen_image_edit/compile_text_encoder.py --language_only"
+            )
+        print(f"  Loading language model from {language_model_path}...")
+        compiled_language_model = neuronx_distributed.trace.parallel_model_load(
+            language_model_path
         )
-    print(f"  Loading language model from {language_model_path}...")
-    compiled_language_model = neuronx_distributed.trace.parallel_model_load(
-        language_model_path
-    )
-    print("  Language model loaded (TP=8 with KV head replication)!")
+        print("  Language model loaded (TP=8 with KV head replication)!")
 
     # Create Text Encoder Wrapper
     # Store reference to original, then delete after wrapper is created
@@ -462,14 +511,22 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
         original_text_encoder=original_text_encoder,
         compiled_vision_encoder=compiled_vision_encoder,
         compiled_language_model=compiled_language_model,
+        cpu_language_model=cpu_language_model,
         image_size=args.image_size,
         max_seq_len=args.max_sequence_length
     )
-    # Delete original text encoder to free ~16GB memory
-    del original_text_encoder
-    gc.collect()
-    print("  Text encoder wrapper created!")
-    print("  Original text encoder deleted to free memory.")
+
+    if use_cpu_language_model:
+        # When using CPU language model, we keep it - don't delete
+        # Only delete other parts of the original text encoder
+        print("  Text encoder wrapper created!")
+        print("  Language model kept on CPU, other components deleted.")
+    else:
+        # Delete original text encoder to free ~16GB memory
+        del original_text_encoder
+        gc.collect()
+        print("  Text encoder wrapper created!")
+        print("  Original text encoder deleted to free memory.")
 
     # ========================================
     # 3. Load VAE (Encoder + Decoder)
@@ -535,6 +592,7 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
         compiled_post_quant_conv = torch.jit.load(post_quant_conv_path)
 
     # Create VAE Wrapper
+    cpu_decode = getattr(args, 'cpu_vae_decode', False)
     pipe.vae = NeuronVAEWrapper(
         original_vae=neuron_vae,
         compiled_encoder=compiled_encoder,
@@ -542,9 +600,11 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
         compiled_quant_conv=compiled_quant_conv,
         compiled_post_quant_conv=compiled_post_quant_conv,
         expected_height=args.height,
-        expected_width=args.width
+        expected_width=args.width,
+        cpu_decode=cpu_decode
     )
     # Delete the neuron_vae (original VAE copy) - small but still free it
+    # Note: if cpu_decode=True, the decoder/post_quant_conv refs are already copied
     del neuron_vae
     gc.collect()
     print("  VAE wrapper created!")
@@ -554,17 +614,22 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     # Override the property with a lambda that returns CPU device
     type(pipe)._execution_device = property(lambda self: torch.device("cpu"))
 
-    # Use vision_mode defined at the top of the function
+    # Use vision_mode and language_mode defined at the top of the function
     print("\n" + "=" * 60)
-    print("All Models Loaded on Trainium2!")
+    print("All Models Loaded!")
     print("=" * 60)
     print("  - Transformer: Neuron (TP=8)")
-    print("  - Language Model: Neuron (TP=8)")
+    print(f"  - Language Model: {language_mode}")
     print(f"  - Vision Encoder: Neuron ({vision_mode})")
     print("  - VAE: Neuron (single device)")
     print("")
-    print("Memory optimization:")
-    print("  - Original models deleted after wrapping (freed ~56GB CPU)")
+    if use_cpu_language_model:
+        print("Memory note:")
+        print("  - Language Model on CPU (~8GB CPU memory)")
+        print("  - Other components on Neuron")
+    else:
+        print("Memory optimization:")
+        print("  - Original models deleted after wrapping (freed ~56GB CPU)")
 
     return pipe
 
@@ -723,6 +788,14 @@ if __name__ == "__main__":
                         help="Use TP-compiled vision encoder (from vision_encoder_tp/). "
                              "Default is to auto-detect based on available compiled models.")
 
+    # Language model mode
+    parser.add_argument("--cpu_language_model", action="store_true", default=True,
+                        help="Run Language Model on CPU (default). "
+                             "This avoids GQA alignment issues with TP=8.")
+    parser.add_argument("--neuron_language_model", action="store_true",
+                        help="Use Neuron-compiled Language Model instead of CPU. "
+                             "Requires compiled model with correct TP degree (usually TP=4).")
+
     # Inference settings
     parser.add_argument("--num_inference_steps", type=int, default=50,
                         help="Number of denoising steps (default: 50)")
@@ -740,6 +813,11 @@ if __name__ == "__main__":
                         help="Run warmup inference before main inference")
     parser.add_argument("--save_comparison", action="store_true",
                         help="Save side-by-side comparison image")
+
+    # Debug options
+    parser.add_argument("--cpu_vae_decode", action="store_true",
+                        help="[DEBUG] Run VAE decoder on CPU instead of Neuron. "
+                             "Use this to verify if other components are working correctly.")
 
     args = parser.parse_args()
 

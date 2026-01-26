@@ -312,6 +312,8 @@ def test_vae_roundtrip(args):
     # Check compiled models exist
     encoder_path = f"{args.compiled_models_dir}/vae_encoder/model.pt"
     decoder_path = f"{args.compiled_models_dir}/vae_decoder/model.pt"
+    quant_conv_path = f"{args.compiled_models_dir}/quant_conv/model.pt"
+    post_quant_conv_path = f"{args.compiled_models_dir}/post_quant_conv/model.pt"
 
     if not os.path.exists(encoder_path) or not os.path.exists(decoder_path):
         print(f"\nERROR: Compiled VAE models not found")
@@ -323,21 +325,58 @@ def test_vae_roundtrip(args):
     compiled_encoder = torch.jit.load(encoder_path)
     compiled_decoder = torch.jit.load(decoder_path)
 
+    # Load quant_conv and post_quant_conv if available
+    compiled_quant_conv = None
+    compiled_post_quant_conv = None
+    if os.path.exists(quant_conv_path):
+        print(f"  Loading quant_conv from {quant_conv_path}")
+        compiled_quant_conv = torch.jit.load(quant_conv_path)
+    else:
+        print(f"  WARNING: quant_conv not compiled, using CPU version")
+
+    if os.path.exists(post_quant_conv_path):
+        print(f"  Loading post_quant_conv from {post_quant_conv_path}")
+        compiled_post_quant_conv = torch.jit.load(post_quant_conv_path)
+    else:
+        print(f"  WARNING: post_quant_conv not compiled, using CPU version")
+
     # Neuron roundtrip
     print("Running Neuron roundtrip...")
     with torch.no_grad():
         neuron_encoded = compiled_encoder(test_input)
-        # Note: quant_conv might need to run on CPU if not compiled
-        neuron_quant = neuron_vae.quant_conv(neuron_encoded)
+
+        # Use compiled quant_conv if available
+        if compiled_quant_conv is not None:
+            neuron_quant = compiled_quant_conv(neuron_encoded)
+        else:
+            neuron_quant = neuron_vae.quant_conv(neuron_encoded)
+
         neuron_latent = neuron_quant[:, :16, :, :, :]
-        neuron_post_quant = neuron_vae.post_quant_conv(neuron_latent)
+
+        # Use compiled post_quant_conv if available
+        if compiled_post_quant_conv is not None:
+            neuron_post_quant = compiled_post_quant_conv(neuron_latent)
+        else:
+            neuron_post_quant = neuron_vae.post_quant_conv(neuron_latent)
+
         neuron_decoded = compiled_decoder(neuron_post_quant)
 
     # Compare intermediate results
     print("\n--- Intermediate Comparisons ---")
     compute_metrics(cpu_encoded, neuron_encoded, "Encoder Output")
-    compute_metrics(cpu_latent, neuron_latent, "Latent (after quant)")
+    compute_metrics(cpu_quant, neuron_quant, "After quant_conv (full 32 channels)")
+    compute_metrics(cpu_latent, neuron_latent, "Latent (first 16 channels)")
+    compute_metrics(cpu_post_quant, neuron_post_quant, "After post_quant_conv")
     metrics = compute_metrics(cpu_decoded, neuron_decoded, "Final Decoded Output")
+
+    # Additional test: Decoder with SAME input to isolate decoder error
+    print("\n--- Decoder Isolation Test (same input) ---")
+    with torch.no_grad():
+        # Use CPU post_quant output as input to both decoders
+        cpu_decoder_from_cpu_input = neuron_vae.decoder(cpu_post_quant)
+        neuron_decoder_from_cpu_input = compiled_decoder(cpu_post_quant)
+    compute_metrics(cpu_decoder_from_cpu_input, neuron_decoder_from_cpu_input,
+                    "Decoder (same CPU input)")
 
     # Save comparison images
     if args.save_images:

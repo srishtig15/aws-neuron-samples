@@ -36,15 +36,22 @@ def run_test(test_script, args):
     cmd = [
         sys.executable, test_script,
         "--compiled_models_dir", args.compiled_models_dir,
-        "--height", str(args.height),
-        "--width", str(args.width),
     ]
 
+    # VAE test supports --height and --width
+    if "test_vae" in test_script:
+        cmd.extend(["--height", str(args.height)])
+        cmd.extend(["--width", str(args.width)])
+
+    # Text encoder only supports --image_size and --max_sequence_length
     if "text_encoder" in test_script:
         cmd.extend(["--image_size", str(args.image_size)])
         cmd.extend(["--max_sequence_length", str(args.max_sequence_length)])
 
+    # Transformer supports multiple options
     if "transformer" in test_script:
+        cmd.extend(["--height", str(args.height)])
+        cmd.extend(["--width", str(args.width)])
         cmd.extend(["--max_sequence_length", str(args.max_sequence_length)])
         cmd.extend(["--batch_size", str(args.batch_size)])
         cmd.extend(["--patch_multiplier", str(args.patch_multiplier)])

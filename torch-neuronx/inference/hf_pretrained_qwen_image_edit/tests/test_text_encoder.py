@@ -25,8 +25,10 @@ import argparse
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Set Neuron environment BEFORE imports
-TP_DEGREE = 8
-os.environ["LOCAL_WORLD_SIZE"] = str(TP_DEGREE)
+# Note: Language Model uses TP=4 for correct GQA alignment
+# Vision Encoder uses single device or TP=8
+LANGUAGE_TP_DEGREE = 4  # Must match compile_text_encoder.py --language_tp_degree
+os.environ["LOCAL_WORLD_SIZE"] = str(LANGUAGE_TP_DEGREE)  # MUST be set before neuron imports
 os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "2"
 os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2"
 os.environ["NEURON_FUSE_SOFTMAX"] = "1"
@@ -273,6 +275,7 @@ def test_language_model(args):
 
     # Load Neuron compiled model
     print(f"\nLoading compiled language model from {language_model_path}...")
+    print(f"  Using TP degree: {LANGUAGE_TP_DEGREE}")
     import neuronx_distributed
     compiled_lang_model = neuronx_distributed.trace.parallel_model_load(language_model_path)
 

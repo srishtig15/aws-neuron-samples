@@ -331,6 +331,12 @@ def shard_qwen2_attention(tp_degree: int, self_attn):
         else:
             self_attn.num_key_value_heads = self_attn.num_key_value_heads // tp_degree
 
+    # CRITICAL: Update num_key_value_groups!
+    # This is used by repeat_kv() in attention forward to expand KV heads
+    if hasattr(self_attn, 'num_key_value_groups'):
+        self_attn.num_key_value_groups = self_attn.num_heads // self_attn.num_key_value_heads
+        print(f"  Updated num_key_value_groups: {self_attn.num_key_value_groups}")
+
     # Shard Q projection (with padding if needed)
     # Need to pad weights before sharding when num_heads is not divisible by tp_degree
     q_weight_padded = orig_q.weight.data

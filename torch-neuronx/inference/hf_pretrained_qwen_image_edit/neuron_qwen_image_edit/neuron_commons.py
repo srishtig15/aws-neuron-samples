@@ -46,11 +46,16 @@ class NeuronTextEncoderWrapper(nn.Module):
     This wrapper handles the embedding combination logic that normally
     happens inside the original text encoder.
 
+    Supports two modes for Language Model:
+    1. compiled_language_model: Neuron-compiled model (requires correct TP alignment)
+    2. cpu_language_model: Original model on CPU (slower but avoids GQA issues)
+
     IMPORTANT: This wrapper COPIES necessary components and does NOT keep
     references to the original model, to avoid memory bloat.
     """
     def __init__(self, original_text_encoder, compiled_vision_encoder=None,
-                 compiled_language_model=None, image_size=448, max_seq_len=512):
+                 compiled_language_model=None, cpu_language_model=None,
+                 image_size=448, max_seq_len=512):
         super().__init__()
         # Copy config (small object)
         self.config = original_text_encoder.config
@@ -82,6 +87,10 @@ class NeuronTextEncoderWrapper(nn.Module):
         self.compiled_vision_encoder = compiled_vision_encoder
         self.compiled_language_model = compiled_language_model
 
+        # CPU Language Model (alternative to compiled, avoids GQA alignment issues)
+        self.cpu_language_model = cpu_language_model
+        self.use_cpu_language_model = cpu_language_model is not None
+
         # DO NOT keep original_text_encoder - it's 16+ GB!
         # self.original_text_encoder = original_text_encoder  # REMOVED!
 
@@ -109,66 +118,86 @@ class NeuronTextEncoderWrapper(nn.Module):
         """
         batch_size = input_ids.shape[0] if input_ids is not None else 1
 
-        # If we have compiled language model (with optional vision encoder)
-        if self.compiled_language_model is not None:
-            # Step 1: Process images through vision encoder
-            if pixel_values is not None:
-                # Ensure pixel_values is bfloat16 and correct shape
-                pixel_values = pixel_values.to(torch.bfloat16)
+        # Step 1: Process images through vision encoder
+        if pixel_values is not None:
+            # Ensure pixel_values is bfloat16 and correct shape
+            pixel_values = pixel_values.to(torch.bfloat16)
 
-                # Use compiled vision encoder or CPU fallback
-                if self.compiled_vision_encoder is not None:
-                    # Check if we need to pad/reshape to expected size
-                    expected_patches = (self.image_size // self.patch_size) ** 2  # 1024 for 448x448
-                    actual_patches = pixel_values.shape[0]
+            # Use compiled vision encoder or CPU fallback
+            if self.compiled_vision_encoder is not None:
+                # Check if we need to pad/reshape to expected size
+                expected_patches = (self.image_size // self.patch_size) ** 2  # 1024 for 448x448
+                actual_patches = pixel_values.shape[0]
 
-                    if actual_patches != expected_patches:
-                        # Pad or truncate to expected size
-                        if actual_patches < expected_patches:
-                            # Pad with zeros
-                            padding = torch.zeros(
-                                expected_patches - actual_patches,
-                                pixel_values.shape[1],
-                                dtype=pixel_values.dtype,
-                                device=pixel_values.device
-                            )
-                            pixel_values = torch.cat([pixel_values, padding], dim=0)
-                        else:
-                            # Truncate
-                            pixel_values = pixel_values[:expected_patches]
+                if actual_patches != expected_patches:
+                    # Pad or truncate to expected size
+                    if actual_patches < expected_patches:
+                        # Pad with zeros
+                        padding = torch.zeros(
+                            expected_patches - actual_patches,
+                            pixel_values.shape[1],
+                            dtype=pixel_values.dtype,
+                            device=pixel_values.device
+                        )
+                        pixel_values = torch.cat([pixel_values, padding], dim=0)
+                    else:
+                        # Truncate
+                        pixel_values = pixel_values[:expected_patches]
 
-                        # Update image_grid_thw to match
-                        grid_size = self.image_size // self.patch_size
-                        image_grid_thw = torch.tensor([[1, grid_size, grid_size]], dtype=torch.int64)
+                    # Update image_grid_thw to match
+                    grid_size = self.image_size // self.patch_size
+                    image_grid_thw = torch.tensor([[1, grid_size, grid_size]], dtype=torch.int64)
 
-                    image_embeds = self.compiled_vision_encoder(pixel_values, image_grid_thw)
-                    # Note: merger is already included in compiled_vision_encoder
-                else:
-                    # No vision encoder compiled - this should not happen in full Neuron mode
-                    raise RuntimeError(
-                        "Vision encoder not compiled! Please compile the vision encoder first:\n"
-                        "  python neuron_qwen_image_edit/compile_text_encoder.py --vision_only"
-                    )
+                image_embeds = self.compiled_vision_encoder(pixel_values, image_grid_thw)
+                # Note: merger is already included in compiled_vision_encoder
             else:
-                image_embeds = None
-
-            # Step 2: Get text embeddings
-            text_embeds = self.embed_tokens(input_ids)
-
-            # Step 3: Combine embeddings
-            # Find image token positions and replace with image embeddings
-            if image_embeds is not None:
-                # The image token ID in Qwen2.5-VL
-                image_token_id = self.config.image_token_id if hasattr(self.config, 'image_token_id') else 151655
-
-                # Create combined embeddings
-                inputs_embeds = self._merge_embeddings(
-                    text_embeds, image_embeds, input_ids, image_token_id
+                # No vision encoder compiled - this should not happen in full Neuron mode
+                raise RuntimeError(
+                    "Vision encoder not compiled! Please compile the vision encoder first:\n"
+                    "  python neuron_qwen_image_edit/compile_text_encoder.py --vision_only"
                 )
-            else:
-                inputs_embeds = text_embeds
+        else:
+            image_embeds = None
 
-            # Step 4: Pad inputs_embeds and attention_mask to max_seq_len
+        # Step 2: Get text embeddings
+        text_embeds = self.embed_tokens(input_ids)
+
+        # Step 3: Combine embeddings
+        # Find image token positions and replace with image embeddings
+        if image_embeds is not None:
+            # The image token ID in Qwen2.5-VL
+            image_token_id = self.config.image_token_id if hasattr(self.config, 'image_token_id') else 151655
+
+            # Create combined embeddings
+            inputs_embeds = self._merge_embeddings(
+                text_embeds, image_embeds, input_ids, image_token_id
+            )
+        else:
+            inputs_embeds = text_embeds
+
+        # Step 4 & 5: Run language model (CPU or compiled)
+        if self.use_cpu_language_model:
+            # CPU Language Model mode - no padding needed, handles dynamic sequence lengths
+            # This avoids GQA alignment issues that occur with TP != 4
+            with torch.no_grad():
+                cpu_outputs = self.cpu_language_model(
+                    inputs_embeds=inputs_embeds.to(torch.bfloat16),
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                    return_dict=True
+                )
+                hidden_states = cpu_outputs.last_hidden_state
+
+            # Create output similar to original
+            if return_dict:
+                return type('TextEncoderOutput', (), {
+                    'hidden_states': (hidden_states,),
+                    'last_hidden_state': hidden_states
+                })()
+            return hidden_states
+
+        elif self.compiled_language_model is not None:
+            # Neuron compiled Language Model mode - requires fixed sequence length
             original_seq_len = inputs_embeds.shape[1]
             hidden_size = inputs_embeds.shape[2]
 
@@ -198,10 +227,10 @@ class NeuronTextEncoderWrapper(nn.Module):
                     attention_mask = attention_mask[:, :self.max_seq_len]
                 original_seq_len = self.max_seq_len
 
-            # Step 5: Run language model
+            # Run compiled language model
             hidden_states = self.compiled_language_model(inputs_embeds, attention_mask)
 
-            # Step 6: Remove padding from output (restore original sequence length)
+            # Remove padding from output (restore original sequence length)
             hidden_states = hidden_states[:, :original_seq_len, :]
 
             # Create output similar to original
@@ -211,11 +240,13 @@ class NeuronTextEncoderWrapper(nn.Module):
                     'last_hidden_state': hidden_states
                 })()
             return hidden_states
+
         else:
-            # No compiled language model - this should not happen in full Neuron mode
+            # No language model available
             raise RuntimeError(
-                "Language model not compiled! Please compile the language model first:\n"
-                "  python neuron_qwen_image_edit/compile_text_encoder.py --language_only"
+                "No language model available! Please either:\n"
+                "1. Compile language model: python neuron_qwen_image_edit/compile_text_encoder.py --language_only\n"
+                "2. Use CPU language model by passing cpu_language_model to NeuronTextEncoderWrapper"
             )
 
     def _merge_embeddings(self, text_embeds, image_embeds, input_ids, image_token_id):
@@ -287,10 +318,15 @@ def neuron_scaled_dot_product_attention(query, key, value, attn_mask=None,
                                          dropout_p=None, is_causal=None, scale=None):
     """Custom scaled dot product attention optimized for Neuron.
 
-    Supports Grouped Query Attention (GQA) where num_kv_heads < num_q_heads.
+    Supports:
+    - Grouped Query Attention (GQA) where num_kv_heads < num_q_heads
+    - Causal masking when is_causal=True
+    - Explicit attention masks (attn_mask)
     """
     orig_shape = None
     orig_query_shape = query.shape
+    q_len = query.shape[-2]
+    kv_len = key.shape[-2]
 
     if len(query.shape) == 4:
         orig_shape = query.shape
@@ -312,13 +348,45 @@ def neuron_scaled_dot_product_attention(query, key, value, attn_mask=None,
     if scale is None:
         scale = 1 / math.sqrt(query.size(-1))
 
-    if query.size() == key.size():
-        attention_scores = torch.bmm(key, query.transpose(-1, -2)) * scale
-        attention_probs = attention_scores.softmax(dim=1).permute(0, 2, 1)
-    else:
-        attention_scores = torch.bmm(query, key.transpose(-1, -2)) * scale
-        attention_probs = attention_scores.softmax(dim=-1)
+    # Compute attention scores: [batch*heads, q_len, kv_len]
+    attention_scores = torch.bmm(query, key.transpose(-1, -2)) * scale
 
+    # Apply causal mask if requested
+    if is_causal:
+        # Create causal mask: positions above the main diagonal are masked (-inf)
+        # Shape: (q_len, kv_len)
+        # Use torch.where to avoid NaN from 0 * -inf
+        causal_mask = torch.triu(
+            torch.ones(q_len, kv_len, device=attention_scores.device),
+            diagonal=1
+        )
+        causal_mask = torch.where(
+            causal_mask == 1,
+            torch.tensor(float('-inf'), dtype=attention_scores.dtype, device=attention_scores.device),
+            torch.tensor(0.0, dtype=attention_scores.dtype, device=attention_scores.device)
+        )
+        attention_scores = attention_scores + causal_mask
+
+    # Apply explicit attention mask if provided
+    if attn_mask is not None:
+        # attn_mask can be:
+        # - 2D: (q_len, kv_len) - applied to all batches/heads
+        # - 3D: (batch*heads, q_len, kv_len) - per-head mask
+        # - 4D: (batch, heads, q_len, kv_len) - full mask
+        if attn_mask.dim() == 4:
+            # Reshape 4D mask to 3D
+            attn_mask = attn_mask.reshape(-1, attn_mask.shape[-2], attn_mask.shape[-1])
+        elif attn_mask.dim() == 2:
+            # Broadcast 2D mask
+            attn_mask = attn_mask.unsqueeze(0)
+
+        # Convert boolean mask to additive mask if needed
+        if attn_mask.dtype == torch.bool:
+            attn_mask = torch.where(attn_mask, 0.0, float('-inf'))
+
+        attention_scores = attention_scores + attn_mask.to(attention_scores.dtype)
+
+    attention_probs = attention_scores.softmax(dim=-1)
     attn_out = torch.bmm(attention_probs, value)
 
     if orig_shape:
@@ -367,18 +435,20 @@ sdpa_original = torch.nn.functional.scaled_dot_product_attention
 
 def attention_wrapper(query, key, value, attn_mask=None, dropout_p=None, is_causal=None,
                       scale=None, enable_gqa=False):
-    """Attention wrapper for text encoder (uses mask when provided)."""
-    if attn_mask is not None:
-        # Pass through to original SDPA which handles GQA
-        return sdpa_original(query, key, value, attn_mask=attn_mask,
-                            dropout_p=dropout_p, is_causal=is_causal, scale=scale,
-                            enable_gqa=enable_gqa)
-    else:
-        return neuron_scaled_dot_product_attention(query, key, value,
-                                                   attn_mask=attn_mask,
-                                                   dropout_p=dropout_p,
-                                                   is_causal=is_causal,
-                                                   scale=scale)
+    """Attention wrapper for text encoder.
+
+    Always uses our custom implementation for better Neuron tracing compatibility.
+    The custom implementation supports:
+    - Causal masking (is_causal=True)
+    - Explicit attention masks (attn_mask)
+    - GQA (handled by repeat_kv in model's forward, but we handle leftovers)
+    """
+    # Always use our custom implementation for Neuron compatibility
+    return neuron_scaled_dot_product_attention(query, key, value,
+                                               attn_mask=attn_mask,
+                                               dropout_p=dropout_p,
+                                               is_causal=is_causal,
+                                               scale=scale)
 
 
 def attention_wrapper_for_transformer(query, key, value, attn_mask=None,
