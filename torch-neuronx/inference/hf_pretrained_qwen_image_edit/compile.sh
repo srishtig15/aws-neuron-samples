@@ -22,9 +22,9 @@ VAE_TILE_SIZE=512
 # Parse arguments
 HEIGHT=${1:-1024}
 WIDTH=${2:-1024}
-IMAGE_SIZE=${3:-224}  # Vision encoder image size (must be divisible by 14 and result in even grid)
+IMAGE_SIZE=${3:-448}  # Vision encoder image size (must be divisible by 14 and result in even grid)
 TP_DEGREE=${4:-8}
-MAX_SEQ_LEN=${5:-512}
+MAX_SEQ_LEN=${5:-1024}
 PATCH_MULTIPLIER=${6:-3}  # 2 for single image editing, 3 for 2 images merging, 1 for generation
 
 echo "============================================"
@@ -112,4 +112,4 @@ echo ""
 # NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "..." --patch_multiplier 3 --warmup
 
 # 完整运行示例
-NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "根据这图1中女性和图2中的男性，生成一组结婚照，并遵循以下描述：新郎穿着红色的中式马褂，新娘穿着精致的秀禾服，头戴金色凤冠。他们并肩站立在古老的朱红色宫墙前，背景是雕花的木窗。光线明亮柔和，构图对称，氛围喜庆而隆重。" --patch_multiplier 3 --warmup --height 1024 --width 1024 --max_sequence_length 512
+NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "根据这图1中女性和图2中的男性，生成一组结婚照，并遵循以下描述：新郎穿着红色的中式马褂，新娘穿着精致的秀禾服，头戴金色凤冠。他们并肩站立在古老的朱红色宫墙前，背景是雕花的木窗。光线明亮柔和，构图对称，氛围喜庆而隆重。" --patch_multiplier 3 --warmup

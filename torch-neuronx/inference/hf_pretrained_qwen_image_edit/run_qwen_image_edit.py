@@ -1079,9 +1079,9 @@ if __name__ == "__main__":
                         help="Patch multiplier (2 for image editing, 1 for generation)")
 
     # Text encoder settings - MUST match compilation settings
-    parser.add_argument("--image_size", type=int, default=224,
+    parser.add_argument("--image_size", type=int, default=448,
                         help="Vision encoder image size (must match compiled model)")
-    parser.add_argument("--max_sequence_length", type=int, default=512,
+    parser.add_argument("--max_sequence_length", type=int, default=1024,
                         help="Max text sequence length (must match compiled model)")
     parser.add_argument("--vision_tp", action="store_true",
                         help="Use TP-compiled vision encoder (from vision_encoder_tp/). "
