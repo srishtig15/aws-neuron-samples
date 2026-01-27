@@ -70,28 +70,30 @@ class NKIFlashAttnQwenDoubleStreamProcessor:
         Input shape: (batch, seq, heads, head_dim)
         Output shape: (batch, seq, heads, head_dim)
 
-        With transpose_nki_inputs=True (default):
-        - Input: (batch, seq, heads, head_dim)
+        NKI Flash Attention with transpose_nki_inputs=False:
+        - Input: (batch, heads, seq, head_dim)
         - Output: (batch, seq, heads, head_dim)
         """
         batch, seq, heads, head_dim = query.shape
 
-        # Ensure contiguous tensors for NKI kernel
-        q = query.contiguous()
-        k = key.contiguous()
-        v = value.contiguous()
+        # Permute from (batch, seq, heads, head_dim) to (batch, heads, seq, head_dim)
+        q = query.permute(0, 2, 1, 3).contiguous()
+        k = key.permute(0, 2, 1, 3).contiguous()
+        v = value.permute(0, 2, 1, 3).contiguous()
 
-        # Apply NKI Flash Attention with transpose_nki_inputs=True
-        # This means input/output are both (batch, seq, heads, head_dim)
+        # Apply NKI Flash Attention
+        # Input: (batch, heads, seq, head_dim)
+        # Output: (batch, seq, heads, head_dim)
         out = self._nki_flash_attn(
             q, k, v,
             lnc=self.lnc,
             causal=False,  # Image attention is not causal
             mixed_precision=True,
             dropout_p=0.0,
-            transpose_nki_inputs=True,  # Input is (batch, seq, heads, head_dim)
+            transpose_nki_inputs=False,
         )
 
+        # Output is already (batch, seq, heads, head_dim)
         return out
 
     def _sdpa_attention(
