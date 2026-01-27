@@ -239,10 +239,8 @@ attn.to_q = ColumnParallelLinear(dtype=torch.bfloat16, in_features, out_features
 |----------|---------|-------------|
 | `--images` | Required | Input image path(s), 1-3 images |
 | `--prompt` | Required | Edit instruction |
-| `--height` | 512 | Output image height |
-| `--width` | 512 | Output image width |
-| `--compiled_height` | 512 | Height used during compilation |
-| `--compiled_width` | 512 | Width used during compilation |
+| `--height` | 1024 | Image height (must match compiled model) |
+| `--width` | 1024 | Image width (must match compiled model) |
 | `--num_inference_steps` | 50 | Denoising steps |
 | `--true_cfg_scale` | 4.0 | CFG scale (runs transformer twice per step) |
 | `--max_sequence_length` | 512 | Must match compilation |
@@ -254,7 +252,7 @@ attn.to_q = ColumnParallelLinear(dtype=torch.bfloat16, in_features, out_features
 ```
 ERROR: hidden_states has X patches but model expects Y
 ```
-**Solution**: Ensure `--compiled_height` and `--compiled_width` match the dimensions used during compilation. The runtime script automatically adjusts `VAE_IMAGE_SIZE` to match.
+**Solution**: Ensure `--height` and `--width` match the dimensions used during compilation. The runtime script automatically adjusts `VAE_IMAGE_SIZE` to match.
 
 ### OOM Error
 ```
