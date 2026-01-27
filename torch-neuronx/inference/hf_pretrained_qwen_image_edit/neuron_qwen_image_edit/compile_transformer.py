@@ -141,7 +141,7 @@ def compile_transformer(args):
 
     compiler_workdir = args.compiler_workdir
     compiled_models_dir = args.compiled_models_dir
-    batch_size = args.batch_size  # 2 for CFG, 1 for smaller compilation
+    batch_size = args.batch_size  # Always 1, CFG runs transformer twice sequentially
 
     print(f"Compiling transformer with:")
     print(f"  Image size: {args.height}x{args.width}")
@@ -198,7 +198,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_sequence_length", type=int, default=512,
                         help="Max sequence length for text encoder")
     parser.add_argument("--batch_size", type=int, default=1,
-                        help="Batch size (2 for CFG, 1 for smaller compilation)")
+                        help="Batch size (always 1, CFG runs transformer twice sequentially)")
     parser.add_argument("--tp_degree", type=int, default=8,
                         help="Tensor parallel degree (8 to match language model)")
     parser.add_argument("--patch_multiplier", type=int, default=2,

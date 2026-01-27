@@ -66,22 +66,17 @@ python neuron_qwen_image_edit/compile_transformer.py \
 echo "Transformer compiled successfully!"
 echo ""
 
-# Step 4: Text Encoder (Vision Encoder + Language Model)
-echo "[Step 4/4] Compiling Text Encoder..."
+# Step 4: Vision Encoder (Language Model runs on CPU)
+echo "[Step 4/4] Compiling Vision Encoder..."
 echo "Note: Text encoder (Qwen2.5-VL) has two components:"
-echo "  - Vision Encoder (32 blocks) - single device (dimensions not divisible by TP=8)"
-echo "  - Language Model (28 layers, TP=${TP_DEGREE} with KV head replication)"
-echo "  Using --use_subprocess to avoid XLA initialization conflicts"
+echo "  - Vision Encoder: compiled on single device (dims not divisible by TP=8)"
+echo "  - Language Model: runs on CPU (28Q/4KV heads incompatible with TP=8)"
 python neuron_qwen_image_edit/compile_text_encoder.py \
-    --mode separate \
-    --use_subprocess \
+    --vision_only \
     --image_size ${IMAGE_SIZE} \
-    --max_sequence_length ${MAX_SEQ_LEN} \
-    --tp_degree ${TP_DEGREE} \
-    --language_tp_degree ${TP_DEGREE} \
     --compiled_models_dir ${COMPILED_MODELS_DIR} \
     --compiler_workdir ${COMPILER_WORKDIR}
-echo "Text Encoder compiled!"
+echo "Vision Encoder compiled!"
 echo ""
 
 echo "============================================"
@@ -105,11 +100,11 @@ echo "      --patch_multiplier ${PATCH_MULTIPLIER} \\"
 echo "      --max_sequence_length ${MAX_SEQ_LEN}"
 echo ""
 
-# # batch_size=1 (无 CFG，默认)                                                                                                                                                                                           
-# NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png --prompt "把女生变成男生" --transformer_batch_size 1 --warmup
+# 单图编辑示例 (CFG默认开启，true_cfg_scale=4.0)
+# NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png --prompt "把女生变成男生" --warmup
 
-# # batch_size=2 (有 CFG，需要用 batch_size=2 编译 transformer)                                                                                                                                                           
-# NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png --prompt "把女生变成男生" --transformer_batch_size 2 --guidance_scale 7.5 --warmup
+# 多图合成示例 (需要 patch_multiplier=3)
+# NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "..." --patch_multiplier 3 --warmup
 
-# batch_size=1 (无 CFG，默认) 多图输入示例
-NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "根据这图1中女性和图2中的男性，生成一组结婚照，并遵循以下描述：新郎穿着红色的中式马褂，新娘穿着精致的秀禾服，头戴金色凤冠。他们并肩站立在古老的朱红色宫墙前，背景是雕花的木窗。光线明亮柔和，构图对称，氛围喜庆而隆重。" --transformer_batch_size 1 --patch_multiplier 3 --warmup
+# 完整运行示例
+NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "根据这图1中女性和图2中的男性，生成一组结婚照，并遵循以下描述：新郎穿着红色的中式马褂，新娘穿着精致的秀禾服，头戴金色凤冠。他们并肩站立在古老的朱红色宫墙前，背景是雕花的木窗。光线明亮柔和，构图对称，氛围喜庆而隆重。" --patch_multiplier 3 --warmup

@@ -589,9 +589,10 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
 
     # img_shapes for the wrapper - must match compiled model
     # Use compiled dimensions and temporal_frames = patch_multiplier
+    # Note: batch_size=1, CFG runs transformer twice sequentially (not batch_size=2)
     patch_h = compiled_patch_h
     patch_w = compiled_patch_w
-    img_shapes = [(temporal_frames, patch_h, patch_w)] * args.transformer_batch_size
+    img_shapes = [(temporal_frames, patch_h, patch_w)]
 
     # Store reference to original for wrapper, then delete
     original_transformer = pipe.transformer
@@ -909,7 +910,7 @@ def run_inference(args):
     print("=" * 60)
     print(f"  Compiled dimensions: {args.compiled_height}x{args.compiled_width}")
     print(f"  Steps: {args.num_inference_steps}")
-    print(f"  Guidance scale: {args.guidance_scale}")
+    print(f"  CFG scale: {args.true_cfg_scale}")
 
     # Load original pipeline
     print("\nLoading original pipeline...")
@@ -973,12 +974,9 @@ def run_inference(args):
     # Create generator for reproducibility
     generator = torch.Generator().manual_seed(args.seed)
 
-    # Handle CFG based on transformer_batch_size
-    guidance_scale = args.guidance_scale
-    if args.transformer_batch_size == 1:
-        if args.guidance_scale != 1.0:
-            print(f"  WARNING: transformer_batch_size=1, forcing guidance_scale=1.0 (no CFG)")
-        guidance_scale = 1.0  # CFG requires batch_size=2
+    # CFG is controlled by true_cfg_scale (default 4.0 in pipeline)
+    # CFG runs transformer twice sequentially, NOT with batch_size=2
+    true_cfg_scale = args.true_cfg_scale
 
     # Warmup run
     if args.warmup:
@@ -993,7 +991,7 @@ def run_inference(args):
             negative_prompt=args.negative_prompt,
             height=args.compiled_height,  # Use compiled dimensions
             width=args.compiled_width,
-            guidance_scale=guidance_scale,
+            true_cfg_scale=true_cfg_scale,
             num_inference_steps=min(5, args.num_inference_steps),
             generator=warmup_generator,
         )
@@ -1014,7 +1012,7 @@ def run_inference(args):
         negative_prompt=args.negative_prompt,
         height=args.compiled_height,  # Use compiled dimensions
         width=args.compiled_width,
-        guidance_scale=guidance_scale,
+        true_cfg_scale=true_cfg_scale,
         num_inference_steps=args.num_inference_steps,
         generator=generator,
     )
@@ -1077,8 +1075,6 @@ if __name__ == "__main__":
                         help="Vision encoder image size (must match compiled model)")
     parser.add_argument("--max_sequence_length", type=int, default=512,
                         help="Max text sequence length (must match compiled model)")
-    parser.add_argument("--transformer_batch_size", type=int, default=1,
-                        help="Transformer batch size (1=no CFG, 2=with CFG, must match compiled model)")
     parser.add_argument("--vision_tp", action="store_true",
                         help="Use TP-compiled vision encoder (from vision_encoder_tp/). "
                              "Default is to auto-detect based on available compiled models.")
@@ -1102,8 +1098,9 @@ if __name__ == "__main__":
     # Inference settings
     parser.add_argument("--num_inference_steps", type=int, default=40,
                         help="Number of denoising steps (default: 40)")
-    parser.add_argument("--guidance_scale", type=float, default=7.5,
-                        help="Classifier-free guidance scale (default: 7.5)")
+    parser.add_argument("--true_cfg_scale", type=float, default=4.0,
+                        help="Classifier-free guidance scale (default: 4.0). "
+                             "CFG runs transformer twice sequentially (not batch_size=2).")
     parser.add_argument("--seed", type=int, default=SEED,
                         help="Random seed for reproducibility")
 
