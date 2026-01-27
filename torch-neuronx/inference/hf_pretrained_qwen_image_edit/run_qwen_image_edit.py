@@ -545,10 +545,11 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     print(f"  - Vision Encoder: {vision_mode}")
     print(f"  - Language Model: {language_mode}")
     if use_cpu_language_model:
-        print("\nNOTE: Language Model on CPU due to GQA alignment issue with TP=8")
-        print("      (28 Q heads / 4 KV heads requires TP=4, which causes OOM on Transformer)")
+        print("\nNOTE: Language Model on CPU (safe fallback mode)")
+        print("      Use --neuron_language_model for TP=8 compiled model")
     else:
-        print("\nNOTE: All TP models use TP=8 for consistent world_size")
+        print("\nNOTE: Language Model uses TP=8 with KV head replication")
+        print("      (Q heads padded 28->32, KV heads replicated 4->8)")
 
     # ========================================
     # 1. Load Transformer FIRST (TP=8)
@@ -1085,10 +1086,10 @@ if __name__ == "__main__":
     # Language model mode
     parser.add_argument("--cpu_language_model", action="store_true", default=True,
                         help="Run Language Model on CPU (default). "
-                             "This avoids GQA alignment issues with TP=8.")
+                             "Safe fallback mode that avoids any TP compatibility issues.")
     parser.add_argument("--neuron_language_model", action="store_true",
-                        help="Use Neuron-compiled Language Model instead of CPU. "
-                             "Requires compiled model with correct TP degree (usually TP=4).")
+                        help="Use Neuron-compiled Language Model with TP=8 (KV head replication mode). "
+                             "Requires: python compile_text_encoder.py --language_only --language_tp_degree 8")
 
     # Vision encoder mode
     parser.add_argument("--cpu_vision_encoder", action="store_true", default=True,

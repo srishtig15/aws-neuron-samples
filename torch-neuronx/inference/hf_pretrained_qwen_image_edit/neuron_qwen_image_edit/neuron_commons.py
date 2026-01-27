@@ -322,16 +322,26 @@ class NeuronTextEncoderWrapper(nn.Module):
                         device=attention_mask.device
                     )
                     attention_mask = torch.cat([attention_mask, mask_padding], dim=1)
+
+                # Pad position_ids with sequential positions
+                if position_ids is not None:
+                    # position_ids shape: (3, batch, seq_len)
+                    # Pad with sequential positions continuing from the last position
+                    last_pos = position_ids[:, :, -1:] + 1  # (3, batch, 1)
+                    pad_positions = last_pos + torch.arange(pad_len, device=position_ids.device).view(1, 1, -1)
+                    position_ids = torch.cat([position_ids, pad_positions], dim=2)
             elif original_seq_len > self.max_seq_len:
                 # Truncate if too long
                 print(f"  WARNING: Sequence length {original_seq_len} > max_seq_len {self.max_seq_len}, truncating")
                 inputs_embeds = inputs_embeds[:, :self.max_seq_len, :]
                 if attention_mask is not None:
                     attention_mask = attention_mask[:, :self.max_seq_len]
+                if position_ids is not None:
+                    position_ids = position_ids[:, :, :self.max_seq_len]
                 original_seq_len = self.max_seq_len
 
-            # Run compiled language model
-            hidden_states = self.compiled_language_model(inputs_embeds, attention_mask)
+            # Run compiled language model with position_ids for M-RoPE
+            hidden_states = self.compiled_language_model(inputs_embeds, attention_mask, position_ids)
 
             # Remove padding from output (restore original sequence length)
             hidden_states = hidden_states[:, :original_seq_len, :]

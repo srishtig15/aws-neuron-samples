@@ -63,23 +63,31 @@ class LanguageModelWrapper(nn.Module):
     """
     Wrapper for the Qwen2.5-VL Language Model.
     Processes the combined text and vision embeddings.
+
+    IMPORTANT: Must accept position_ids for M-RoPE (Multimodal RoPE) to work correctly.
+    Qwen2.5-VL uses 3D position_ids with shape [3, batch, seq_len] for:
+    - t (temporal): frame index for video, 0 for images
+    - h (height): spatial row position for image tokens
+    - w (width): spatial column position for image tokens
     """
     def __init__(self, language_model, embed_tokens):
         super().__init__()
         self.language_model = language_model
         self.embed_tokens = embed_tokens
 
-    def forward(self, inputs_embeds, attention_mask):
+    def forward(self, inputs_embeds, attention_mask, position_ids):
         """
         Args:
             inputs_embeds: (batch, seq_len, hidden_size) - combined text+vision embeddings
             attention_mask: (batch, seq_len)
+            position_ids: (3, batch, seq_len) - 3D position IDs for M-RoPE
         Returns:
             hidden_states: (batch, seq_len, hidden_size)
         """
         outputs = self.language_model(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
+            position_ids=position_ids,
             output_hidden_states=True,
             return_dict=True
         )
@@ -405,28 +413,41 @@ def compile_language_model(args):
 
     The language model processes text tokens combined with vision embeddings.
 
-    IMPORTANT: Qwen2.5-VL has a specific GQA configuration:
+    Qwen2.5-VL-7B GQA configuration:
     - 28 Q heads, 4 KV heads -> each KV head shared by 7 Q heads
-    - For TP to work correctly, Q head boundaries must align with KV head groups
-    - TP=4 is the ONLY TP degree that aligns correctly (7 Q heads per rank = 1 KV group)
-    - TP=8 causes 3/7 ranks to have misaligned Q-KV mapping, producing wrong results
+
+    Supported TP degrees:
+    - TP=4: Standard sharding (7 Q heads, 1 KV head per rank)
+    - TP=8: KV replication mode (Q padded to 32 -> 4 per rank, KV replicated -> 1 per rank)
+
+    The KV replication logic in shard_qwen2_attention handles TP=8 correctly by:
+    1. Padding Q heads from 28 to 32 (divisible by 8)
+    2. Replicating each KV head to pairs of ranks
+    3. Updating num_key_value_groups to 4 (4 Q heads / 1 KV head per rank)
     """
     batch_size = 1
     sequence_length = args.max_sequence_length
     hidden_size = 3584  # Qwen2.5-VL hidden size
 
-    # Use language-specific TP degree (default=4 for correct GQA alignment)
-    tp_degree = getattr(args, 'language_tp_degree', 4)
+    # Use language-specific TP degree
+    tp_degree = getattr(args, 'language_tp_degree', 8)
 
-    # Warn if using non-optimal TP degree
-    if tp_degree != 4:
+    # Validate TP degree
+    num_kv_heads = 4
+    if tp_degree > num_kv_heads and tp_degree % num_kv_heads != 0:
+        raise ValueError(
+            f"For TP={tp_degree} > num_kv_heads={num_kv_heads}, "
+            f"tp_degree must be divisible by num_kv_heads. "
+            f"Valid TP degrees: 1, 2, 4, 8"
+        )
+
+    if tp_degree == 8:
         print("=" * 60)
-        print("WARNING: TP degree for Language Model")
+        print("INFO: Using KV Head Replication Mode (TP=8)")
         print("=" * 60)
-        print(f"  Requested TP degree: {tp_degree}")
-        print(f"  Qwen2.5-VL has 28 Q heads, 4 KV heads (GQA group size = 7)")
-        print(f"  TP=4 is the ONLY degree that aligns Q heads with KV groups!")
-        print(f"  Using TP={tp_degree} will cause incorrect attention computation.")
+        print(f"  Q heads: 28 -> padded to 32 -> 4 per rank")
+        print(f"  KV heads: 4 -> replicated -> 1 per rank")
+        print(f"  num_key_value_groups: 4 (Q_per_rank / KV_per_rank)")
         print("=" * 60)
 
     os.environ["LOCAL_WORLD_SIZE"] = str(tp_degree)
@@ -450,8 +471,11 @@ def compile_language_model(args):
         # attention_mask: (batch, seq_len)
         sample_attention_mask = torch.ones(
             (batch_size, sequence_length), dtype=torch.int64)
+        # position_ids: (3, batch, seq_len) - 3D for M-RoPE
+        # For tracing, use simple sequential positions (text-only pattern)
+        sample_position_ids = torch.arange(sequence_length).view(1, 1, -1).expand(3, batch_size, -1).clone()
 
-        sample_inputs = (sample_inputs_embeds, sample_attention_mask)
+        sample_inputs = (sample_inputs_embeds, sample_attention_mask, sample_position_ids)
 
         try:
             compiled_lang_model = neuronx_distributed.trace.parallel_model_trace(
@@ -626,10 +650,10 @@ if __name__ == "__main__":
                         help="Run each compilation in separate subprocess (avoids XLA conflicts)")
     parser.add_argument("--tp_degree", type=int, default=8,
                         help="Tensor parallel degree for vision encoder TP mode (default=8)")
-    parser.add_argument("--language_tp_degree", type=int, default=4,
+    parser.add_argument("--language_tp_degree", type=int, default=8,
                         help="Tensor parallel degree for language model. "
-                             "IMPORTANT: Must be 4 for Qwen2.5-VL due to GQA alignment. "
-                             "Using other values will produce incorrect results.")
+                             "TP=4: Standard sharding. TP=8: KV head replication mode. "
+                             "Default=8 to match transformer TP degree.")
     args = parser.parse_args()
 
     if args.mode == "separate":

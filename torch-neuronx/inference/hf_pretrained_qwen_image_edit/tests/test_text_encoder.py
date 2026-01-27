@@ -25,9 +25,9 @@ import argparse
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Set Neuron environment BEFORE imports
-# Note: Language Model uses TP=4 for correct GQA alignment
-# Vision Encoder uses single device or TP=8
-LANGUAGE_TP_DEGREE = 4  # Must match compile_text_encoder.py --language_tp_degree
+# Note: Language Model now uses TP=8 with KV head replication
+# Vision Encoder uses single device (dimensions not divisible by 8)
+LANGUAGE_TP_DEGREE = 8  # Must match compile_text_encoder.py --language_tp_degree
 os.environ["LOCAL_WORLD_SIZE"] = str(LANGUAGE_TP_DEGREE)  # MUST be set before neuron imports
 os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "2"
 os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2"
@@ -251,9 +251,12 @@ def test_language_model(args):
     inputs_embeds = torch.randn(batch_size, sequence_length, hidden_size, dtype=dtype)
     # attention_mask: (batch, seq_len)
     attention_mask = torch.ones(batch_size, sequence_length, dtype=torch.int64)
+    # position_ids: (3, batch, seq_len) - 3D for M-RoPE
+    position_ids = torch.arange(sequence_length).view(1, 1, -1).expand(3, batch_size, -1).clone()
 
     print(f"  inputs_embeds: {inputs_embeds.shape}")
     print(f"  attention_mask: {attention_mask.shape}")
+    print(f"  position_ids: {position_ids.shape}")
 
     # CPU inference
     print("\nRunning CPU inference...")
@@ -261,6 +264,7 @@ def test_language_model(args):
         cpu_output = lang_model(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
+            position_ids=position_ids,
             output_hidden_states=True,
             return_dict=True
         ).last_hidden_state
@@ -279,10 +283,10 @@ def test_language_model(args):
     import neuronx_distributed
     compiled_lang_model = neuronx_distributed.trace.parallel_model_load(language_model_path)
 
-    # Neuron inference
+    # Neuron inference (with position_ids for M-RoPE)
     print("Running Neuron inference...")
     with torch.no_grad():
-        neuron_output = compiled_lang_model(inputs_embeds, attention_mask)
+        neuron_output = compiled_lang_model(inputs_embeds, attention_mask, position_ids)
     print(f"  Neuron output shape: {neuron_output.shape}")
 
     # Compare results

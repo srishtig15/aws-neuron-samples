@@ -70,7 +70,7 @@ echo ""
 echo "[Step 4/4] Compiling Text Encoder..."
 echo "Note: Text encoder (Qwen2.5-VL) has two components:"
 echo "  - Vision Encoder (32 blocks) - single device (dimensions not divisible by TP=8)"
-echo "  - Language Model (28 layers, TP=${TP_DEGREE})"
+echo "  - Language Model (28 layers, TP=${TP_DEGREE} with KV head replication)"
 echo "  Using --use_subprocess to avoid XLA initialization conflicts"
 python neuron_qwen_image_edit/compile_text_encoder.py \
     --mode separate \
@@ -78,6 +78,7 @@ python neuron_qwen_image_edit/compile_text_encoder.py \
     --image_size ${IMAGE_SIZE} \
     --max_sequence_length ${MAX_SEQ_LEN} \
     --tp_degree ${TP_DEGREE} \
+    --language_tp_degree ${TP_DEGREE} \
     --compiled_models_dir ${COMPILED_MODELS_DIR} \
     --compiler_workdir ${COMPILER_WORKDIR}
 echo "Text Encoder compiled!"

@@ -22,7 +22,8 @@ import argparse
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Set Neuron environment BEFORE imports
-os.environ["LOCAL_WORLD_SIZE"] = "4"
+# Now using TP=8 for language model with KV head replication
+os.environ["LOCAL_WORLD_SIZE"] = "8"
 os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "2"
 os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2"
 os.environ["NEURON_FUSE_SOFTMAX"] = "1"
