@@ -70,19 +70,20 @@ class NKIFlashAttnQwenDoubleStreamProcessor:
         Input shape: (batch, seq, heads, head_dim)
         Output shape: (batch, seq, heads, head_dim)
 
-        NKI Flash Attention with transpose_nki_inputs=False:
-        - Input: (batch, heads, seq, head_dim)
-        - Output: (batch, seq, heads, head_dim)
+        NKI kernel internally expects (batch, heads, head_dim, seq).
+        With transpose_nki_inputs=True, we provide (batch, heads, head_dim, seq).
+        Output is always (batch, seq, heads, head_dim).
         """
         batch, seq, heads, head_dim = query.shape
 
-        # Permute from (batch, seq, heads, head_dim) to (batch, heads, seq, head_dim)
-        q = query.permute(0, 2, 1, 3).contiguous()
-        k = key.permute(0, 2, 1, 3).contiguous()
-        v = value.permute(0, 2, 1, 3).contiguous()
+        # Permute from (batch, seq, heads, head_dim) to (batch, heads, head_dim, seq)
+        # This is what the kernel actually expects internally
+        q = query.permute(0, 2, 3, 1).contiguous()
+        k = key.permute(0, 2, 3, 1).contiguous()
+        v = value.permute(0, 2, 3, 1).contiguous()
 
         # Apply NKI Flash Attention
-        # Input: (batch, heads, seq, head_dim)
+        # Input: (batch, heads, head_dim, seq)
         # Output: (batch, seq, heads, head_dim)
         out = self._nki_flash_attn(
             q, k, v,
@@ -90,7 +91,7 @@ class NKIFlashAttnQwenDoubleStreamProcessor:
             causal=False,  # Image attention is not causal
             mixed_precision=True,
             dropout_p=0.0,
-            transpose_nki_inputs=False,
+            transpose_nki_inputs=True,  # Input is (batch, heads, head_dim, seq)
         )
 
         # Output is already (batch, seq, heads, head_dim)

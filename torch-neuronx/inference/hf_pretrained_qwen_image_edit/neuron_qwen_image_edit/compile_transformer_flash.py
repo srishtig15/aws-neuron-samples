@@ -76,14 +76,11 @@ def get_transformer_model(tp_degree: int, img_shapes: list, use_flash_attention:
     print("Patching RoPE for Neuron compatibility...")
     pipe.transformer = patch_qwenimage_rope(pipe.transformer)
 
-    # 2. Patch with NKI Flash Attention
+    # 2. NKI Flash Attention is not compatible with XLA tracing
+    # The kernel returns incorrect shapes during symbolic tracing.
+    # Using default SDPA attention instead.
     if use_flash_attention:
-        print("Patching transformer with NKI Flash Attention...")
-        pipe.transformer = patch_transformer_with_flash_attention(
-            pipe.transformer,
-            use_flash_attention=True,
-            lnc=2  # TRN2 uses lnc=2
-        )
+        print("NOTE: NKI Flash Attention not compatible with XLA tracing, using SDPA")
 
     # 3. Shard transformer blocks for tensor parallelism
     num_blocks = len(pipe.transformer.transformer_blocks)
