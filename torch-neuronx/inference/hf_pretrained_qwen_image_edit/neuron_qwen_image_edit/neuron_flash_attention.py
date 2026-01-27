@@ -41,7 +41,7 @@ class NKIFlashAttnQwenDoubleStreamProcessor:
 
     Key differences from standard processor:
     - Uses NKI Flash Attention kernel instead of torch SDPA
-    - Requires sequence length to be divisible by 2048
+    - Uses transpose_nki_inputs=True for (batch, seq, heads, head_dim) layout
     - Optimized for TRN2 with lnc=2
     """
 
@@ -70,52 +70,27 @@ class NKIFlashAttnQwenDoubleStreamProcessor:
         Input shape: (batch, seq, heads, head_dim)
         Output shape: (batch, seq, heads, head_dim)
 
-        NKI Flash Attention expects:
-        - Input: (batch, heads, seq, head_dim) with transpose_nki_inputs=False
+        With transpose_nki_inputs=True (default):
+        - Input: (batch, seq, heads, head_dim)
         - Output: (batch, seq, heads, head_dim)
         """
         batch, seq, heads, head_dim = query.shape
 
-        # Check sequence length requirement
-        if seq % 2048 != 0:
-            # Pad to multiple of 2048
-            pad_len = (2048 - seq % 2048) % 2048
-            if pad_len > 0:
-                query = F.pad(query, (0, 0, 0, 0, 0, pad_len))
-                key = F.pad(key, (0, 0, 0, 0, 0, pad_len))
-                value = F.pad(value, (0, 0, 0, 0, 0, pad_len))
-                padded = True
-                padded_seq = seq + pad_len
-            else:
-                padded = False
-                padded_seq = seq
-        else:
-            padded = False
-            pad_len = 0
-            padded_seq = seq
+        # Ensure contiguous tensors for NKI kernel
+        q = query.contiguous()
+        k = key.contiguous()
+        v = value.contiguous()
 
-        # Permute to NKI expected layout: (batch, heads, seq, head_dim)
-        # From: (batch, seq, heads, head_dim)
-        q = query.permute(0, 2, 1, 3).contiguous()  # (batch, heads, seq, head_dim)
-        k = key.permute(0, 2, 1, 3).contiguous()
-        v = value.permute(0, 2, 1, 3).contiguous()
-
-        # Apply NKI Flash Attention with transpose_nki_inputs=False
-        # Input: (batch, heads, seq, head_dim)
-        # Output: (batch, seq, heads, head_dim)
+        # Apply NKI Flash Attention with transpose_nki_inputs=True
+        # This means input/output are both (batch, seq, heads, head_dim)
         out = self._nki_flash_attn(
             q, k, v,
             lnc=self.lnc,
             causal=False,  # Image attention is not causal
             mixed_precision=True,
             dropout_p=0.0,
-            transpose_nki_inputs=False,  # Input is already (batch, heads, seq, head_dim)
+            transpose_nki_inputs=True,  # Input is (batch, seq, heads, head_dim)
         )
-
-        # Output should be (batch, seq, heads, head_dim)
-        # Remove padding if applied
-        if padded:
-            out = out[:, :seq, :, :]
 
         return out
 
