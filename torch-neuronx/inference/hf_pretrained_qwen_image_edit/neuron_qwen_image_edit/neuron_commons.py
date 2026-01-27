@@ -206,9 +206,11 @@ class NeuronTextEncoderWrapper(nn.Module):
         4. Language model on compiled model
         5. Remove padding from output
         """
+        import time
         batch_size = input_ids.shape[0] if input_ids is not None else 1
 
         # Step 1: Process images through vision encoder
+        _t0 = time.time()
         if pixel_values is not None:
             # Ensure pixel_values is bfloat16 and correct shape
             pixel_values = pixel_values.to(torch.bfloat16)
@@ -254,6 +256,8 @@ class NeuronTextEncoderWrapper(nn.Module):
                 )
         else:
             image_embeds = None
+        _t1 = time.time()
+        print(f"  [Profile] Vision encoder: {_t1 - _t0:.2f}s")
 
         # Step 2: Get text embeddings
         text_embeds = self.embed_tokens(input_ids)
@@ -278,6 +282,7 @@ class NeuronTextEncoderWrapper(nn.Module):
         position_ids = self._get_rope_index(input_ids, image_grid_thw, attention_mask)
 
         # Step 5: Run language model (CPU or compiled)
+        _t2 = time.time()
         if self.use_cpu_language_model:
             # CPU Language Model mode - no padding needed, handles dynamic sequence lengths
             # This avoids GQA alignment issues that occur with TP != 4
@@ -290,6 +295,8 @@ class NeuronTextEncoderWrapper(nn.Module):
                     return_dict=True
                 )
                 hidden_states = cpu_outputs.last_hidden_state
+            _t3 = time.time()
+            print(f"  [Profile] Language model (CPU): {_t3 - _t2:.2f}s")
 
             # Create output similar to original
             if return_dict:

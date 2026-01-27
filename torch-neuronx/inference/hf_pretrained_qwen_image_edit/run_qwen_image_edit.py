@@ -162,11 +162,22 @@ class NeuronTransformerWrapper(torch.nn.Module):
         timestep = timestep.to(torch.float32)
 
         # Run on compiled Neuron model
+        import time
+        _t_start = time.time()
         output = self.compiled_transformer(
             hidden_states,
             encoder_hidden_states,
             timestep
         )
+        # Profile transformer step (print every 10 steps to avoid spam)
+        if not hasattr(self, '_step_count'):
+            self._step_count = 0
+            self._step_times = []
+        self._step_count += 1
+        self._step_times.append(time.time() - _t_start)
+        if self._step_count % 10 == 0:
+            avg_time = sum(self._step_times[-10:]) / 10
+            print(f"  [Profile] Transformer step {self._step_count}: avg {avg_time:.3f}s/step")
 
         # 4. Remove padding from output if we padded hidden_states
         if actual_patches < self.expected_num_patches:
@@ -270,6 +281,9 @@ class NeuronVAEWrapper(torch.nn.Module):
 
     def encode(self, x, return_dict=True):
         """Encode images to latents on Neuron. Supports tiled encoding for large images."""
+        import time
+        _t_enc_start = time.time()
+
         # Ensure 5D format: (batch, channels, temporal, height, width)
         if len(x.shape) == 4:
             x = x.unsqueeze(2)  # Add temporal dimension
@@ -323,7 +337,9 @@ class NeuronVAEWrapper(torch.nn.Module):
                 def __init__(self, latent_dist):
                     self.latent_dist = latent_dist
 
+            print(f"  [Profile] VAE encode: {time.time() - _t_enc_start:.2f}s")
             return EncoderOutput(LatentDist(sample, mean))
+        print(f"  [Profile] VAE encode: {time.time() - _t_enc_start:.2f}s")
         return sample
 
     def _tiled_encode(self, x):
@@ -386,6 +402,9 @@ class NeuronVAEWrapper(torch.nn.Module):
 
     def decode(self, z, return_dict=True):
         """Decode latents to images on Neuron. Supports tiled decoding for large latents."""
+        import time
+        _t_dec_start = time.time()
+
         # NOTE: Do NOT unscale latents here!
         # The pipeline already unscales latents before calling decode
 
@@ -429,6 +448,7 @@ class NeuronVAEWrapper(torch.nn.Module):
             if latent_h != expected_latent_h or latent_w != expected_latent_w:
                 dec = dec[:, :, :, :output_h, :output_w]
 
+        print(f"  [Profile] VAE decode: {time.time() - _t_dec_start:.2f}s")
         if return_dict:
             from diffusers.models.autoencoders.vae import DecoderOutput
             return DecoderOutput(sample=dec)
@@ -569,15 +589,12 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
         transformer_path
     )
 
-    # Calculate expected shapes for the COMPILED model
-    # These must match what was used during compilation (compile.sh defaults to 512x512)
-    compiled_height = args.compiled_height
-    compiled_width = args.compiled_width
-    compiled_latent_h = compiled_height // 8
-    compiled_latent_w = compiled_width // 8
-    compiled_patch_h = compiled_latent_h // 2
-    compiled_patch_w = compiled_latent_w // 2
-    base_num_patches = compiled_patch_h * compiled_patch_w  # 32*32=1024 for 512x512
+    # Calculate expected shapes based on image dimensions
+    latent_h = args.height // 8
+    latent_w = args.width // 8
+    patch_h = latent_h // 2
+    patch_w = latent_w // 2
+    base_num_patches = patch_h * patch_w  # e.g., 64*64=4096 for 1024x1024
 
     # For IMAGE EDITING, patches are doubled (source + noise latents concatenated)
     # This is handled by using temporal_frames = patch_multiplier
@@ -587,11 +604,8 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     expected_num_patches = temporal_frames * base_num_patches
     print(f"  Expected num_patches: {expected_num_patches} (temporal_frames={temporal_frames}, base={base_num_patches})")
 
-    # img_shapes for the wrapper - must match compiled model
-    # Use compiled dimensions and temporal_frames = patch_multiplier
+    # img_shapes for the wrapper
     # Note: batch_size=1, CFG runs transformer twice sequentially (not batch_size=2)
-    patch_h = compiled_patch_h
-    patch_w = compiled_patch_w
     img_shapes = [(temporal_frames, patch_h, patch_w)]
 
     # Store reference to original for wrapper, then delete
@@ -908,7 +922,7 @@ def run_inference(args):
     print("\n" + "=" * 60)
     print("Qwen-Image-Edit Inference on Trainium2")
     print("=" * 60)
-    print(f"  Compiled dimensions: {args.compiled_height}x{args.compiled_width}")
+    print(f"  Compiled dimensions: {args.height}x{args.width}")
     print(f"  Steps: {args.num_inference_steps}")
     print(f"  CFG scale: {args.true_cfg_scale}")
 
@@ -921,11 +935,11 @@ def run_inference(args):
     # This creates more patches than our compiled transformer expects.
     # We need to match our compiled dimensions.
     import diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus as qwen_pipeline_module
-    compiled_vae_pixels = args.compiled_height * args.compiled_width  # e.g., 512*512
+    compiled_vae_pixels = args.height * args.width  # e.g., 512*512
     original_vae_size = getattr(qwen_pipeline_module, 'VAE_IMAGE_SIZE', 1024*1024)
     qwen_pipeline_module.VAE_IMAGE_SIZE = compiled_vae_pixels
     print(f"\nOverriding VAE_IMAGE_SIZE: {original_vae_size} -> {compiled_vae_pixels}")
-    print(f"  (This ensures source images produce {args.compiled_height//8//2}x{args.compiled_width//8//2} patches)")
+    print(f"  (This ensures source images produce {args.height//8//2}x{args.width//8//2} patches)")
 
     pipe = QwenImageEditPlusPipeline.from_pretrained(
         MODEL_ID,
@@ -956,9 +970,9 @@ def run_inference(args):
         print(f"  Loading: {img_path}")
         img = load_image(img_path)
         # Resize to match COMPILED dimensions (not inference dimensions)
-        img = img.resize((args.compiled_width, args.compiled_height))
+        img = img.resize((args.width, args.height))
         source_images.append(img)
-    print(f"All images resized to: {args.compiled_width}x{args.compiled_height} (compiled dimensions)")
+    print(f"All images resized to: {args.width}x{args.height} (compiled dimensions)")
 
     # Use single image or list based on count
     input_images = source_images[0] if len(source_images) == 1 else source_images
@@ -989,8 +1003,8 @@ def run_inference(args):
             image=input_images,
             prompt=args.prompt,
             negative_prompt=args.negative_prompt,
-            height=args.compiled_height,  # Use compiled dimensions
-            width=args.compiled_width,
+            height=args.height,  # Use compiled dimensions
+            width=args.width,
             true_cfg_scale=true_cfg_scale,
             num_inference_steps=min(5, args.num_inference_steps),
             generator=warmup_generator,
@@ -1010,8 +1024,8 @@ def run_inference(args):
         image=input_images,
         prompt=args.prompt,
         negative_prompt=args.negative_prompt,
-        height=args.compiled_height,  # Use compiled dimensions
-        width=args.compiled_width,
+        height=args.height,  # Use compiled dimensions
+        width=args.width,
         true_cfg_scale=true_cfg_scale,
         num_inference_steps=args.num_inference_steps,
         generator=generator,
@@ -1030,10 +1044,10 @@ def run_inference(args):
     if args.save_comparison:
         # Create comparison with all input images + output
         num_images = len(source_images) + 1  # inputs + output
-        comparison = Image.new('RGB', (args.compiled_width * num_images, args.compiled_height))
+        comparison = Image.new('RGB', (args.width * num_images, args.height))
         for i, img in enumerate(source_images):
-            comparison.paste(img, (args.compiled_width * i, 0))
-        comparison.paste(output_image, (args.compiled_width * len(source_images), 0))
+            comparison.paste(img, (args.width * i, 0))
+        comparison.paste(output_image, (args.width * len(source_images), 0))
         comparison_path = output_path.replace('.png', '_comparison.png')
         comparison.save(comparison_path)
         print(f"Comparison saved to: {comparison_path}")
@@ -1056,17 +1070,11 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=str, default=None,
                         help="Output image path (default: output_edited.png)")
 
-    # Image settings for inference
-    parser.add_argument("--height", type=int, default=512,
-                        help="Image height for inference")
-    parser.add_argument("--width", type=int, default=512,
-                        help="Image width for inference")
-
-    # Compiled model dimensions (what the model was compiled with)
-    parser.add_argument("--compiled_height", type=int, default=512,
-                        help="Height used during model compilation (default: 512)")
-    parser.add_argument("--compiled_width", type=int, default=512,
-                        help="Width used during model compilation (default: 512)")
+    # Image dimensions (must match compiled model)
+    parser.add_argument("--height", type=int, default=1024,
+                        help="Image height (must match compiled model)")
+    parser.add_argument("--width", type=int, default=1024,
+                        help="Image width (must match compiled model)")
     parser.add_argument("--patch_multiplier", type=int, default=2,
                         help="Patch multiplier (2 for image editing, 1 for generation)")
 

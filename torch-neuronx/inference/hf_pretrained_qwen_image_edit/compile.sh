@@ -71,18 +71,18 @@ python neuron_qwen_image_edit/compile_transformer.py \
 echo "Transformer compiled successfully!"
 echo ""
 
-# # Step 4: Vision Encoder (Language Model runs on CPU)
-# echo "[Step 4/4] Compiling Vision Encoder..."
-# echo "Note: Text encoder (Qwen2.5-VL) has two components:"
-# echo "  - Vision Encoder: compiled on single device (dims not divisible by TP=8)"
-# echo "  - Language Model: runs on CPU (28Q/4KV heads incompatible with TP=8)"
-# python neuron_qwen_image_edit/compile_text_encoder.py \
-#     --vision_only \
-#     --image_size ${IMAGE_SIZE} \
-#     --compiled_models_dir ${COMPILED_MODELS_DIR} \
-#     --compiler_workdir ${COMPILER_WORKDIR}
-# echo "Vision Encoder compiled!"
-# echo ""
+# Step 4: Vision Encoder (Language Model runs on CPU)
+echo "[Step 4/4] Compiling Vision Encoder..."
+echo "Note: Text encoder (Qwen2.5-VL) has two components:"
+echo "  - Vision Encoder: compiled on single device (dims not divisible by TP=8)"
+echo "  - Language Model: runs on CPU (28Q/4KV heads incompatible with TP=8)"
+python neuron_qwen_image_edit/compile_text_encoder.py \
+    --vision_only \
+    --image_size ${IMAGE_SIZE} \
+    --compiled_models_dir ${COMPILED_MODELS_DIR} \
+    --compiler_workdir ${COMPILER_WORKDIR}
+echo "Vision Encoder compiled!"
+echo ""
 
 echo "============================================"
 echo "Compilation Complete!"
