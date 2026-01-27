@@ -36,19 +36,19 @@ echo ""
 
 # Step 1: Download the model
 echo "[Step 1/4] Downloading model..."
-# python neuron_qwen_image_edit/cache_hf_model.py
+python neuron_qwen_image_edit/cache_hf_model.py
 echo "Model downloaded successfully!"
 echo ""
 
 # Step 2: Compile VAE (encoder and decoder)
 echo "[Step 2/4] Compiling VAE..."
 echo "Using modified VAE with 'nearest' interpolation (Neuron doesn't support 'nearest-exact')"
-# python neuron_qwen_image_edit/compile_vae.py \
-#     --height ${HEIGHT} \
-#     --width ${WIDTH} \
-#     --temporal_frames 1 \
-#     --compiled_models_dir ${COMPILED_MODELS_DIR} \
-#     --compiler_workdir ${COMPILER_WORKDIR}
+python neuron_qwen_image_edit/compile_vae.py \
+    --height ${HEIGHT} \
+    --width ${WIDTH} \
+    --temporal_frames 1 \
+    --compiled_models_dir ${COMPILED_MODELS_DIR} \
+    --compiler_workdir ${COMPILER_WORKDIR}
 echo "VAE compiled successfully!"
 echo ""
 
@@ -72,14 +72,14 @@ echo "Note: Text encoder (Qwen2.5-VL) has two components:"
 echo "  - Vision Encoder (32 blocks) - single device (dimensions not divisible by TP=8)"
 echo "  - Language Model (28 layers, TP=${TP_DEGREE})"
 echo "  Using --use_subprocess to avoid XLA initialization conflicts"
-# python neuron_qwen_image_edit/compile_text_encoder.py \
-#     --mode separate \
-#     --use_subprocess \
-#     --image_size ${IMAGE_SIZE} \
-#     --max_sequence_length ${MAX_SEQ_LEN} \
-#     --tp_degree ${TP_DEGREE} \
-#     --compiled_models_dir ${COMPILED_MODELS_DIR} \
-#     --compiler_workdir ${COMPILER_WORKDIR}
+python neuron_qwen_image_edit/compile_text_encoder.py \
+    --mode separate \
+    --use_subprocess \
+    --image_size ${IMAGE_SIZE} \
+    --max_sequence_length ${MAX_SEQ_LEN} \
+    --tp_degree ${TP_DEGREE} \
+    --compiled_models_dir ${COMPILED_MODELS_DIR} \
+    --compiler_workdir ${COMPILER_WORKDIR}
 echo "Text Encoder compiled!"
 echo ""
 
