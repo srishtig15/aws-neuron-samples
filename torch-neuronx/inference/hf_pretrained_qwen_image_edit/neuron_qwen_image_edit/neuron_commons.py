@@ -104,6 +104,91 @@ class NeuronTextEncoderWrapper(nn.Module):
         num_patches_per_side = image_size // self.patch_size
         self.num_image_tokens = (num_patches_per_side // self.spatial_merge_size) ** 2
 
+        # Special token IDs from config
+        self.image_token_id = getattr(self.config, 'image_token_id', 151655)
+        self.vision_start_token_id = getattr(self.config, 'vision_start_token_id', 151652)
+
+    def _get_rope_index(self, input_ids, image_grid_thw, attention_mask):
+        """
+        Calculate 3D position_ids for M-RoPE (Multimodal RoPE).
+
+        For multimodal input (text + images), position_ids have different patterns:
+        - Text tokens: sequential positions (same for t, h, w dimensions)
+        - Image tokens: 3D grid positions based on spatial layout
+
+        This replicates the logic from Qwen2_5_VLModel.get_rope_index().
+        """
+        batch_size, seq_len = input_ids.shape
+        device = input_ids.device
+
+        # If no images, use simple text-only position_ids
+        if image_grid_thw is None:
+            if attention_mask is not None:
+                position_ids = attention_mask.long().cumsum(-1) - 1
+                position_ids.masked_fill_(attention_mask == 0, 1)
+                position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+            else:
+                position_ids = torch.arange(seq_len, device=device).view(1, 1, -1).expand(3, batch_size, -1)
+            return position_ids
+
+        # Multimodal case: need to compute proper 3D positions
+        position_ids = torch.ones(3, batch_size, seq_len, dtype=torch.long, device=device)
+
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+
+        for b in range(batch_size):
+            # Get non-padded tokens for this batch
+            valid_mask = attention_mask[b] == 1
+            valid_ids = input_ids[b][valid_mask]
+            valid_len = valid_ids.shape[0]
+
+            # Find image token positions in the valid sequence
+            is_image_token = (valid_ids == self.image_token_id)
+            num_actual_image_tokens = is_image_token.sum().item()
+
+            if num_actual_image_tokens == 0:
+                # No images, use sequential positions
+                pos = torch.arange(valid_len, device=device)
+                position_ids[:, b, valid_mask] = pos.unsqueeze(0).expand(3, -1)
+                continue
+
+            # Get grid dimensions for this image
+            t, h, w = image_grid_thw[0].tolist()
+            llm_grid_h = h // self.spatial_merge_size
+            llm_grid_w = w // self.spatial_merge_size
+
+            # Build position_ids token by token
+            # For simplicity: text tokens get sequential positions, image tokens get grid positions
+            pos_list = []
+            current_pos = 0
+            img_token_idx = 0
+
+            for i in range(valid_len):
+                if is_image_token[i]:
+                    # Image token: use 2D grid position
+                    grid_idx = img_token_idx
+                    t_pos = grid_idx // (llm_grid_h * llm_grid_w)
+                    remainder = grid_idx % (llm_grid_h * llm_grid_w)
+                    h_pos = remainder // llm_grid_w
+                    w_pos = remainder % llm_grid_w
+                    # Add offset from previous text
+                    pos_list.append([current_pos + t_pos, current_pos + h_pos, current_pos + w_pos])
+                    img_token_idx += 1
+                    # Update current_pos after last image token
+                    if img_token_idx == num_actual_image_tokens:
+                        current_pos = current_pos + max(t_pos, h_pos, w_pos) + 1
+                else:
+                    # Text token: use sequential position
+                    pos_list.append([current_pos, current_pos, current_pos])
+                    current_pos += 1
+
+            # Convert to tensor
+            pos_tensor = torch.tensor(pos_list, dtype=torch.long, device=device).T  # [3, valid_len]
+            position_ids[:, b, valid_mask] = pos_tensor
+
+        return position_ids
+
     def forward(self, input_ids=None, attention_mask=None, pixel_values=None,
                 image_grid_thw=None, output_hidden_states=True, return_dict=True, **kwargs):
         """
@@ -176,16 +261,10 @@ class NeuronTextEncoderWrapper(nn.Module):
             inputs_embeds = text_embeds
 
         # Step 4: Calculate 3D position_ids for M-RoPE (required by Qwen2.5-VL)
-        # For text-only input (no images), position_ids are simple cumulative positions
-        # Shape: [3, batch_size, seq_len] - same values for all 3 dimensions (t, h, w)
-        if attention_mask is not None:
-            position_ids = attention_mask.long().cumsum(-1) - 1
-            position_ids.masked_fill_(attention_mask == 0, 1)
-            position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
-        else:
-            seq_len = inputs_embeds.shape[1]
-            position_ids = torch.arange(seq_len, device=inputs_embeds.device)
-            position_ids = position_ids.view(1, 1, -1).expand(3, batch_size, -1)
+        # For multimodal input (text + images), position_ids have special patterns:
+        # - Text tokens: sequential positions (same for t, h, w dimensions)
+        # - Image tokens: 3D grid positions based on spatial layout
+        position_ids = self._get_rope_index(input_ids, image_grid_thw, attention_mask)
 
         # Step 5: Run language model (CPU or compiled)
         if self.use_cpu_language_model:

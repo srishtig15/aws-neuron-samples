@@ -818,6 +818,16 @@ def run_inference(args):
         cache_dir=HUGGINGFACE_CACHE_DIR,
         local_files_only=True
     )
+
+    # CRITICAL: Configure processor to output fixed image size matching compiled vision encoder
+    # The processor dynamically determines grid size based on min/max pixels.
+    # We must force it to use the exact size the vision encoder was compiled for.
+    target_pixels = args.image_size * args.image_size
+    print(f"\nConfiguring processor for vision encoder size: {args.image_size}x{args.image_size}")
+    print(f"  Setting min_pixels = max_pixels = {target_pixels}")
+    pipe.processor.image_processor.min_pixels = target_pixels
+    pipe.processor.image_processor.max_pixels = target_pixels
+
     print("Pipeline loaded!")
 
     # Load ALL compiled models - everything runs on Trainium2
