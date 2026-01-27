@@ -84,6 +84,14 @@ class NeuronQwenEmbedRope(nn.Module):
         """
         Compute RoPE frequencies for video and text.
 
+        Handles multiple img_shapes formats:
+        - (T, H, W): single tuple for one video
+        - [(T, H, W)]: list with single tuple
+        - [(T1, H, W), (T2, H, W)]: list of tuples (multiple images)
+        - [[(T1, H, W), (T2, H, W)]]: nested list (batch of multiple images)
+
+        For multiple images, frames are summed to get total patch count.
+
         Returns:
             Tuple of (vid_freqs, txt_freqs), each being (cos, sin) tuple
         """
@@ -94,15 +102,36 @@ class NeuronQwenEmbedRope(nn.Module):
         if max_txt_seq_len is None:
             raise ValueError("Either max_txt_seq_len or txt_seq_lens must be provided.")
 
-        # Handle batch format
-        if isinstance(video_fhw, list):
-            video_fhw = video_fhw[0]
-        if not isinstance(video_fhw, (list, tuple)):
-            video_fhw = [video_fhw]
-        if isinstance(video_fhw[0], (list, tuple)):
-            video_fhw = video_fhw[0]
+        # Parse video_fhw into (total_frames, height, width)
+        # Need to handle different formats correctly:
+        # 1. (T, H, W) - single tuple
+        # 2. [(T, H, W)] - list with single tuple
+        # 3. [(T1, H, W), (T2, H, W)] - list of tuples for multiple images
+        # 4. [[(T1, H, W), (T2, H, W)]] - nested list for batch
 
-        frame, height, width = video_fhw
+        if isinstance(video_fhw, tuple) and len(video_fhw) == 3 and isinstance(video_fhw[0], int):
+            # Format 1: (T, H, W) - single tuple
+            frame, height, width = video_fhw
+        elif isinstance(video_fhw, list) and len(video_fhw) > 0:
+            first_elem = video_fhw[0]
+            if isinstance(first_elem, tuple) and len(first_elem) == 3 and isinstance(first_elem[0], int):
+                # Format 2 or 3: [(T, H, W)] or [(T1, H, W), (T2, H, W), ...]
+                # Sum frames from all tuples, assume same H, W
+                frame = sum(t[0] for t in video_fhw)
+                height, width = first_elem[1], first_elem[2]
+            elif isinstance(first_elem, (list, tuple)) and len(first_elem) > 0:
+                # Format 4: [[(T1, H, W), (T2, H, W), ...]] - nested list
+                # Take first batch item, sum frames from all images
+                shapes = first_elem
+                if isinstance(shapes[0], tuple) and len(shapes[0]) == 3:
+                    frame = sum(t[0] for t in shapes)
+                    height, width = shapes[0][1], shapes[0][2]
+                else:
+                    raise ValueError(f"Unsupported nested video_fhw format: {video_fhw}")
+            else:
+                raise ValueError(f"Unsupported video_fhw format: {video_fhw}")
+        else:
+            raise ValueError(f"Unsupported video_fhw format: {video_fhw}")
 
         # Compute video frequencies
         vid_cos, vid_sin = self._compute_video_freqs(frame, height, width, device)
@@ -181,6 +210,13 @@ def apply_rotary_emb_neuron(
     This is a drop-in replacement for apply_rotary_emb_qwen that uses
     (cos, sin) tuples instead of complex tensors.
 
+    The rotation is applied as:
+        out[2k] = x[2k] * cos[k] - x[2k+1] * sin[k]
+        out[2k+1] = x[2k] * sin[k] + x[2k+1] * cos[k]
+
+    This is equivalent to complex multiplication:
+        (x_real + i*x_imag) * (cos + i*sin) = (x_real*cos - x_imag*sin) + i*(x_real*sin + x_imag*cos)
+
     Args:
         x: Input tensor [B, S, H, D]
         freqs_cis: Tuple of (cos, sin) tensors, each [S, D//2]
@@ -192,39 +228,45 @@ def apply_rotary_emb_neuron(
     """
     cos, sin = freqs_cis
 
-    # Expand dims for broadcasting: [S, D//2] -> [1, S, 1, D//2] or similar
-    # But we need to handle the head dimension too
-    # x shape: [B, S, H, D] where D = 2 * (D//2)
+    # cos/sin have shape [S, D//2] where D is the head_dim
+    # x has shape [B, S, H, D]
 
-    # The cos/sin have shape [S, D//2] where D is the head_dim
-    # We need to broadcast properly
-    cos = cos.unsqueeze(0).unsqueeze(2)  # [1, S, 1, D//2]
-    sin = sin.unsqueeze(0).unsqueeze(2)  # [1, S, 1, D//2]
+    # Expand cos/sin to match x's D dimension by interleaving
+    # [c0, c1, ..., c31] -> [c0, c0, c1, c1, ..., c31, c31]
+    # This uses repeat_interleave which is more compiler-friendly than stack+flatten
+    cos = cos.repeat_interleave(2, dim=-1)  # [S, D]
+    sin = sin.repeat_interleave(2, dim=-1)  # [S, D]
+
+    # Expand dims for broadcasting: [S, D] -> [1, S, 1, D]
+    cos = cos.unsqueeze(0).unsqueeze(2)
+    sin = sin.unsqueeze(0).unsqueeze(2)
 
     # Move to same device as x
     cos = cos.to(x.device)
     sin = sin.to(x.device)
 
     # For use_real_unbind_dim == -1 (default for QwenImage)
-    # Split x into real and imaginary parts
+    # x is stored as [x0_real, x0_imag, x1_real, x1_imag, ...]
+    # x_rotated should be [-x0_imag, x0_real, -x1_imag, x1_real, ...]
     if use_real_unbind_dim == -1:
-        # x: [B, S, H, D] -> reshape to [B, S, H, D//2, 2] -> unbind
-        x_reshape = x.reshape(*x.shape[:-1], -1, 2)
-        x_real, x_imag = x_reshape.unbind(-1)  # Each [B, S, H, D//2]
-        x_rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(-2)  # [B, S, H, D]
+        # Reshape to separate real/imag pairs, then create rotated version
+        # Use view instead of reshape for better tracing
+        orig_shape = x.shape
+        x_reshape = x.view(orig_shape[0], orig_shape[1], orig_shape[2], -1, 2)  # [B, S, H, D//2, 2]
+        # Create rotated: [-imag, real] for each pair
+        x_rotated = torch.cat([-x_reshape[..., 1:2], x_reshape[..., 0:1]], dim=-1)  # [B, S, H, D//2, 2]
+        x_rotated = x_rotated.view(orig_shape)  # [B, S, H, D]
+
     elif use_real_unbind_dim == -2:
-        x_reshape = x.reshape(*x.shape[:-1], 2, -1)
-        x_real, x_imag = x_reshape.unbind(-2)
+        # x is stored as [x0_real, x1_real, ..., x0_imag, x1_imag, ...]
+        half_d = x.shape[-1] // 2
+        x_real = x[..., :half_d]
+        x_imag = x[..., half_d:]
         x_rotated = torch.cat([-x_imag, x_real], dim=-1)
     else:
         raise ValueError(f"use_real_unbind_dim={use_real_unbind_dim} but should be -1 or -2.")
 
-    # Need to expand cos/sin to match x shape
-    # cos, sin: [1, S, 1, D//2] need to become [1, S, 1, D] by repeating
-    cos = cos.repeat(1, 1, 1, 2)  # [1, S, 1, D]
-    sin = sin.repeat(1, 1, 1, 2)  # [1, S, 1, D]
-
-    # Apply rotation: x * cos + x_rotated * sin
+    # Apply rotation: out = x * cos + x_rotated * sin
     out = (x.float() * cos + x_rotated.float() * sin).to(x.dtype)
 
     return out

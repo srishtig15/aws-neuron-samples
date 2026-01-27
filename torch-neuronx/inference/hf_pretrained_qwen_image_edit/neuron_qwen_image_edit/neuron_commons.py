@@ -55,6 +55,7 @@ class NeuronTextEncoderWrapper(nn.Module):
     """
     def __init__(self, original_text_encoder, compiled_vision_encoder=None,
                  compiled_language_model=None, cpu_language_model=None,
+                 cpu_vision_encoder=None,  # NEW: Option to use CPU vision encoder
                  image_size=448, max_seq_len=512):
         super().__init__()
         # Copy config (small object)
@@ -86,6 +87,10 @@ class NeuronTextEncoderWrapper(nn.Module):
         # Compiled models
         self.compiled_vision_encoder = compiled_vision_encoder
         self.compiled_language_model = compiled_language_model
+
+        # CPU Vision Encoder (for better accuracy, avoids compilation precision loss)
+        self.cpu_vision_encoder = cpu_vision_encoder
+        self.use_cpu_vision_encoder = cpu_vision_encoder is not None
 
         # CPU Language Model (alternative to compiled, avoids GQA alignment issues)
         self.cpu_language_model = cpu_language_model
@@ -208,8 +213,13 @@ class NeuronTextEncoderWrapper(nn.Module):
             # Ensure pixel_values is bfloat16 and correct shape
             pixel_values = pixel_values.to(torch.bfloat16)
 
-            # Use compiled vision encoder or CPU fallback
-            if self.compiled_vision_encoder is not None:
+            # Option 1: Use CPU Vision Encoder (highest accuracy)
+            if self.use_cpu_vision_encoder:
+                with torch.no_grad():
+                    image_embeds = self.cpu_vision_encoder(pixel_values, image_grid_thw)
+
+            # Option 2: Use compiled Vision Encoder (faster but may have precision loss)
+            elif self.compiled_vision_encoder is not None:
                 # Check if we need to pad/reshape to expected size
                 expected_patches = (self.image_size // self.patch_size) ** 2  # 1024 for 448x448
                 actual_patches = pixel_values.shape[0]
@@ -236,10 +246,11 @@ class NeuronTextEncoderWrapper(nn.Module):
                 image_embeds = self.compiled_vision_encoder(pixel_values, image_grid_thw)
                 # Note: merger is already included in compiled_vision_encoder
             else:
-                # No vision encoder compiled - this should not happen in full Neuron mode
+                # No vision encoder available
                 raise RuntimeError(
-                    "Vision encoder not compiled! Please compile the vision encoder first:\n"
-                    "  python neuron_qwen_image_edit/compile_text_encoder.py --vision_only"
+                    "No vision encoder available! Please either:\n"
+                    "  1. Compile: python neuron_qwen_image_edit/compile_text_encoder.py --vision_only\n"
+                    "  2. Use --cpu_vision_encoder flag"
                 )
         else:
             image_embeds = None

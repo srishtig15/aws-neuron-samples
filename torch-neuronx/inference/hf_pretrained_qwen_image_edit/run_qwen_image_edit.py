@@ -519,9 +519,17 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     import gc
 
     # Check for vision encoder mode
+    # --neuron_vision_encoder overrides default --cpu_vision_encoder
     vision_encoder_tp_path = f"{compiled_models_dir}/vision_encoder_tp"
     use_vision_tp = args.vision_tp if hasattr(args, 'vision_tp') else False
-    vision_mode = "TP=8" if (use_vision_tp or os.path.exists(vision_encoder_tp_path)) else "single device"
+    use_neuron_vision = getattr(args, 'neuron_vision_encoder', False)
+    use_cpu_vision_encoder = not use_neuron_vision  # Default to CPU unless --neuron_vision_encoder
+    if use_cpu_vision_encoder:
+        vision_mode = "CPU (highest accuracy, default)"
+    elif use_vision_tp or os.path.exists(vision_encoder_tp_path):
+        vision_mode = "TP=8"
+    else:
+        vision_mode = "single device"
 
     print("\n" + "=" * 60)
     print("Loading Compiled Models for Trainium2")
@@ -604,10 +612,20 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
 
     # Load Vision Encoder
     # Check for TP version first (better memory distribution), then single device
-    # Note: vision_encoder_tp_path and use_vision_tp are defined at the top of this function
+    # Note: vision_encoder_tp_path, use_vision_tp, use_cpu_vision_encoder are defined at the top
     vision_encoder_single_path = f"{compiled_models_dir}/vision_encoder/model.pt"
+    compiled_vision_encoder = None
+    cpu_vision_encoder = None
 
-    if use_vision_tp or (os.path.exists(vision_encoder_tp_path) and not os.path.exists(vision_encoder_single_path)):
+    if use_cpu_vision_encoder:
+        # CPU Vision Encoder mode - highest accuracy, avoids compilation precision loss
+        # This is useful when compiled vision encoder produces blurry outputs
+        print("  Using CPU Vision Encoder (highest accuracy)...")
+        # Extract vision encoder from text encoder - will be passed to wrapper
+        cpu_vision_encoder = pipe.text_encoder.model.visual
+        cpu_vision_encoder.eval()
+        print("  Vision encoder prepared on CPU!")
+    elif use_vision_tp or (os.path.exists(vision_encoder_tp_path) and not os.path.exists(vision_encoder_single_path)):
         # Load TP-compiled vision encoder
         if not os.path.exists(vision_encoder_tp_path):
             raise FileNotFoundError(
@@ -671,15 +689,18 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
         compiled_vision_encoder=compiled_vision_encoder,
         compiled_language_model=compiled_language_model,
         cpu_language_model=cpu_language_model,
+        cpu_vision_encoder=cpu_vision_encoder,
         image_size=args.image_size,
         max_seq_len=args.max_sequence_length
     )
 
-    if use_cpu_language_model:
-        # When using CPU language model, we keep it - don't delete
-        # Only delete other parts of the original text encoder
+    if use_cpu_language_model or use_cpu_vision_encoder:
+        # When using CPU models, we keep references - don't delete original
         print("  Text encoder wrapper created!")
-        print("  Language model kept on CPU, other components deleted.")
+        if use_cpu_language_model:
+            print("  Language model kept on CPU.")
+        if use_cpu_vision_encoder:
+            print("  Vision encoder kept on CPU (highest accuracy mode).")
     else:
         # Delete original text encoder to free ~16GB memory
         del original_text_encoder
@@ -797,6 +818,87 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     return pipe
 
 
+def debug_text_encoder(pipe, input_images, args):
+    """
+    Debug: Compare NeuronTextEncoderWrapper output vs CPU.
+
+    This function helps identify if text encoder is causing output issues.
+    """
+    import torch.nn.functional as F
+
+    print("\nPreparing test input...")
+
+    # Prepare input like the pipeline does
+    prompt = args.prompt
+    if isinstance(input_images, list):
+        base_img_prompt = "".join([f"Picture {i+1}: <|vision_start|><|image_pad|><|vision_end|>" for i in range(len(input_images))])
+        images = input_images
+    else:
+        base_img_prompt = "Picture 1: <|vision_start|><|image_pad|><|vision_end|>"
+        images = [input_images]
+
+    template = pipe.prompt_template_encode
+    txt = [template.format(base_img_prompt + prompt)]
+
+    model_inputs = pipe.processor(
+        text=txt,
+        images=images,
+        padding=True,
+        return_tensors="pt",
+    )
+
+    print(f"  input_ids: {model_inputs.input_ids.shape}")
+    print(f"  pixel_values: {model_inputs.pixel_values.shape}")
+    print(f"  image_grid_thw: {model_inputs.image_grid_thw.tolist()}")
+
+    # Count image tokens
+    image_token_id = pipe.text_encoder.config.image_token_id if hasattr(pipe.text_encoder, 'config') else 151655
+    num_image_tokens = (model_inputs.input_ids == image_token_id).sum().item()
+    print(f"  Image tokens in input: {num_image_tokens}")
+
+    # Run the wrapper (which is what inference uses)
+    print("\nRunning NeuronTextEncoderWrapper...")
+    with torch.no_grad():
+        wrapper_output = pipe.text_encoder(
+            input_ids=model_inputs.input_ids,
+            attention_mask=model_inputs.attention_mask,
+            pixel_values=model_inputs.pixel_values.to(torch.bfloat16),
+            image_grid_thw=model_inputs.image_grid_thw,
+            output_hidden_states=True,
+        )
+
+    if hasattr(wrapper_output, 'hidden_states'):
+        wrapper_hidden = wrapper_output.hidden_states[-1]
+    else:
+        wrapper_hidden = wrapper_output.last_hidden_state
+
+    print(f"  Wrapper output shape: {wrapper_hidden.shape}")
+    print(f"  Wrapper output stats: mean={wrapper_hidden.float().mean():.4f}, std={wrapper_hidden.float().std():.4f}")
+    print(f"  Wrapper output range: [{wrapper_hidden.float().min():.4f}, {wrapper_hidden.float().max():.4f}]")
+
+    # Check for NaN/Inf
+    has_nan = torch.isnan(wrapper_hidden).any().item()
+    has_inf = torch.isinf(wrapper_hidden).any().item()
+    if has_nan:
+        print("  [WARNING] Output contains NaN!")
+    if has_inf:
+        print("  [WARNING] Output contains Inf!")
+
+    # Save intermediate results for debugging
+    debug_data = {
+        'input_ids': model_inputs.input_ids.cpu().numpy(),
+        'attention_mask': model_inputs.attention_mask.cpu().numpy(),
+        'pixel_values_shape': list(model_inputs.pixel_values.shape),
+        'image_grid_thw': model_inputs.image_grid_thw.cpu().numpy(),
+        'wrapper_output': wrapper_hidden.float().cpu().numpy(),
+    }
+
+    import numpy as np
+    np.savez('debug_text_encoder_output.npz', **debug_data)
+    print("\n  Debug data saved to: debug_text_encoder_output.npz")
+    print("  To compare with CPU, load original pipeline and run the same inputs.")
+
+
 def run_inference(args):
     """Run image editing inference on Trainium2."""
     set_seed(args.seed)
@@ -811,6 +913,17 @@ def run_inference(args):
     # Load original pipeline
     print("\nLoading original pipeline...")
     dtype = torch.bfloat16
+
+    # CRITICAL FIX: Override VAE_IMAGE_SIZE before loading pipeline
+    # The pipeline uses VAE_IMAGE_SIZE (default 1024*1024) to resize source images.
+    # This creates more patches than our compiled transformer expects.
+    # We need to match our compiled dimensions.
+    import diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus as qwen_pipeline_module
+    compiled_vae_pixels = args.compiled_height * args.compiled_width  # e.g., 512*512
+    original_vae_size = getattr(qwen_pipeline_module, 'VAE_IMAGE_SIZE', 1024*1024)
+    qwen_pipeline_module.VAE_IMAGE_SIZE = compiled_vae_pixels
+    print(f"\nOverriding VAE_IMAGE_SIZE: {original_vae_size} -> {compiled_vae_pixels}")
+    print(f"  (This ensures source images produce {args.compiled_height//8//2}x{args.compiled_width//8//2} patches)")
 
     pipe = QwenImageEditPlusPipeline.from_pretrained(
         MODEL_ID,
@@ -847,6 +960,14 @@ def run_inference(args):
 
     # Use single image or list based on count
     input_images = source_images[0] if len(source_images) == 1 else source_images
+
+    # Debug: Compare text encoder outputs
+    if args.debug_text_encoder:
+        print("\n" + "="*60)
+        print("[DEBUG] Text Encoder Comparison")
+        print("="*60)
+        debug_text_encoder(pipe, input_images, args)
+        print("="*60 + "\n")
 
     # Create generator for reproducibility
     generator = torch.Generator().manual_seed(args.seed)
@@ -969,6 +1090,14 @@ if __name__ == "__main__":
                         help="Use Neuron-compiled Language Model instead of CPU. "
                              "Requires compiled model with correct TP degree (usually TP=4).")
 
+    # Vision encoder mode
+    parser.add_argument("--cpu_vision_encoder", action="store_true", default=True,
+                        help="Run Vision Encoder on CPU for higher accuracy (default). "
+                             "Compiled Vision Encoder has precision loss that gets amplified by LM.")
+    parser.add_argument("--neuron_vision_encoder", action="store_true",
+                        help="Use Neuron-compiled Vision Encoder instead of CPU. "
+                             "May have lower accuracy but faster speed.")
+
     # Inference settings
     parser.add_argument("--num_inference_steps", type=int, default=40,
                         help="Number of denoising steps (default: 40)")
@@ -994,6 +1123,9 @@ if __name__ == "__main__":
     parser.add_argument("--cpu_vae_decode", action="store_true",
                         help="[DEBUG] Run VAE decoder on CPU instead of Neuron. "
                              "Use this to verify if other components are working correctly.")
+    parser.add_argument("--debug_text_encoder", action="store_true",
+                        help="[DEBUG] Compare Text Encoder outputs before running inference. "
+                             "This helps identify if text encoder is the source of issues.")
 
     args = parser.parse_args()
 
