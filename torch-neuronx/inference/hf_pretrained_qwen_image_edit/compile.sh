@@ -21,7 +21,7 @@ WIDTH=${2:-512}
 IMAGE_SIZE=${3:-224}  # Vision encoder image size (must be divisible by 14 and result in even grid)
 TP_DEGREE=${4:-8}
 MAX_SEQ_LEN=${5:-512}
-PATCH_MULTIPLIER=${6:-2}  # 2 for image editing, 1 for generation
+PATCH_MULTIPLIER=${6:-3}  # 3 for 2 images merging, 2 for image editing, 1 for generation
 
 echo "============================================"
 echo "Qwen-Image-Edit-2509 Compilation for Neuron"
@@ -36,19 +36,19 @@ echo ""
 
 # Step 1: Download the model
 echo "[Step 1/4] Downloading model..."
-python neuron_qwen_image_edit/cache_hf_model.py
+# python neuron_qwen_image_edit/cache_hf_model.py
 echo "Model downloaded successfully!"
 echo ""
 
 # Step 2: Compile VAE (encoder and decoder)
 echo "[Step 2/4] Compiling VAE..."
 echo "Using modified VAE with 'nearest' interpolation (Neuron doesn't support 'nearest-exact')"
-python neuron_qwen_image_edit/compile_vae.py \
-    --height ${HEIGHT} \
-    --width ${WIDTH} \
-    --temporal_frames 1 \
-    --compiled_models_dir ${COMPILED_MODELS_DIR} \
-    --compiler_workdir ${COMPILER_WORKDIR}
+# python neuron_qwen_image_edit/compile_vae.py \
+#     --height ${HEIGHT} \
+#     --width ${WIDTH} \
+#     --temporal_frames 1 \
+#     --compiled_models_dir ${COMPILED_MODELS_DIR} \
+#     --compiler_workdir ${COMPILER_WORKDIR}
 echo "VAE compiled successfully!"
 echo ""
 
@@ -72,14 +72,14 @@ echo "Note: Text encoder (Qwen2.5-VL) has two components:"
 echo "  - Vision Encoder (32 blocks) - single device (dimensions not divisible by TP=8)"
 echo "  - Language Model (28 layers, TP=${TP_DEGREE})"
 echo "  Using --use_subprocess to avoid XLA initialization conflicts"
-python neuron_qwen_image_edit/compile_text_encoder.py \
-    --mode separate \
-    --use_subprocess \
-    --image_size ${IMAGE_SIZE} \
-    --max_sequence_length ${MAX_SEQ_LEN} \
-    --tp_degree ${TP_DEGREE} \
-    --compiled_models_dir ${COMPILED_MODELS_DIR} \
-    --compiler_workdir ${COMPILER_WORKDIR}
+# python neuron_qwen_image_edit/compile_text_encoder.py \
+#     --mode separate \
+#     --use_subprocess \
+#     --image_size ${IMAGE_SIZE} \
+#     --max_sequence_length ${MAX_SEQ_LEN} \
+#     --tp_degree ${TP_DEGREE} \
+#     --compiled_models_dir ${COMPILED_MODELS_DIR} \
+#     --compiler_workdir ${COMPILER_WORKDIR}
 echo "Text Encoder compiled!"
 echo ""
 
@@ -104,11 +104,11 @@ echo "      --patch_multiplier ${PATCH_MULTIPLIER} \\"
 echo "      --max_sequence_length ${MAX_SEQ_LEN}"
 echo ""
 
-# batch_size=1 (无 CFG，默认)                                                                                                                                                                                           
-NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png --prompt "把女生变成男生" --transformer_batch_size 1 --warmup
+# # batch_size=1 (无 CFG，默认)                                                                                                                                                                                           
+# NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png --prompt "把女生变成男生" --transformer_batch_size 1 --warmup
 
 # # batch_size=2 (有 CFG，需要用 batch_size=2 编译 transformer)                                                                                                                                                           
-# NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png --prompt "把女生变成男生" --transformer_batch_size 2 --guidance_scale 7.5
+# NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png --prompt "把女生变成男生" --transformer_batch_size 2 --guidance_scale 7.5 --warmup
 
-# # batch_size=1 (无 CFG，默认) 多图输入示例
-# NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "根据这图1中女性和图2中的男性，生成一组结婚照，并遵循以下描述：新郎穿着红色的中式马褂，新娘穿着精致的秀禾服，头戴金色凤冠。他们并肩站立在古老的朱红色宫墙前，背景是雕花的木窗。光线明亮柔和，构图对称，氛围喜庆而隆重。" --transformer_batch_size 1                                                                                                                  
+# batch_size=1 (无 CFG，默认) 多图输入示例
+NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "根据这图1中女性和图2中的男性，生成一组结婚照，并遵循以下描述：新郎穿着红色的中式马褂，新娘穿着精致的秀禾服，头戴金色凤冠。他们并肩站立在古老的朱红色宫墙前，背景是雕花的木窗。光线明亮柔和，构图对称，氛围喜庆而隆重。" --transformer_batch_size 1 --patch_multiplier 3 --warmup
