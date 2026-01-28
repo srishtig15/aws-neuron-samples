@@ -5,8 +5,13 @@ os.environ["XLA_DISABLE_FUNCTIONALIZATION"] = "0"
 os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "2"  # For trn2
 os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2"  # For trn2
 
-# Compiler flags based on wan2.2 reference
-compiler_flags = """ --target=trn2 --lnc=2 --internal-hlo2tensorizer-options='--fuse-dot-logistic=false' --model-type=transformer --enable-fast-loading-neuron-binaries """  #  --verbose=INFO
+# Compiler flags optimized for transformer models (based on Flux reference)
+# Key optimizations:
+# - --model-type=transformer: Enables transformer-specific optimizations
+# - --enable-ccop-compute-overlap: Overlaps communication with computation
+# - --auto-cast=none: Preserves bfloat16 precision
+# - -O1: Basic optimization level (O2 can cause issues with some models)
+compiler_flags = """ --target=trn2 --lnc=2 --model-type=transformer -O1 --auto-cast=none --enable-fast-loading-neuron-binaries --tensorizer-options='--enable-ccop-compute-overlap' --internal-hlo2tensorizer-options='--fuse-dot-logistic=false' """
 os.environ["NEURON_CC_FLAGS"] = os.environ.get("NEURON_CC_FLAGS", "") + compiler_flags
 
 import torch
@@ -18,13 +23,15 @@ from torch import nn
 from diffusers import QwenImageEditPlusPipeline
 from diffusers.models.transformers.transformer_qwenimage import QwenImageTransformer2DModel
 
-from neuron_commons import attention_wrapper_for_transformer
+from neuron_commons import neuron_scaled_dot_product_attention
 from neuron_parallel_utils import shard_qwen_attention, shard_feedforward, shard_modulation
 from neuron_rope import patch_qwenimage_rope
 
-# Note: Do NOT override SDPA globally during compilation
-# The diffusers attention processor handles attention internally
-# torch.nn.functional.scaled_dot_product_attention = attention_wrapper_for_transformer
+# Override SDPA globally for Neuron compatibility during compilation
+# NOTE: NKI Flash Attention kernel doesn't work with parallel_model_trace (XLA tracing limitation)
+# Using basic attention implementation instead
+print("Using Neuron-compatible SDPA for compilation")
+torch.nn.functional.scaled_dot_product_attention = neuron_scaled_dot_product_attention
 
 CACHE_DIR = "/opt/dlami/nvme/qwen_image_edit_hf_cache_dir"
 MODEL_ID = "Qwen/Qwen-Image-Edit-2509"

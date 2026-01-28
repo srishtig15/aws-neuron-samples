@@ -77,25 +77,55 @@ The Q-KV mapping cannot be preserved with TP=8. Valid TP degrees: 1, 2, or 4.
 
 ## Performance Notes
 
-Current performance on TRN2 for 1024x1024 with 2-image merge:
-- Vision Encoder: ~0.4s
-- Language Model (CPU): ~2.0s
-- VAE encode: ~0.4s
-- VAE decode: ~0.6s
-- **Transformer: ~2.8s/step** (bottleneck)
+### Current Performance (Optimized)
 
-For comparison, H100 achieves ~0.75s/step for transformer.
+Performance on TRN2 for 1024x1024 with 2-image merge (40 steps, CFG enabled):
 
-### Attempted Optimization: NKI Flash Attention
+| Component | Time |
+|-----------|------|
+| Vision Encoder (CPU, first call) | ~21s |
+| Vision Encoder (CPU, cached) | ~0.7s |
+| Language Model (CPU) | ~1-4s |
+| VAE encode | ~0.4s |
+| VAE decode | ~1.6s |
+| **Transformer** | **~1.9s/step** |
 
-Attempted to use `neuronx_distributed.kernels.flash_attn.nki_flash_attn_func` for transformer attention.
+**Total inference time**: ~190s (40 steps × 2 CFG passes)
 
-**Result**: NKI Flash Attention is not compatible with XLA tracing - it returns incorrect symbolic shapes during `neuronx_distributed.trace.parallel_model_trace`. The kernel may be designed for training scenarios or requires different integration.
+### Performance Comparison
 
-**Current Status**: Using standard SDPA attention. Further optimization may require:
-- Updated neuronx-distributed with better flash attention support
-- Different compilation approach
-- Consultation with AWS Neuron team
+| Platform | Transformer Speed | Relative |
+|----------|------------------|----------|
+| H100 (without Flash Attention) | ~0.75s/step | 1.0x |
+| TRN2 (optimized) | ~1.9s/step | 2.5x slower |
+
+### Compiler Optimizations Applied
+
+The following compiler flags provide ~32% speedup over baseline:
+
+```python
+compiler_flags = """
+    --target=trn2
+    --lnc=2
+    --model-type=transformer              # Transformer-specific optimizations
+    -O1                                   # Optimization level
+    --auto-cast=none                      # Preserve bfloat16 precision
+    --tensorizer-options='--enable-ccop-compute-overlap'  # Key: overlap comm/compute
+    --enable-fast-loading-neuron-binaries
+"""
+```
+
+**Key optimization**: `--enable-ccop-compute-overlap` allows tensor parallel communication (all-reduce) to overlap with computation, significantly reducing synchronization overhead.
+
+### NKI Flash Attention Status
+
+Attempted to use NKI Flash Attention kernel (`neuronxcc.nki._private_kernels.attention.attention_isa_kernel`), which is used by Flux on Neuron.
+
+**Result**: NKI kernel is not compatible with `parallel_model_trace` (V1 API) due to XLA tracing limitations - the kernel's output parameter cannot be modified during tracing.
+
+**Workaround**: Would require migration to `ModelBuilder` API (V2), but V2 has RoPE buffer constant-folding issues that produce incorrect outputs.
+
+**Current Status**: Using standard SDPA attention with compiler optimizations.
 
 ## File Reference
 

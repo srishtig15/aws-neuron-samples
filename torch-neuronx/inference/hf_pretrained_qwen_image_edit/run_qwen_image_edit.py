@@ -64,7 +64,6 @@ from neuron_qwen_image_edit.autoencoder_kl_qwenimage_neuron import (
 )
 from neuron_qwen_image_edit.neuron_commons import NeuronTextEncoderWrapper
 
-
 # Constants
 COMPILED_MODELS_DIR = "/opt/dlami/nvme/compiled_models"
 HUGGINGFACE_CACHE_DIR = "/opt/dlami/nvme/qwen_image_edit_hf_cache_dir"

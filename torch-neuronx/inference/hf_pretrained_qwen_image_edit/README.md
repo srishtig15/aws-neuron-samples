@@ -204,12 +204,47 @@ Shapes are not compatible: f32[1,2048,3,128] vs f32[1,1024,1,128]
 ```
 **Solution**: Ensure `patch_multiplier` matches between compilation and inference.
 
+## Performance
+
+### Benchmark Results (1024x1024, 2-image merge, 40 steps with CFG)
+
+| Platform | Transformer Speed | Total Time |
+|----------|------------------|------------|
+| H100 (without Flash Attention) | ~0.75s/step | ~60s |
+| TRN2 (TP=8, optimized) | **~1.9s/step** | ~190s |
+
+### Compiler Optimizations
+
+The following compiler flags are used for optimal performance:
+
+```python
+--model-type=transformer      # Transformer-specific optimizations
+-O1                           # Optimization level
+--auto-cast=none              # Preserve bfloat16 precision
+--tensorizer-options='--enable-ccop-compute-overlap'  # Overlap communication with computation
+```
+
+The `--enable-ccop-compute-overlap` flag is particularly important for tensor parallelism, as it allows all-reduce operations to overlap with computation, reducing synchronization overhead.
+
+### Component Timing Breakdown
+
+| Component | Time |
+|-----------|------|
+| Vision Encoder (CPU, first call) | ~21s |
+| Vision Encoder (CPU, cached) | ~0.7s |
+| Language Model (CPU) | ~1-4s |
+| VAE Encode | ~0.4s |
+| **Transformer (40 steps × 2 CFG)** | **~152s** |
+| VAE Decode | ~1.6s |
+
+The transformer is the main bottleneck, accounting for ~80% of total inference time.
+
 ## Known Limitations
 
 1. **Fixed dimensions**: Models are compiled for specific dimensions. Different sizes require recompilation.
 2. **Language model**: Runs on CPU due to GQA architecture (28Q/4KV heads incompatible with TP=8).
 3. **Sequence length**: Must match between compilation and inference.
-4. **Performance**: Transformer is the bottleneck (~2.8s/step on TRN2 vs ~0.75s/step on H100 for 1024x1024 with 2-image merge).
+4. **NKI Flash Attention**: Not available with `parallel_model_trace` API due to XLA tracing limitations. Would require migration to `ModelBuilder` API.
 
 ## References
 

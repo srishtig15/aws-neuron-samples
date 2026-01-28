@@ -8,12 +8,19 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLForCond
 # Try to import NKI kernel, but don't fail if not available
 try:
     import neuronxcc.nki as nki
-    from neuronxcc.nki._private_kernels.attention import attention_isa_kernel
+    from neuronxcc.nki.language import nc
+    try:
+        from neuronxcc.nki._private_kernels.attention import attention_isa_kernel
+    except ImportError:
+        from neuronxcc.nki.kernels.attention import attention_isa_kernel
     _flash_fwd_call = nki.jit()(attention_isa_kernel)
     NKI_AVAILABLE = True
-except ImportError:
+    print(f"NKI Flash Attention kernel loaded successfully")
+except ImportError as e:
     _flash_fwd_call = None
     NKI_AVAILABLE = False
+    nc = None
+    print(f"NKI Flash Attention not available: {e}")
 
 
 class InferenceTextEncoderWrapper(nn.Module):
@@ -435,7 +442,8 @@ class f32Wrapper(nn.Module):
 
 
 def neuron_scaled_dot_product_attention(query, key, value, attn_mask=None,
-                                         dropout_p=None, is_causal=None, scale=None):
+                                         dropout_p=None, is_causal=None, scale=None,
+                                         enable_gqa=False, **kwargs):
     """Custom scaled dot product attention optimized for Neuron.
 
     Supports:
@@ -522,6 +530,8 @@ def attention_wrapper_sharded_without_swap(query, key, value):
     Note: This kernel requires Q, K, V to have the same sequence length.
     For cross-attention with different lengths, fall back to basic attention.
     """
+    import os
+
     bs, n_head, q_len, d_head = query.shape
     _, _, kv_len, _ = key.shape
 
@@ -530,19 +540,26 @@ def attention_wrapper_sharded_without_swap(query, key, value):
         # Fall back to basic attention
         return neuron_scaled_dot_product_attention(query, key, value)
 
+    # Reshape for NKI kernel: expects [bs*n_head, d_head, seq_len] for Q, K
+    # and [bs*n_head, seq_len, d_head] for V
     q = query.clone().permute(0, 1, 3, 2).reshape((bs*n_head, d_head, q_len))
     k = key.clone().permute(0, 1, 3, 2).reshape((bs*n_head, d_head, kv_len))
     v = value.clone().reshape((bs*n_head, kv_len, d_head))
     attn_output = torch.zeros((bs*n_head, q_len, d_head), dtype=torch.bfloat16, device=q.device)
 
-    # Use sharded attention kernel for trn2
-    use_sharded_attention_kernel = True
+    # Compute scale: 1/sqrt(d_head)
+    scale = 1.0 / math.sqrt(d_head)
+
+    # Check if using virtual core size 2 (TRN2 default)
+    vc_size = int(os.getenv("NEURON_RT_VIRTUAL_CORE_SIZE", "2"))
+    use_sharded_attention_kernel = (vc_size == 2)
+
     if use_sharded_attention_kernel:
-        grid = (2,)
-        _flash_fwd_call[grid](q, k, v, 0.117, attn_output,
+        grid = (nc(2),)
+        _flash_fwd_call[grid](q, k, v, scale, attn_output,
                               kernel_name="AttentionMMSoftmaxMMWithoutSwap")
     else:
-        _flash_fwd_call(q, k, v, 0.117, attn_output,
+        _flash_fwd_call(q, k, v, scale, attn_output,
                         kernel_name="AttentionMMSoftmaxMMWithoutSwap")
 
     attn_output = attn_output.reshape((bs, n_head, q_len, d_head))
@@ -573,15 +590,35 @@ def attention_wrapper(query, key, value, attn_mask=None, dropout_p=None, is_caus
 
 def attention_wrapper_for_transformer(query, key, value, attn_mask=None,
                                        dropout_p=None, is_causal=None,
-                                       scale=None):
-    """Attention wrapper for transformer.
+                                       scale=None, enable_gqa=False):
+    """Attention wrapper for transformer using NKI Flash Attention kernel.
 
-    Uses basic softmax attention for better compatibility during compilation.
-    NKI kernel can be enabled later for performance optimization.
+    Uses NKI kernel for optimal performance on Trainium2.
+    Falls back to basic attention for incompatible shapes.
     """
-    # For now, use basic attention for better compatibility
-    # NKI kernel has shape constraints that may not work with all attention patterns
-    return neuron_scaled_dot_product_attention(query, key, value,
-                                               attn_mask=attn_mask,
-                                               dropout_p=dropout_p,
-                                               is_causal=is_causal)
+    # Check if NKI kernel can be used:
+    # 1. NKI must be available
+    # 2. Q, K, V must have same sequence length (joint attention)
+    # 3. No attention mask (NKI doesn't support masks well)
+    # 4. Not causal attention
+
+    bs, n_head, q_len, d_head = query.shape
+    _, _, kv_len, _ = key.shape
+
+    use_nki = (
+        NKI_AVAILABLE and
+        _flash_fwd_call is not None and
+        q_len == kv_len and
+        attn_mask is None and
+        not is_causal
+    )
+
+    if use_nki:
+        # Use NKI Flash Attention kernel
+        return attention_wrapper_sharded_without_swap(query, key, value)
+    else:
+        # Fall back to basic attention
+        return neuron_scaled_dot_product_attention(query, key, value,
+                                                   attn_mask=attn_mask,
+                                                   dropout_p=dropout_p,
+                                                   is_causal=is_causal)
