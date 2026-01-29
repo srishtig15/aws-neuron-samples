@@ -6,9 +6,16 @@
 # Default settings:
 #   - Output size: 1024x1024
 #   - VAE tile size: 512x512 (fixed, uses tiled processing for larger images)
-#   - max_sequence_length: 512
+#   - max_sequence_length: 1024
 #   - tp_degree: 8 (for transformer)
-#   - patch_multiplier: 2 (for image editing mode)
+#   - patch_multiplier: 3 (for 2-image merging)
+#
+# Usage:
+#   ./compile.sh                    # Compile all (V1 + V2 + V1 Flash)
+#   ./compile.sh v1                 # Compile V1 only
+#   ./compile.sh v2                 # Compile V2 only
+#   ./compile.sh v1_flash           # Compile V1 Flash only (recommended, NKI Flash Attention)
+#   ./compile.sh 1024 1024 448 8 1024 3  # Custom dimensions
 
 set -e
 
@@ -18,6 +25,13 @@ COMPILER_WORKDIR="/opt/dlami/nvme/compiler_workdir"
 
 # Fixed VAE tile size (VAE uses tiled processing for larger images)
 VAE_TILE_SIZE=512
+
+# Check if first argument is version selector
+VERSION_MODE="all"
+if [[ "$1" == "v1" || "$1" == "v2" || "$1" == "v1_flash" ]]; then
+    VERSION_MODE="$1"
+    shift
+fi
 
 # Parse arguments
 HEIGHT=${1:-1024}
@@ -30,6 +44,7 @@ PATCH_MULTIPLIER=${6:-3}  # 2 for single image editing, 3 for 2 images merging, 
 echo "============================================"
 echo "Qwen-Image-Edit-2509 Compilation for Neuron"
 echo "============================================"
+echo "Transformer Version: ${VERSION_MODE}"
 echo "Output Size: ${HEIGHT}x${WIDTH}"
 echo "VAE Tile Size: ${VAE_TILE_SIZE}x${VAE_TILE_SIZE} (fixed)"
 echo "Vision Encoder Image Size: ${IMAGE_SIZE}"
@@ -60,15 +75,44 @@ echo ""
 # Step 3: Compile Transformer
 echo "[Step 3/4] Compiling Transformer..."
 echo "  TP=${TP_DEGREE}, patch_multiplier=${PATCH_MULTIPLIER} (for image editing)"
-python neuron_qwen_image_edit/compile_transformer.py \
-    --height ${HEIGHT} \
-    --width ${WIDTH} \
-    --tp_degree ${TP_DEGREE} \
-    --patch_multiplier ${PATCH_MULTIPLIER} \
-    --max_sequence_length ${MAX_SEQ_LEN} \
-    --compiled_models_dir ${COMPILED_MODELS_DIR} \
-    --compiler_workdir ${COMPILER_WORKDIR}
-echo "Transformer compiled successfully!"
+
+if [[ "$VERSION_MODE" == "all" || "$VERSION_MODE" == "v1" ]]; then
+    echo "  Compiling V1 (parallel_model_trace)..."
+    python neuron_qwen_image_edit/compile_transformer.py \
+        --height ${HEIGHT} \
+        --width ${WIDTH} \
+        --tp_degree ${TP_DEGREE} \
+        --patch_multiplier ${PATCH_MULTIPLIER} \
+        --max_sequence_length ${MAX_SEQ_LEN} \
+        --compiled_models_dir ${COMPILED_MODELS_DIR} \
+        --compiler_workdir ${COMPILER_WORKDIR}
+    echo "  V1 Transformer compiled successfully!"
+fi
+
+if [[ "$VERSION_MODE" == "all" || "$VERSION_MODE" == "v2" ]]; then
+    echo "  Compiling V2 (ModelBuilder)..."
+    python neuron_qwen_image_edit/compile_transformer_v2.py \
+        --height ${HEIGHT} \
+        --width ${WIDTH} \
+        --tp_degree ${TP_DEGREE} \
+        --patch_multiplier ${PATCH_MULTIPLIER} \
+        --max_sequence_length ${MAX_SEQ_LEN} \
+        --compiled_models_dir ${COMPILED_MODELS_DIR}
+    echo "  V2 Transformer compiled successfully!"
+fi
+
+if [[ "$VERSION_MODE" == "all" || "$VERSION_MODE" == "v1_flash" ]]; then
+    echo "  Compiling V1 Flash (NKI Flash Attention, recommended)..."
+    python neuron_qwen_image_edit/compile_transformer_v1_flash.py \
+        --height ${HEIGHT} \
+        --width ${WIDTH} \
+        --tp_degree ${TP_DEGREE} \
+        --patch_multiplier ${PATCH_MULTIPLIER} \
+        --max_sequence_length ${MAX_SEQ_LEN} \
+        --compiled_models_dir ${COMPILED_MODELS_DIR} \
+        --compiler_workdir ${COMPILER_WORKDIR}
+    echo "  V1 Flash Transformer compiled successfully!"
+fi
 echo ""
 
 # Step 4: Vision Encoder (Language Model runs on CPU)
@@ -91,18 +135,37 @@ echo ""
 echo "Compiled models saved to: ${COMPILED_MODELS_DIR}/"
 echo "  - vae_encoder/ (tile: ${VAE_TILE_SIZE}x${VAE_TILE_SIZE})"
 echo "  - vae_decoder/ (tile: ${VAE_TILE_SIZE}x${VAE_TILE_SIZE})"
-echo "  - transformer/ (TP=${TP_DEGREE}, output: ${HEIGHT}x${WIDTH})"
+if [[ "$VERSION_MODE" == "all" || "$VERSION_MODE" == "v1" ]]; then
+    echo "  - transformer/ (V1, TP=${TP_DEGREE}, output: ${HEIGHT}x${WIDTH})"
+fi
+if [[ "$VERSION_MODE" == "all" || "$VERSION_MODE" == "v2" ]]; then
+    echo "  - transformer_v2/ (V2, TP=${TP_DEGREE}, output: ${HEIGHT}x${WIDTH})"
+fi
+if [[ "$VERSION_MODE" == "all" || "$VERSION_MODE" == "v1_flash" ]]; then
+    echo "  - transformer_v1_flash/ (V1 Flash, TP=${TP_DEGREE}, output: ${HEIGHT}x${WIDTH}, NKI Flash Attention)"
+fi
+echo "  - vision_encoder/"
 echo ""
 echo "Note: Language model runs on CPU (GQA 28Q/4KV incompatible with TP=8)"
 echo ""
 echo "To run inference on Trainium2:"
+echo ""
+echo "  # V1 Flash (recommended, NKI Flash Attention):"
 echo "  python run_qwen_image_edit.py \\"
 echo "      --images input.jpg \\"
 echo "      --prompt \"your edit instruction\" \\"
-echo "      --height ${HEIGHT} \\"
-echo "      --width ${WIDTH} \\"
-echo "      --patch_multiplier ${PATCH_MULTIPLIER} \\"
-echo "      --max_sequence_length ${MAX_SEQ_LEN}"
+echo "      --use_v1_flash"
+echo ""
+echo "  # V2 (ModelBuilder):"
+echo "  python run_qwen_image_edit.py \\"
+echo "      --images input.jpg \\"
+echo "      --prompt \"your edit instruction\" \\"
+echo "      --use_v2"
+echo ""
+echo "  # V1:"
+echo "  python run_qwen_image_edit.py \\"
+echo "      --images input.jpg \\"
+echo "      --prompt \"your edit instruction\""
 echo ""
 
 # 单图编辑示例 (CFG默认开启，true_cfg_scale=4.0)
@@ -113,7 +176,5 @@ echo ""
 
 # 完整运行示例
 NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "根据这图1中女性和图2中的男性，生成一组结婚照，并遵循以下描述：新郎穿着红色的中式马褂，新娘穿着精致的秀禾服，头戴金色凤冠。他们并肩站立在古老的朱红色宫墙前，背景是雕花的木窗。光线明亮柔和，构图对称，氛围喜庆而隆重。" --patch_multiplier 3 --warmup
-
-python neuron_qwen_image_edit/compile_transformer_v2.py --height 1024 --width 1024 --patch_multiplier 3 
-
 NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "根据这图1中女性和图2中的男性，生成一组结婚照，并遵循以下描述：新郎穿着红色的中式马褂，新娘穿着精致的秀禾服，头戴金色凤冠。他们并肩站立在古老的朱红色宫墙前，背景是雕花的木窗。光线明亮柔和，构图对称，氛围喜庆而隆重。" --patch_multiplier 3 --warmup --use_v2
+NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "根据这图1中女性和图2中的男性，生成一组结婚照，并遵循以下描述：新郎穿着红色的中式马褂，新娘穿着精致的秀禾服，头戴金色凤冠。他们并肩站立在古老的朱红色宫墙前，背景是雕花的木窗。光线明亮柔和，构图对称，氛围喜庆而隆重。" --patch_multiplier 3 --warmup --use_v1_flash 

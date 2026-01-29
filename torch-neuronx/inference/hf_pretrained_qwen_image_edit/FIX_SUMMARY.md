@@ -98,8 +98,9 @@ Performance on TRN2 for 1024x1024 with 2-image merge (40 steps, CFG enabled):
 | Platform | Transformer Speed | Relative |
 |----------|------------------|----------|
 | H100 (without Flash Attention) | ~0.75s/step | 1.0x |
-| **TRN2 V2 (ModelBuilder)** | **~0.95s/step** | **1.3x slower** |
-| TRN2 V1 (parallel_model_trace) | ~1.9s/step | 2.5x slower |
+| **TRN2 V1 Flash (NKI)** | **~1.2s/step** | **1.6x slower** |
+| TRN2 V2 (ModelBuilder) | ~1.2s/step | 1.6x slower |
+| TRN2 V1 (parallel_model_trace) | ~2.4s/step | 3.2x slower |
 
 ### Compiler Optimizations Applied
 
@@ -119,14 +120,14 @@ compiler_flags = """
 
 **Key optimization**: `--enable-ccop-compute-overlap` allows tensor parallel communication (all-reduce) to overlap with computation, significantly reducing synchronization overhead.
 
-### V2 ModelBuilder API (2x Speedup)
+### V2 ModelBuilder API (2x Speedup over V1)
 
 V2 implementation using `ModelBuilder` API achieves ~2x speedup over V1:
 
 | API | Speed | Notes |
 |-----|-------|-------|
-| V2 (ModelBuilder) | ~0.95s/step | Pre-computed RoPE as input |
-| V1 (parallel_model_trace) | ~1.9s/step | RoPE computed inside model |
+| V2 (ModelBuilder) | ~1.2s/step | Pre-computed RoPE as input |
+| V1 (parallel_model_trace) | ~2.4s/step | RoPE computed inside model |
 
 **Key V2 Implementation Details**:
 1. RoPE frequencies pre-computed from original `QwenEmbedRope` model
@@ -134,11 +135,30 @@ V2 implementation using `ModelBuilder` API achieves ~2x speedup over V1:
 3. Uses `NxDModel.load()` with `set_weights()` and `to_neuron()` for loading
 4. Extracts first frame as noise prediction for scheduler compatibility
 
-### NKI Flash Attention Status
+### V1 Flash with NKI Flash Attention (Recommended)
 
-NKI Flash Attention kernel is **not compatible** with ModelBuilder/XLA tracing due to "immutable output parameter" limitation. The kernel requires a pre-allocated output tensor modified in-place, which XLA tracing doesn't support.
+V1 Flash combines the best of V1 and V2:
+- Uses `parallel_model_trace` API (supports NKI kernels)
+- Uses pre-computed RoPE (like V2)
+- Uses NKI Flash Attention kernel for hardware-optimized attention
 
-**Current Status**: V2 achieves 2x speedup using standard SDPA attention with compiler optimizations.
+| API | Speed | Notes |
+|-----|-------|-------|
+| **V1 Flash (NKI)** | **~1.2s/step** | NKI Flash Attention + pre-computed RoPE |
+| V2 (ModelBuilder) | ~1.2s/step | Pre-computed RoPE as input |
+| V1 (parallel_model_trace) | ~2.4s/step | RoPE computed inside model |
+
+**Key V1 Flash Implementation Details**:
+1. Disables XLA functionalization (`XLA_DISABLE_FUNCTIONALIZATION=1`) to allow NKI in-place operations
+2. Replaces diffusers' `Attention` class with custom `NKIQwenAttention` that directly calls NKI kernel
+3. Uses same NKI import path as Flux: `from torch_neuronx.xla_impl.ops import nki_jit`
+4. Pre-computes RoPE and passes as input tensors (same as V2)
+
+### NKI Flash Attention Compatibility
+
+NKI Flash Attention kernel is **not compatible** with ModelBuilder API due to XLA functionalization. The kernel requires in-place modification of output tensor, which XLA's functionalization converts to out-of-place operations.
+
+**Solution**: V1 Flash uses `parallel_model_trace` with `XLA_DISABLE_FUNCTIONALIZATION=1` to support NKI kernels.
 
 ## File Reference
 
@@ -149,6 +169,7 @@ NKI Flash Attention kernel is **not compatible** with ModelBuilder/XLA tracing d
 | `neuron_rope.py` | Neuron-compatible RoPE implementation |
 | `autoencoder_kl_qwenimage_neuron.py` | VAE with nearest interpolation |
 | `compile_transformer.py` | V1 transformer compilation (parallel_model_trace) |
-| `compile_transformer_v2.py` | V2 transformer compilation (ModelBuilder, 2x faster) |
+| `compile_transformer_v2.py` | V2 transformer compilation (ModelBuilder) |
+| `compile_transformer_v1_flash.py` | V1 Flash compilation (NKI Flash Attention, recommended) |
 | `compile_text_encoder.py` | Vision encoder compilation |
 | `compile_vae.py` | VAE encoder/decoder compilation |

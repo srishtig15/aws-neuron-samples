@@ -431,6 +431,198 @@ def load_transformer_v2(compiled_models_dir: str, pipe, args):
     return wrapper
 
 
+class NeuronTransformerWrapperV1Flash(torch.nn.Module):
+    """
+    Wrapper for V1 Flash compiled transformer (parallel_model_trace + NKI Flash Attention).
+
+    Key features:
+    - Uses parallel_model_trace API (supports NKI Flash Attention)
+    - RoPE frequencies are passed as input (like V2)
+    - Uses NKI Flash Attention for better performance
+    """
+    def __init__(self, original_transformer, compiled_transformer, img_rotary_emb, txt_rotary_emb,
+                 expected_num_patches=1024, expected_seq_len=512, temporal_frames=3):
+        super().__init__()
+        self.config = original_transformer.config
+        self.dtype = original_transformer.dtype
+        self.device = original_transformer.device
+        self.compiled_transformer = compiled_transformer
+
+        # Pre-computed RoPE frequencies
+        self.img_rotary_emb = img_rotary_emb
+        self.txt_rotary_emb = txt_rotary_emb
+
+        self.expected_num_patches = expected_num_patches
+        self.expected_seq_len = expected_seq_len
+        self.temporal_frames = temporal_frames
+        self.base_patches = expected_num_patches // temporal_frames
+
+    @contextlib.contextmanager
+    def cache_context(self, name: str):
+        """Dummy cache context for compatibility with pipeline."""
+        yield
+
+    def forward(self, hidden_states, encoder_hidden_states=None,
+                timestep=None, img_shapes=None, return_dict=False, **kwargs):
+        """Forward pass using V1 Flash compiled transformer with RoPE as input."""
+        batch_size = hidden_states.shape[0]
+
+        # Debug: Print shapes on first call
+        if not hasattr(self, '_debug_printed'):
+            print(f"DEBUG Transformer V1 Flash input shapes:")
+            print(f"  hidden_states: {hidden_states.shape}")
+            print(f"  encoder_hidden_states: {encoder_hidden_states.shape}")
+            print(f"  timestep: {timestep.shape}")
+            print(f"  img_rotary_emb: {self.img_rotary_emb.shape}")
+            print(f"  txt_rotary_emb: {self.txt_rotary_emb.shape}")
+            print(f"  temporal_frames: {self.temporal_frames}, base_patches: {self.base_patches}")
+            self._debug_printed = True
+
+        # Handle hidden_states padding
+        actual_patches = hidden_states.shape[1]
+        if actual_patches != self.expected_num_patches:
+            if actual_patches < self.expected_num_patches:
+                pad_size = self.expected_num_patches - actual_patches
+                padding = torch.zeros(
+                    (batch_size, pad_size, hidden_states.shape[2]),
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device
+                )
+                hidden_states = torch.cat([hidden_states, padding], dim=1)
+            else:
+                print(f"ERROR: hidden_states has {actual_patches} patches but model expects {self.expected_num_patches}")
+                hidden_states = hidden_states[:, :self.expected_num_patches, :]
+
+        # Handle encoder_hidden_states padding
+        actual_seq_len = encoder_hidden_states.shape[1]
+        if actual_seq_len != self.expected_seq_len:
+            if actual_seq_len < self.expected_seq_len:
+                pad_size = self.expected_seq_len - actual_seq_len
+                padding = torch.zeros(
+                    (batch_size, pad_size, encoder_hidden_states.shape[2]),
+                    dtype=encoder_hidden_states.dtype,
+                    device=encoder_hidden_states.device
+                )
+                encoder_hidden_states = torch.cat([encoder_hidden_states, padding], dim=1)
+            else:
+                print(f"WARNING: Truncating encoder_hidden_states from {actual_seq_len} to {self.expected_seq_len}")
+                encoder_hidden_states = encoder_hidden_states[:, :self.expected_seq_len, :]
+
+        # Convert timestep to float32
+        timestep = timestep.to(torch.float32)
+
+        # Run compiled transformer with RoPE as input
+        import time
+        _t_start = time.time()
+        output = self.compiled_transformer(
+            hidden_states,
+            encoder_hidden_states,
+            timestep,
+            self.img_rotary_emb,
+            self.txt_rotary_emb
+        )
+
+        # Profile
+        if not hasattr(self, '_step_count'):
+            self._step_count = 0
+            self._step_times = []
+        self._step_count += 1
+        self._step_times.append(time.time() - _t_start)
+        if self._step_count % 10 == 0:
+            avg_time = sum(self._step_times[-10:]) / 10
+            print(f"  [Profile] Transformer V1 Flash step {self._step_count}: avg {avg_time:.3f}s/step")
+
+        # Extract tensor from output
+        if isinstance(output, tuple):
+            output_tensor = output[0]
+        else:
+            output_tensor = output
+
+        # Extract first frame as noise prediction (same as V2)
+        output_tensor = output_tensor[:, :self.base_patches, :]
+
+        if return_dict:
+            from diffusers.models.modeling_outputs import Transformer2DModelOutput
+            return Transformer2DModelOutput(sample=output_tensor)
+        return (output_tensor,)
+
+
+def load_transformer_v1_flash(compiled_models_dir: str, pipe, args):
+    """
+    Load V1 Flash compiled transformer model using parallel_model_load.
+
+    V1 Flash models are compiled with parallel_model_trace and require:
+    1. Model files in transformer_v1_flash/ directory
+    2. rope_cache.pt - pre-computed RoPE tensors
+    3. config.json - model configuration
+
+    Args:
+        compiled_models_dir: Directory containing compiled model artifacts
+        pipe: Pipeline with original transformer (for config)
+        args: Command line arguments
+
+    Returns:
+        NeuronTransformerWrapperV1Flash wrapping the loaded model
+    """
+    import json
+
+    v1_flash_path = f"{compiled_models_dir}/transformer_v1_flash"
+    model_path = f"{v1_flash_path}/model"  # Model files are in subdirectory
+    rope_cache_path = f"{v1_flash_path}/rope_cache.pt"
+    config_path = f"{v1_flash_path}/config.json"
+
+    # Validate files exist
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(
+            f"V1 Flash transformer not found at {model_path}\n"
+            "Please run: python neuron_qwen_image_edit/compile_transformer_v1_flash.py"
+        )
+    if not os.path.exists(rope_cache_path):
+        raise FileNotFoundError(
+            f"V1 Flash RoPE cache not found at {rope_cache_path}\n"
+            "Please run: python neuron_qwen_image_edit/compile_transformer_v1_flash.py"
+        )
+
+    # Load config
+    print(f"  Loading V1 Flash config from {config_path}...")
+    with open(config_path, "r") as f:
+        config = json.load(f)
+
+    expected_num_patches = config["num_patches"]
+    expected_seq_len = config["text_seq_len"]
+    temporal_frames = config.get("frame", config.get("patch_multiplier", 3))
+    base_patches = expected_num_patches // temporal_frames
+    print(f"  V1 Flash config: patches={expected_num_patches}, seq_len={expected_seq_len}")
+    print(f"  V1 Flash config: temporal_frames={temporal_frames}, base_patches={base_patches}")
+    print(f"  NKI Flash Attention: {config.get('nki_flash_attention', False)}")
+
+    # Load pre-computed RoPE tensors
+    print(f"  Loading RoPE cache from {rope_cache_path}...")
+    rope_cache = torch.load(rope_cache_path)
+    img_rotary_emb = rope_cache["img_rotary_emb"].to(torch.bfloat16)
+    txt_rotary_emb = rope_cache["txt_rotary_emb"].to(torch.bfloat16)
+    print(f"  img_rotary_emb: {img_rotary_emb.shape}")
+    print(f"  txt_rotary_emb: {txt_rotary_emb.shape}")
+
+    # Load compiled model using parallel_model_load (from model subdirectory)
+    print(f"  Loading V1 Flash model from {model_path}...")
+    compiled_transformer = neuronx_distributed.trace.parallel_model_load(model_path)
+    print("  V1 Flash model loaded!")
+
+    # Create wrapper
+    wrapper = NeuronTransformerWrapperV1Flash(
+        original_transformer=pipe.transformer,
+        compiled_transformer=compiled_transformer,
+        img_rotary_emb=img_rotary_emb,
+        txt_rotary_emb=txt_rotary_emb,
+        expected_num_patches=expected_num_patches,
+        expected_seq_len=expected_seq_len,
+        temporal_frames=temporal_frames,
+    )
+
+    return wrapper
+
+
 class NeuronVAEWrapper(torch.nn.Module):
     """
     Wrapper for VAE with compiled encoder and decoder on Trainium2.
@@ -819,9 +1011,30 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     # IMPORTANT: Must load the largest TP model first to initialize
     # the communicator with the correct world size
     use_v2 = getattr(args, 'use_v2', False)
+    use_v1_flash = getattr(args, 'use_v1_flash', False)
     v2_available = os.path.exists(f"{compiled_models_dir}/transformer_v2/nxd_model.pt")
+    v1_flash_available = os.path.exists(f"{compiled_models_dir}/transformer_v1_flash")
 
-    if use_v2:
+    if use_v1_flash:
+        print("\n[1/3] Loading Transformer V1 Flash (parallel_model_trace + NKI Flash Attention, TP=8)...")
+        if not v1_flash_available:
+            raise FileNotFoundError(
+                f"Transformer V1 Flash not found at {compiled_models_dir}/transformer_v1_flash\n"
+                "Please run: python neuron_qwen_image_edit/compile_transformer_v1_flash.py"
+            )
+
+        # Store reference to original for wrapper
+        original_transformer = pipe.transformer
+
+        # Load V1 Flash model
+        pipe.transformer = load_transformer_v1_flash(compiled_models_dir, pipe, args)
+
+        # Delete original transformer to free ~40GB memory
+        del original_transformer
+        gc.collect()
+        print("  Transformer V1 Flash loaded!")
+        print("  Original transformer deleted to free memory.")
+    elif use_v2:
         print("\n[1/3] Loading Transformer V2 (ModelBuilder API, TP=8)...")
         if not v2_available:
             raise FileNotFoundError(
@@ -1078,7 +1291,12 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     type(pipe)._execution_device = property(lambda self: torch.device("cpu"))
 
     # Use vision_mode and language_mode defined at the top of the function
-    transformer_api = "V2 (ModelBuilder)" if use_v2 else "V1 (parallel_model_trace)"
+    if use_v1_flash:
+        transformer_api = "V1 Flash (parallel_model_trace + NKI)"
+    elif use_v2:
+        transformer_api = "V2 (ModelBuilder)"
+    else:
+        transformer_api = "V1 (parallel_model_trace)"
     print("\n" + "=" * 60)
     print("All Models Loaded!")
     print("=" * 60)
@@ -1388,6 +1606,10 @@ if __name__ == "__main__":
                         help="Use V2 transformer compiled with ModelBuilder API. "
                              "V2 passes RoPE as input tensors (like Flux). "
                              "Requires: python neuron_qwen_image_edit/compile_transformer_v2.py")
+    parser.add_argument("--use_v1_flash", action="store_true",
+                        help="Use V1 Flash transformer with NKI Flash Attention. "
+                             "Combines V1's parallel_model_trace (supports NKI) with V2's RoPE handling. "
+                             "Requires: python neuron_qwen_image_edit/compile_transformer_v1_flash.py")
 
     # Other options
     parser.add_argument("--warmup", action="store_true",
