@@ -64,6 +64,14 @@ from neuron_qwen_image_edit.autoencoder_kl_qwenimage_neuron import (
 )
 from neuron_qwen_image_edit.neuron_commons import NeuronTextEncoderWrapper
 
+# Import NxDModel for V2 API loading
+try:
+    from neuronx_distributed.trace.nxd_model.nxd_model import NxDModel
+    NXD_MODEL_AVAILABLE = True
+except ImportError:
+    NXD_MODEL_AVAILABLE = False
+    print("WARNING: NxDModel not available. V2 models cannot be loaded.")
+
 # Constants
 COMPILED_MODELS_DIR = "/opt/dlami/nvme/compiled_models"
 HUGGINGFACE_CACHE_DIR = "/opt/dlami/nvme/qwen_image_edit_hf_cache_dir"
@@ -186,6 +194,241 @@ class NeuronTransformerWrapper(torch.nn.Module):
             from diffusers.models.modeling_outputs import Transformer2DModelOutput
             return Transformer2DModelOutput(sample=output[0])
         return output
+
+
+class NeuronTransformerWrapperV2(torch.nn.Module):
+    """
+    Wrapper for V2 compiled transformer (ModelBuilder API) on Trainium2.
+
+    Key difference from V1: RoPE frequencies are passed as input, not computed internally.
+    """
+    def __init__(self, original_transformer, nxd_model, img_rotary_emb, txt_rotary_emb,
+                 expected_num_patches=1024, expected_seq_len=512, temporal_frames=3):
+        super().__init__()
+        self.config = original_transformer.config
+        self.dtype = original_transformer.dtype
+        self.device = original_transformer.device
+        self.nxd_model = nxd_model
+
+        # Pre-computed RoPE frequencies
+        self.img_rotary_emb = img_rotary_emb
+        self.txt_rotary_emb = txt_rotary_emb
+
+        self.expected_num_patches = expected_num_patches
+        self.expected_seq_len = expected_seq_len
+        self.temporal_frames = temporal_frames
+        # Base patches per frame (noise prediction output size)
+        self.base_patches = expected_num_patches // temporal_frames
+
+    @contextlib.contextmanager
+    def cache_context(self, name: str):
+        """Dummy cache context for compatibility with pipeline."""
+        yield
+
+    def forward(self, hidden_states, encoder_hidden_states=None,
+                timestep=None, img_shapes=None, return_dict=False, **kwargs):
+        """Forward pass using V2 compiled transformer with RoPE as input."""
+        batch_size = hidden_states.shape[0]
+
+        # Debug: Print shapes on first call
+        if not hasattr(self, '_debug_printed'):
+            print(f"DEBUG Transformer V2 input shapes:")
+            print(f"  hidden_states: {hidden_states.shape}")
+            print(f"  encoder_hidden_states: {encoder_hidden_states.shape}")
+            print(f"  timestep: {timestep.shape}")
+            print(f"  img_rotary_emb: {self.img_rotary_emb.shape}")
+            print(f"  txt_rotary_emb: {self.txt_rotary_emb.shape}")
+            print(f"  temporal_frames: {self.temporal_frames}, base_patches: {self.base_patches}")
+            print(f"  Will extract last {self.base_patches} patches as noise prediction")
+            self._debug_printed = True
+
+        # Handle hidden_states padding
+        actual_patches = hidden_states.shape[1]
+        if actual_patches != self.expected_num_patches:
+            if actual_patches < self.expected_num_patches:
+                pad_size = self.expected_num_patches - actual_patches
+                padding = torch.zeros(
+                    (batch_size, pad_size, hidden_states.shape[2]),
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device
+                )
+                hidden_states = torch.cat([hidden_states, padding], dim=1)
+            else:
+                print(f"ERROR: hidden_states has {actual_patches} patches but model expects {self.expected_num_patches}")
+                hidden_states = hidden_states[:, :self.expected_num_patches, :]
+
+        # Handle encoder_hidden_states padding
+        actual_seq_len = encoder_hidden_states.shape[1]
+        if actual_seq_len != self.expected_seq_len:
+            if actual_seq_len < self.expected_seq_len:
+                pad_size = self.expected_seq_len - actual_seq_len
+                padding = torch.zeros(
+                    (batch_size, pad_size, encoder_hidden_states.shape[2]),
+                    dtype=encoder_hidden_states.dtype,
+                    device=encoder_hidden_states.device
+                )
+                encoder_hidden_states = torch.cat([encoder_hidden_states, padding], dim=1)
+            else:
+                print(f"WARNING: Truncating encoder_hidden_states from {actual_seq_len} to {self.expected_seq_len}")
+                encoder_hidden_states = encoder_hidden_states[:, :self.expected_seq_len, :]
+
+        # Convert timestep to float32
+        timestep = timestep.to(torch.float32)
+
+        # Run V2 model with RoPE as input
+        import time
+        _t_start = time.time()
+        output = self.nxd_model(
+            hidden_states,
+            encoder_hidden_states,
+            timestep,
+            self.img_rotary_emb,
+            self.txt_rotary_emb
+        )
+
+        # Profile
+        if not hasattr(self, '_step_count'):
+            self._step_count = 0
+            self._step_times = []
+        self._step_count += 1
+        self._step_times.append(time.time() - _t_start)
+        if self._step_count % 10 == 0:
+            avg_time = sum(self._step_times[-10:]) / 10
+            print(f"  [Profile] Transformer V2 step {self._step_count}: avg {avg_time:.3f}s/step")
+
+        # Extract tensor from output (handle tuple or tensor)
+        if isinstance(output, tuple):
+            output_tensor = output[0]
+        else:
+            output_tensor = output
+
+        # For image editing, the model processes temporal_frames * base_patches
+        # but should only return the noise prediction for one frame (base_patches)
+        # Try extracting the FIRST frame (index 0) as noise prediction
+        # (QwenImage may use frame 0 for noise, unlike other models that use last frame)
+        output_tensor = output_tensor[:, :self.base_patches, :]
+
+        if return_dict:
+            from diffusers.models.modeling_outputs import Transformer2DModelOutput
+            return Transformer2DModelOutput(sample=output_tensor)
+        return (output_tensor,)
+
+
+def load_transformer_v2(compiled_models_dir: str, pipe, args):
+    """
+    Load V2 compiled transformer model using NxDModel API.
+
+    V2 models are compiled with ModelBuilder and require:
+    1. nxd_model.pt - the compiled model
+    2. weights/ - sharded checkpoints
+    3. rope_cache.pt - pre-computed RoPE tensors
+    4. config.json - model configuration
+
+    Args:
+        compiled_models_dir: Directory containing compiled model artifacts
+        pipe: Pipeline with original transformer (for config)
+        args: Command line arguments
+
+    Returns:
+        NeuronTransformerWrapperV2 wrapping the loaded model
+    """
+    import json
+
+    if not NXD_MODEL_AVAILABLE:
+        raise RuntimeError(
+            "NxDModel is not available. Please ensure neuronx_distributed is installed correctly."
+        )
+
+    v2_path = f"{compiled_models_dir}/transformer_v2"
+    nxd_model_path = f"{v2_path}/nxd_model.pt"
+    weights_path = f"{v2_path}/weights"
+    rope_cache_path = f"{v2_path}/rope_cache.pt"
+    config_path = f"{v2_path}/config.json"
+
+    # Validate all required files exist
+    if not os.path.exists(nxd_model_path):
+        raise FileNotFoundError(
+            f"V2 transformer model not found at {nxd_model_path}\n"
+            "Please run: python neuron_qwen_image_edit/compile_transformer_v2.py"
+        )
+    if not os.path.exists(weights_path):
+        raise FileNotFoundError(
+            f"V2 transformer weights not found at {weights_path}\n"
+            "Please run: python neuron_qwen_image_edit/compile_transformer_v2.py"
+        )
+    if not os.path.exists(rope_cache_path):
+        raise FileNotFoundError(
+            f"V2 RoPE cache not found at {rope_cache_path}\n"
+            "Please run: python neuron_qwen_image_edit/compile_transformer_v2.py"
+        )
+
+    # Load config
+    print(f"  Loading V2 config from {config_path}...")
+    with open(config_path, "r") as f:
+        config = json.load(f)
+
+    expected_num_patches = config["num_patches"]
+    expected_seq_len = config["text_seq_len"]
+    temporal_frames = config.get("frame", config.get("patch_multiplier", 3))
+    base_patches = expected_num_patches // temporal_frames
+    print(f"  V2 config: patches={expected_num_patches}, seq_len={expected_seq_len}")
+    print(f"  V2 config: temporal_frames={temporal_frames}, base_patches={base_patches}")
+
+    # Load pre-computed RoPE tensors
+    print(f"  Loading RoPE cache from {rope_cache_path}...")
+    rope_cache = torch.load(rope_cache_path)
+    img_rotary_emb = rope_cache["img_rotary_emb"].to(torch.bfloat16)
+    txt_rotary_emb = rope_cache["txt_rotary_emb"].to(torch.bfloat16)
+    print(f"  img_rotary_emb: {img_rotary_emb.shape}")
+    print(f"  txt_rotary_emb: {txt_rotary_emb.shape}")
+
+    # Debug: Print RoPE statistics
+    img_cos = img_rotary_emb[..., 0]
+    img_sin = img_rotary_emb[..., 1]
+    txt_cos = txt_rotary_emb[..., 0]
+    txt_sin = txt_rotary_emb[..., 1]
+    print(f"  img_cos stats: min={img_cos.min():.4f}, max={img_cos.max():.4f}, mean={img_cos.mean():.4f}")
+    print(f"  img_sin stats: min={img_sin.min():.4f}, max={img_sin.max():.4f}, mean={img_sin.mean():.4f}")
+    print(f"  txt_cos stats: min={txt_cos.min():.4f}, max={txt_cos.max():.4f}, mean={txt_cos.mean():.4f}")
+    print(f"  txt_sin stats: min={txt_sin.min():.4f}, max={txt_sin.max():.4f}, mean={txt_sin.mean():.4f}")
+
+    # Load the compiled model using NxDModel.load()
+    print(f"  Loading V2 model from {nxd_model_path}...")
+    nxd_model = NxDModel.load(nxd_model_path)
+
+    # Load sharded checkpoints
+    from safetensors.torch import load_file
+    tp_degree = config.get("tp_degree", 8)
+    print(f"  Loading sharded weights for TP={tp_degree}...")
+    sharded_checkpoints = []
+    for rank in range(tp_degree):
+        ckpt_path = f"{weights_path}/tp{rank}_sharded_checkpoint.safetensors"
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+        ckpt = load_file(ckpt_path)
+        sharded_checkpoints.append(ckpt)
+        if rank == 0:
+            print(f"    Rank 0 checkpoint keys: {len(ckpt)} tensors")
+
+    # Initialize model with weights and move to Neuron
+    print("  Setting weights...")
+    nxd_model.set_weights(sharded_checkpoints)
+    print("  Moving model to Neuron...")
+    nxd_model.to_neuron()
+    print("  V2 model initialized on Neuron!")
+
+    # Create wrapper
+    wrapper = NeuronTransformerWrapperV2(
+        original_transformer=pipe.transformer,
+        nxd_model=nxd_model,
+        img_rotary_emb=img_rotary_emb,
+        txt_rotary_emb=txt_rotary_emb,
+        expected_num_patches=expected_num_patches,
+        expected_seq_len=expected_seq_len,
+        temporal_frames=temporal_frames,
+    )
+
+    return wrapper
 
 
 class NeuronVAEWrapper(torch.nn.Module):
@@ -575,50 +818,73 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     # ========================================
     # IMPORTANT: Must load the largest TP model first to initialize
     # the communicator with the correct world size
-    print("\n[1/3] Loading Transformer (TP=8)...")
+    use_v2 = getattr(args, 'use_v2', False)
+    v2_available = os.path.exists(f"{compiled_models_dir}/transformer_v2/nxd_model.pt")
 
-    transformer_path = f"{compiled_models_dir}/transformer"
-    if not os.path.exists(transformer_path):
-        raise FileNotFoundError(
-            f"Transformer not found at {transformer_path}\n"
-            "Please run: python neuron_qwen_image_edit/compile_transformer.py"
+    if use_v2:
+        print("\n[1/3] Loading Transformer V2 (ModelBuilder API, TP=8)...")
+        if not v2_available:
+            raise FileNotFoundError(
+                f"Transformer V2 not found at {compiled_models_dir}/transformer_v2\n"
+                "Please run: python neuron_qwen_image_edit/compile_transformer_v2.py"
+            )
+
+        # Store reference to original for wrapper
+        original_transformer = pipe.transformer
+
+        # Load V2 model
+        pipe.transformer = load_transformer_v2(compiled_models_dir, pipe, args)
+
+        # Delete original transformer to free ~40GB memory
+        del original_transformer
+        gc.collect()
+        print("  Transformer V2 loaded!")
+        print("  Original transformer deleted to free memory.")
+    else:
+        print("\n[1/3] Loading Transformer V1 (parallel_model_trace API, TP=8)...")
+
+        transformer_path = f"{compiled_models_dir}/transformer"
+        if not os.path.exists(transformer_path):
+            raise FileNotFoundError(
+                f"Transformer not found at {transformer_path}\n"
+                "Please run: python neuron_qwen_image_edit/compile_transformer.py"
+            )
+        print(f"  Loading transformer from {transformer_path}...")
+        compiled_transformer = neuronx_distributed.trace.parallel_model_load(
+            transformer_path
         )
-    print(f"  Loading transformer from {transformer_path}...")
-    compiled_transformer = neuronx_distributed.trace.parallel_model_load(
-        transformer_path
-    )
 
-    # Calculate expected shapes based on image dimensions
-    latent_h = args.height // 8
-    latent_w = args.width // 8
-    patch_h = latent_h // 2
-    patch_w = latent_w // 2
-    base_num_patches = patch_h * patch_w  # e.g., 64*64=4096 for 1024x1024
+        # Calculate expected shapes based on image dimensions
+        latent_h = args.height // 8
+        latent_w = args.width // 8
+        patch_h = latent_h // 2
+        patch_w = latent_w // 2
+        base_num_patches = patch_h * patch_w  # e.g., 64*64=4096 for 1024x1024
 
-    # For IMAGE EDITING, patches are doubled (source + noise latents concatenated)
-    # This is handled by using temporal_frames = patch_multiplier
-    # - patch_multiplier=1 (generation): temporal_frames=1, patches = 1 * 32 * 32 = 1024
-    # - patch_multiplier=2 (editing): temporal_frames=2, patches = 2 * 32 * 32 = 2048
-    temporal_frames = args.patch_multiplier
-    expected_num_patches = temporal_frames * base_num_patches
-    print(f"  Expected num_patches: {expected_num_patches} (temporal_frames={temporal_frames}, base={base_num_patches})")
+        # For IMAGE EDITING, patches are doubled (source + noise latents concatenated)
+        # This is handled by using temporal_frames = patch_multiplier
+        # - patch_multiplier=1 (generation): temporal_frames=1, patches = 1 * 32 * 32 = 1024
+        # - patch_multiplier=2 (editing): temporal_frames=2, patches = 2 * 32 * 32 = 2048
+        temporal_frames = args.patch_multiplier
+        expected_num_patches = temporal_frames * base_num_patches
+        print(f"  Expected num_patches: {expected_num_patches} (temporal_frames={temporal_frames}, base={base_num_patches})")
 
-    # img_shapes for the wrapper
-    # Note: batch_size=1, CFG runs transformer twice sequentially (not batch_size=2)
-    img_shapes = [(temporal_frames, patch_h, patch_w)]
+        # img_shapes for the wrapper
+        # Note: batch_size=1, CFG runs transformer twice sequentially (not batch_size=2)
+        img_shapes = [(temporal_frames, patch_h, patch_w)]
 
-    # Store reference to original for wrapper, then delete
-    original_transformer = pipe.transformer
-    pipe.transformer = NeuronTransformerWrapper(
-        original_transformer, compiled_transformer, img_shapes,
-        expected_num_patches=expected_num_patches,
-        expected_seq_len=args.max_sequence_length
-    )
-    # Delete original transformer to free ~40GB memory
-    del original_transformer
-    gc.collect()
-    print(f"  Transformer loaded (TP=8)! Expected patches={expected_num_patches}, seq_len={args.max_sequence_length}")
-    print("  Original transformer deleted to free memory.")
+        # Store reference to original for wrapper, then delete
+        original_transformer = pipe.transformer
+        pipe.transformer = NeuronTransformerWrapper(
+            original_transformer, compiled_transformer, img_shapes,
+            expected_num_patches=expected_num_patches,
+            expected_seq_len=args.max_sequence_length
+        )
+        # Delete original transformer to free ~40GB memory
+        del original_transformer
+        gc.collect()
+        print(f"  Transformer V1 loaded (TP=8)! Expected patches={expected_num_patches}, seq_len={args.max_sequence_length}")
+        print("  Original transformer deleted to free memory.")
 
     # ========================================
     # 2. Load Text Encoder Components
@@ -812,10 +1078,11 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     type(pipe)._execution_device = property(lambda self: torch.device("cpu"))
 
     # Use vision_mode and language_mode defined at the top of the function
+    transformer_api = "V2 (ModelBuilder)" if use_v2 else "V1 (parallel_model_trace)"
     print("\n" + "=" * 60)
     print("All Models Loaded!")
     print("=" * 60)
-    print("  - Transformer: Neuron (TP=8)")
+    print(f"  - Transformer: Neuron (TP=8, {transformer_api})")
     print(f"  - Language Model: {language_mode}")
     print(f"  - Vision Encoder: Neuron ({vision_mode})")
     print(f"  - VAE: Neuron (tile size={vae_tile_size}x{vae_tile_size})")
@@ -1117,6 +1384,10 @@ if __name__ == "__main__":
     parser.add_argument("--vae_tile_size", type=int, default=512,
                         help="VAE tile size (must match compiled VAE size). "
                              "For larger images, tiled VAE will process in this tile size.")
+    parser.add_argument("--use_v2", action="store_true",
+                        help="Use V2 transformer compiled with ModelBuilder API. "
+                             "V2 passes RoPE as input tensors (like Flux). "
+                             "Requires: python neuron_qwen_image_edit/compile_transformer_v2.py")
 
     # Other options
     parser.add_argument("--warmup", action="store_true",
