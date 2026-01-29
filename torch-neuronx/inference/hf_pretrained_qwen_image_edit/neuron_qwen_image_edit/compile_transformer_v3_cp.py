@@ -48,6 +48,7 @@ from neuronx_distributed.parallel_layers.layers import (
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.mappings import (
     gather_from_tensor_model_parallel_region_with_dim,
+    scatter_to_process_group_spmd,
 )
 
 from neuron_parallel_utils import (
@@ -287,6 +288,17 @@ qwen_module.apply_rotary_emb_qwen = apply_rotary_emb_precomputed
 print("Patched apply_rotary_emb_qwen for pre-computed RoPE")
 
 
+def split_along_dim(tensor, dim, rank, data_parallel_group):
+    """Split tensor along dimension using scatter_to_process_group_spmd."""
+    tensor = scatter_to_process_group_spmd(
+        tensor,
+        partition_dim=dim,
+        rank=rank,
+        process_group=data_parallel_group,
+    )
+    return tensor
+
+
 class NeuronQwenTransformerV3CP(nn.Module):
     """
     Neuron-optimized QwenImage Transformer with Context Parallel.
@@ -294,7 +306,8 @@ class NeuronQwenTransformerV3CP(nn.Module):
     Features:
     - TP=4 for model parameter sharding
     - CP enabled (via DP group) for sequence parallelism
-    - NKI Flash Attention with K/V gathering
+    - Data is SPLIT at entry, K/V gathered in attention, output gathered at exit
+    - NKI Flash Attention
     """
 
     def __init__(self, original_transformer, tp_degree, context_parallel_enabled=False):
@@ -340,6 +353,9 @@ class NeuronQwenTransformerV3CP(nn.Module):
         self.head_dim = 128
         self.num_heads = original_transformer.transformer_blocks[0].attn.heads
 
+        # For getting DP rank at runtime
+        self.data_parallel_group = None
+
     def _replace_attention(self):
         """Replace attention modules with CP+NKI versions."""
         for i, block in enumerate(self.transformer_blocks):
@@ -354,8 +370,35 @@ class NeuronQwenTransformerV3CP(nn.Module):
         img_rotary_emb: torch.Tensor,
         txt_rotary_emb: torch.Tensor,
     ) -> torch.Tensor:
-        """Forward pass."""
-        # Split RoPE
+        """Forward pass with Context Parallel data splitting."""
+
+        # Get DP group for CP communication
+        if self.data_parallel_group is None:
+            self.data_parallel_group = parallel_state.get_data_parallel_group()
+
+        # ========== CONTEXT PARALLEL: SPLIT DATA AT ENTRY ==========
+        if self.context_parallel_enabled:
+            dp_rank = parallel_state.get_data_parallel_rank()
+
+            # Split hidden_states along sequence dim (dim=1)
+            hidden_states = split_along_dim(
+                hidden_states, dim=1, rank=dp_rank, data_parallel_group=self.data_parallel_group
+            )
+
+            # Split encoder_hidden_states along sequence dim (dim=1)
+            encoder_hidden_states = split_along_dim(
+                encoder_hidden_states, dim=1, rank=dp_rank, data_parallel_group=self.data_parallel_group
+            )
+
+            # Split RoPE along position dim (dim=0)
+            img_rotary_emb = split_along_dim(
+                img_rotary_emb, dim=0, rank=dp_rank, data_parallel_group=self.data_parallel_group
+            )
+            txt_rotary_emb = split_along_dim(
+                txt_rotary_emb, dim=0, rank=dp_rank, data_parallel_group=self.data_parallel_group
+            )
+
+        # Split RoPE into cos/sin
         img_freqs_cos = img_rotary_emb[..., 0]
         img_freqs_sin = img_rotary_emb[..., 1]
         txt_freqs_cos = txt_rotary_emb[..., 0]
@@ -389,11 +432,10 @@ class NeuronQwenTransformerV3CP(nn.Module):
         hidden_states = self.norm_out(hidden_states, temb)
         output = self.proj_out(hidden_states)
 
-        # Gather output if CP enabled
+        # ========== CONTEXT PARALLEL: GATHER OUTPUT ==========
         if self.context_parallel_enabled:
-            dp_group = parallel_state.get_data_parallel_group()
             output = gather_from_tensor_model_parallel_region_with_dim(
-                output, gather_dim=1, process_group=dp_group
+                output, gather_dim=1, process_group=self.data_parallel_group
             )
 
         return output
