@@ -731,6 +731,263 @@ def load_transformer_v2_flash(compiled_models_dir: str, pipe, args):
     return wrapper
 
 
+class NeuronTransformerWrapperV3CP(torch.nn.Module):
+    """
+    Wrapper for V3 CP (Context Parallel) compiled transformer.
+
+    Key features:
+    - Uses TP=4, CP=2 (world_size=8)
+    - K/V are all-gathered across CP group before attention
+    - Each CP rank processes part of the sequence
+    - RoPE is sharded per CP rank
+    """
+    def __init__(self, original_transformer, nxd_model, img_rotary_emb, txt_rotary_emb,
+                 expected_num_patches=1024, expected_seq_len=512, temporal_frames=3,
+                 cp_degree=2):
+        super().__init__()
+        self.config = original_transformer.config
+        self.dtype = original_transformer.dtype
+        self.device = original_transformer.device
+        self.nxd_model = nxd_model
+
+        # Full RoPE (will be sharded at runtime per CP rank)
+        self.img_rotary_emb_full = img_rotary_emb
+        self.txt_rotary_emb_full = txt_rotary_emb
+
+        self.expected_num_patches = expected_num_patches
+        self.expected_seq_len = expected_seq_len
+        self.temporal_frames = temporal_frames
+        self.base_patches = expected_num_patches // temporal_frames
+        self.cp_degree = cp_degree
+
+        # Local dimensions (per CP rank)
+        self.local_num_patches = expected_num_patches // cp_degree
+        self.local_seq_len = expected_seq_len // cp_degree
+
+    @contextlib.contextmanager
+    def cache_context(self, name: str):
+        """Dummy cache context for compatibility with pipeline."""
+        yield
+
+    def forward(self, hidden_states, encoder_hidden_states=None,
+                timestep=None, img_shapes=None, return_dict=False, **kwargs):
+        """Forward pass with Context Parallel."""
+        batch_size = hidden_states.shape[0]
+
+        # Debug: Print shapes on first call
+        if not hasattr(self, '_debug_printed'):
+            print(f"DEBUG Transformer V3 CP input shapes:")
+            print(f"  hidden_states: {hidden_states.shape}")
+            print(f"  encoder_hidden_states: {encoder_hidden_states.shape}")
+            print(f"  timestep: {timestep.shape}")
+            print(f"  img_rotary_emb_full: {self.img_rotary_emb_full.shape}")
+            print(f"  txt_rotary_emb_full: {self.txt_rotary_emb_full.shape}")
+            print(f"  CP degree: {self.cp_degree}")
+            print(f"  Local patches: {self.local_num_patches}, Local seq_len: {self.local_seq_len}")
+            self._debug_printed = True
+
+        # For CP, the model expects LOCAL data (already sharded)
+        # Since we're running inference, we pass full data and let the model handle it
+        # The compiled model has the gather/scatter logic built in
+
+        # Handle hidden_states padding to expected_num_patches
+        actual_patches = hidden_states.shape[1]
+        if actual_patches != self.expected_num_patches:
+            if actual_patches < self.expected_num_patches:
+                pad_size = self.expected_num_patches - actual_patches
+                padding = torch.zeros(
+                    (batch_size, pad_size, hidden_states.shape[2]),
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device
+                )
+                hidden_states = torch.cat([hidden_states, padding], dim=1)
+            else:
+                print(f"ERROR: hidden_states has {actual_patches} patches but model expects {self.expected_num_patches}")
+                hidden_states = hidden_states[:, :self.expected_num_patches, :]
+
+        # Handle encoder_hidden_states padding
+        actual_seq_len = encoder_hidden_states.shape[1]
+        if actual_seq_len != self.expected_seq_len:
+            if actual_seq_len < self.expected_seq_len:
+                pad_size = self.expected_seq_len - actual_seq_len
+                padding = torch.zeros(
+                    (batch_size, pad_size, encoder_hidden_states.shape[2]),
+                    dtype=encoder_hidden_states.dtype,
+                    device=encoder_hidden_states.device
+                )
+                encoder_hidden_states = torch.cat([encoder_hidden_states, padding], dim=1)
+            else:
+                print(f"WARNING: Truncating encoder_hidden_states from {actual_seq_len} to {self.expected_seq_len}")
+                encoder_hidden_states = encoder_hidden_states[:, :self.expected_seq_len, :]
+
+        # Convert timestep to float32
+        timestep = timestep.to(torch.float32)
+
+        # Run model
+        # Note: For CP models compiled with ModelBuilder, the sharding is handled internally
+        # We pass full data and full RoPE - the model handles the rest
+        import time
+        _t_start = time.time()
+        output = self.nxd_model(
+            hidden_states,
+            encoder_hidden_states,
+            timestep,
+            self.img_rotary_emb_full,
+            self.txt_rotary_emb_full
+        )
+
+        # Profile
+        if not hasattr(self, '_step_count'):
+            self._step_count = 0
+            self._step_times = []
+        self._step_count += 1
+        self._step_times.append(time.time() - _t_start)
+        if self._step_count % 10 == 0:
+            avg_time = sum(self._step_times[-10:]) / 10
+            print(f"  [Profile] Transformer V3 CP step {self._step_count}: avg {avg_time:.3f}s/step")
+
+        # Extract tensor from output
+        if isinstance(output, tuple):
+            output_tensor = output[0]
+        else:
+            output_tensor = output
+
+        # Extract first frame as noise prediction
+        output_tensor = output_tensor[:, :self.base_patches, :]
+
+        if return_dict:
+            from diffusers.models.modeling_outputs import Transformer2DModelOutput
+            return Transformer2DModelOutput(sample=output_tensor)
+        return (output_tensor,)
+
+
+def load_transformer_v3_cp(compiled_models_dir: str, pipe, args):
+    """
+    Load V3 CP compiled transformer with Context Parallel.
+
+    V3 CP models use:
+    - TP=4, CP=2 (world_size=8)
+    - K/V all-gather across CP group
+    - NKI Flash Attention
+
+    Args:
+        compiled_models_dir: Directory containing compiled model artifacts
+        pipe: Pipeline with original transformer (for config)
+        args: Command line arguments
+
+    Returns:
+        NeuronTransformerWrapperV3CP wrapping the loaded model
+    """
+    import json
+
+    if not NXD_MODEL_AVAILABLE:
+        raise RuntimeError(
+            "NxDModel is not available. Please ensure neuronx_distributed is installed correctly."
+        )
+
+    v3_cp_path = f"{compiled_models_dir}/transformer_v3_cp"
+    nxd_model_path = f"{v3_cp_path}/nxd_model.pt"
+    weights_path = f"{v3_cp_path}/weights"
+    rope_cache_path = f"{v3_cp_path}/rope_cache.pt"
+    config_path = f"{v3_cp_path}/config.json"
+
+    # Validate files exist
+    if not os.path.exists(nxd_model_path):
+        raise FileNotFoundError(
+            f"V3 CP transformer model not found at {nxd_model_path}\n"
+            "Please run: ./compile.sh v3_cp"
+        )
+    if not os.path.exists(weights_path):
+        raise FileNotFoundError(
+            f"V3 CP transformer weights not found at {weights_path}\n"
+            "Please run: ./compile.sh v3_cp"
+        )
+    if not os.path.exists(rope_cache_path):
+        raise FileNotFoundError(
+            f"V3 CP RoPE cache not found at {rope_cache_path}\n"
+            "Please run: ./compile.sh v3_cp"
+        )
+
+    # Load config
+    print(f"  Loading V3 CP config from {config_path}...")
+    with open(config_path, "r") as f:
+        config = json.load(f)
+
+    expected_num_patches = config["num_patches"]
+    expected_seq_len = config["text_seq_len"]
+    temporal_frames = config.get("frame", config.get("patch_multiplier", 3))
+    tp_degree = config.get("tp_degree", 4)
+    world_size = config.get("world_size", 8)
+    cp_degree = config.get("cp_degree", 2)
+    base_patches = expected_num_patches // temporal_frames
+
+    print(f"  V3 CP config: patches={expected_num_patches}, seq_len={expected_seq_len}")
+    print(f"  V3 CP config: temporal_frames={temporal_frames}, base_patches={base_patches}")
+    print(f"  V3 CP config: TP={tp_degree}, world_size={world_size}, CP={cp_degree}")
+    print(f"  Context Parallel: {config.get('context_parallel', False)}")
+    print(f"  NKI Flash Attention: {config.get('nki_flash_attention', False)}")
+
+    # Load pre-computed RoPE tensors (full, not sharded)
+    print(f"  Loading RoPE cache from {rope_cache_path}...")
+    rope_cache = torch.load(rope_cache_path)
+    img_rotary_emb = rope_cache["img_rotary_emb"].to(torch.bfloat16)
+    txt_rotary_emb = rope_cache["txt_rotary_emb"].to(torch.bfloat16)
+    print(f"  img_rotary_emb: {img_rotary_emb.shape}")
+    print(f"  txt_rotary_emb: {txt_rotary_emb.shape}")
+
+    # Load the compiled model using NxDModel.load()
+    print(f"  Loading V3 CP model from {nxd_model_path}...")
+    nxd_model = NxDModel.load(nxd_model_path)
+
+    # Load sharded checkpoints
+    # For Context Parallel: TP=4 but world_size=8
+    # Each DP rank (CP rank) uses the same weights as its corresponding TP rank
+    # So we need to duplicate: [tp0, tp1, tp2, tp3] -> [tp0, tp1, tp2, tp3, tp0, tp1, tp2, tp3]
+    from safetensors.torch import load_file
+    print(f"  Loading sharded weights for TP={tp_degree}, world_size={world_size}...")
+
+    # First load the TP checkpoints
+    tp_checkpoints = []
+    for rank in range(tp_degree):
+        ckpt_path = f"{weights_path}/tp{rank}_sharded_checkpoint.safetensors"
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+        ckpt = load_file(ckpt_path)
+        tp_checkpoints.append(ckpt)
+        if rank == 0:
+            print(f"    Rank 0 checkpoint keys: {len(ckpt)} tensors")
+
+    # For CP, duplicate checkpoints for each DP rank
+    # world_size = tp_degree * dp_degree (dp_degree = cp_degree)
+    sharded_checkpoints = []
+    for dp_rank in range(cp_degree):
+        for tp_rank in range(tp_degree):
+            sharded_checkpoints.append(tp_checkpoints[tp_rank])
+
+    print(f"  Total checkpoints: {len(sharded_checkpoints)} (TP={tp_degree} x CP={cp_degree})")
+
+    # Initialize model with weights and move to Neuron
+    print("  Setting weights...")
+    nxd_model.set_weights(sharded_checkpoints)
+    print("  Moving model to Neuron...")
+    nxd_model.to_neuron()
+    print("  V3 CP model initialized on Neuron!")
+
+    # Create wrapper
+    wrapper = NeuronTransformerWrapperV3CP(
+        original_transformer=pipe.transformer,
+        nxd_model=nxd_model,
+        img_rotary_emb=img_rotary_emb,
+        txt_rotary_emb=txt_rotary_emb,
+        expected_num_patches=expected_num_patches,
+        expected_seq_len=expected_seq_len,
+        temporal_frames=temporal_frames,
+        cp_degree=cp_degree,
+    )
+
+    return wrapper
+
+
 class NeuronVAEWrapper(torch.nn.Module):
     """
     Wrapper for VAE with compiled encoder and decoder on Trainium2.
@@ -1121,11 +1378,32 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     use_v2 = getattr(args, 'use_v2', False)
     use_v1_flash = getattr(args, 'use_v1_flash', False)
     use_v2_flash = getattr(args, 'use_v2_flash', False)
+    use_v3_cp = getattr(args, 'use_v3_cp', False)
     v2_available = os.path.exists(f"{compiled_models_dir}/transformer_v2/nxd_model.pt")
     v1_flash_available = os.path.exists(f"{compiled_models_dir}/transformer_v1_flash")
     v2_flash_available = os.path.exists(f"{compiled_models_dir}/transformer_v2_flash/nxd_model.pt")
+    v3_cp_available = os.path.exists(f"{compiled_models_dir}/transformer_v3_cp/nxd_model.pt")
 
-    if use_v2_flash:
+    if use_v3_cp:
+        print("\n[1/3] Loading Transformer V3 CP (Context Parallel + NKI Flash Attention, TP=4, CP=2)...")
+        if not v3_cp_available:
+            raise FileNotFoundError(
+                f"V3 CP transformer not found. Please run: ./compile.sh v3_cp"
+            )
+
+        # Store reference to original for wrapper
+        original_transformer = pipe.transformer
+
+        # Load V3 CP model and assign to pipe
+        pipe.transformer = load_transformer_v3_cp(compiled_models_dir, pipe, args)
+
+        # Delete original transformer to free memory
+        del original_transformer
+        import gc
+        gc.collect()
+        print("  Transformer V3 CP loaded!")
+        print("  Original transformer deleted to free memory.")
+    elif use_v2_flash:
         print("\n[1/3] Loading Transformer V2 Flash (ModelBuilder + NKI Flash Attention, TP=8)...")
         if not v2_flash_available:
             raise FileNotFoundError(
@@ -1420,16 +1698,25 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     type(pipe)._execution_device = property(lambda self: torch.device("cpu"))
 
     # Use vision_mode and language_mode defined at the top of the function
-    if use_v1_flash:
+    if use_v3_cp:
+        transformer_api = "V3 CP (Context Parallel + NKI, TP=4, CP=2)"
+        tp_info = "TP=4, CP=2"
+    elif use_v2_flash:
+        transformer_api = "V2 Flash (ModelBuilder + NKI)"
+        tp_info = "TP=8"
+    elif use_v1_flash:
         transformer_api = "V1 Flash (parallel_model_trace + NKI)"
+        tp_info = "TP=8"
     elif use_v2:
         transformer_api = "V2 (ModelBuilder)"
+        tp_info = "TP=8"
     else:
         transformer_api = "V1 (parallel_model_trace)"
+        tp_info = "TP=8"
     print("\n" + "=" * 60)
     print("All Models Loaded!")
     print("=" * 60)
-    print(f"  - Transformer: Neuron (TP=8, {transformer_api})")
+    print(f"  - Transformer: Neuron ({tp_info}, {transformer_api})")
     print(f"  - Language Model: {language_mode}")
     print(f"  - Vision Encoder: Neuron ({vision_mode})")
     print(f"  - VAE: Neuron (tile size={vae_tile_size}x{vae_tile_size})")
@@ -1743,6 +2030,10 @@ if __name__ == "__main__":
                         help="Use V2 Flash transformer with ModelBuilder + NKI Flash Attention. "
                              "Combines ModelBuilder's XLA optimization with NKI's hardware attention. "
                              "Requires: python neuron_qwen_image_edit/compile_transformer_v2_flash.py")
+    parser.add_argument("--use_v3_cp", action="store_true",
+                        help="Use V3 CP transformer with Context Parallel + NKI Flash Attention. "
+                             "Uses TP=4, CP=2 for improved performance (experimental). "
+                             "Requires: ./compile.sh v3_cp")
 
     # Other options
     parser.add_argument("--warmup", action="store_true",

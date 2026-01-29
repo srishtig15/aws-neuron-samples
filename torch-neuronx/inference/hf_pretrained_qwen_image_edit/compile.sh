@@ -16,6 +16,7 @@
 #   ./compile.sh v2                 # Compile V2 only
 #   ./compile.sh v1_flash           # Compile V1 Flash only (recommended, NKI Flash Attention)
 #   ./compile.sh v2_flash           # Compile V2 Flash only (ModelBuilder + NKI)
+#   ./compile.sh v3_cp              # Compile V3 CP (Context Parallel + NKI, experimental)
 #   ./compile.sh 1024 1024 448 8 1024 3  # Custom dimensions
 
 set -e
@@ -29,7 +30,7 @@ VAE_TILE_SIZE=512
 
 # Check if first argument is version selector
 VERSION_MODE="all"
-if [[ "$1" == "v1" || "$1" == "v2" || "$1" == "v1_flash" || "$1" == "v2_flash" ]]; then
+if [[ "$1" == "v1" || "$1" == "v2" || "$1" == "v1_flash" || "$1" == "v2_flash" || "$1" == "v3_cp" ]]; then
     VERSION_MODE="$1"
     shift
 fi
@@ -126,6 +127,21 @@ if [[ "$VERSION_MODE" == "all" || "$VERSION_MODE" == "v2_flash" ]]; then
         --compiled_models_dir ${COMPILED_MODELS_DIR}
     echo "  V2 Flash Transformer compiled successfully!"
 fi
+
+if [[ "$VERSION_MODE" == "v3_cp" ]]; then
+    echo "  Compiling V3 CP (Context Parallel + NKI Flash Attention)..."
+    echo "  Using TP=4, world_size=8 (CP=2)"
+    python neuron_qwen_image_edit/compile_transformer_v3_cp.py \
+        --height ${HEIGHT} \
+        --width ${WIDTH} \
+        --tp_degree 4 \
+        --world_size 8 \
+        --patch_multiplier ${PATCH_MULTIPLIER} \
+        --max_sequence_length ${MAX_SEQ_LEN} \
+        --compiled_models_dir ${COMPILED_MODELS_DIR} \
+        --compiler_workdir ${COMPILER_WORKDIR}
+    echo "  V3 CP Transformer compiled successfully!"
+fi
 echo ""
 
 # Step 4: Vision Encoder (Language Model runs on CPU)
@@ -159,6 +175,9 @@ if [[ "$VERSION_MODE" == "all" || "$VERSION_MODE" == "v1_flash" ]]; then
 fi
 if [[ "$VERSION_MODE" == "all" || "$VERSION_MODE" == "v2_flash" ]]; then
     echo "  - transformer_v2_flash/ (V2 Flash, TP=${TP_DEGREE}, output: ${HEIGHT}x${WIDTH}, ModelBuilder + NKI)"
+fi
+if [[ "$VERSION_MODE" == "v3_cp" ]]; then
+    echo "  - transformer_v3_cp/ (V3 CP, TP=4, CP=2, output: ${HEIGHT}x${WIDTH}, Context Parallel + NKI)"
 fi
 echo "  - vision_encoder/"
 echo ""
@@ -201,3 +220,4 @@ NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.p
 NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "根据这图1中女性和图2中的男性，生成一组结婚照，并遵循以下描述：新郎穿着红色的中式马褂，新娘穿着精致的秀禾服，头戴金色凤冠。他们并肩站立在古老的朱红色宫墙前，背景是雕花的木窗。光线明亮柔和，构图对称，氛围喜庆而隆重。" --patch_multiplier 3 --warmup --use_v2
 NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "根据这图1中女性和图2中的男性，生成一组结婚照，并遵循以下描述：新郎穿着红色的中式马褂，新娘穿着精致的秀禾服，头戴金色凤冠。他们并肩站立在古老的朱红色宫墙前，背景是雕花的木窗。光线明亮柔和，构图对称，氛围喜庆而隆重。" --patch_multiplier 3 --warmup --use_v1_flash 
 NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "根据这图1中女性和图2中的男性，生成一组结婚照，并遵循以下描述：新郎穿着红色的中式马褂，新娘穿着精致的秀禾服，头戴金色凤冠。他们并肩站立在古老的朱红色宫墙前，背景是雕花的木窗。光线明亮柔和，构图对称，氛围喜庆而隆重。" --patch_multiplier 3 --warmup --use_v2_flash 
+NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "根据这图1中女性和图2中的男性，生成一组结婚照，并遵循以下描述：新郎穿着红色的中式马褂，新娘穿着精致的秀禾服，头戴金色凤冠。他们并肩站立在古老的朱红色宫墙前，背景是雕花的木窗。光线明亮柔和，构图对称，氛围喜庆而隆重。" --patch_multiplier 3 --warmup --use_v3_cp
