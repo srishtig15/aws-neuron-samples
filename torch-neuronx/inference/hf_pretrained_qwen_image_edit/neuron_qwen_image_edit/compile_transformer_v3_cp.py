@@ -44,6 +44,7 @@ from neuronx_distributed import ModelBuilder, NxDParallelState, shard_checkpoint
 from neuronx_distributed.parallel_layers.layers import (
     ColumnParallelLinear,
     RowParallelLinear,
+    SPMDRank,
 )
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.mappings import (
@@ -118,10 +119,11 @@ class CPNKIQwenAttention(nn.Module):
     3. Each CP rank processes its portion of queries against full K/V
     """
 
-    def __init__(self, orig_attn, context_parallel_enabled=False):
+    def __init__(self, orig_attn, context_parallel_enabled=False, data_parallel_group=None):
         super().__init__()
 
         self.context_parallel_enabled = context_parallel_enabled
+        self.data_parallel_group = data_parallel_group
         self.heads = orig_attn.heads
         self.to_q = orig_attn.to_q
         self.to_k = orig_attn.to_k
@@ -197,19 +199,17 @@ class CPNKIQwenAttention(nn.Module):
 
         # Context Parallel: All-gather K/V across DP group
         if self.context_parallel_enabled:
-            dp_group = parallel_state.get_data_parallel_group()
-
             # Gather image K/V
             img_stacked_kv = torch.stack([img_key, img_value], dim=0)
             img_stacked_kv = gather_from_tensor_model_parallel_region_with_dim(
-                img_stacked_kv, gather_dim=3, process_group=dp_group
+                img_stacked_kv, gather_dim=3, process_group=self.data_parallel_group
             )
             img_key, img_value = torch.unbind(img_stacked_kv, dim=0)
 
             # Gather text K/V
             txt_stacked_kv = torch.stack([txt_key, txt_value], dim=0)
             txt_stacked_kv = gather_from_tensor_model_parallel_region_with_dim(
-                txt_stacked_kv, gather_dim=3, process_group=dp_group
+                txt_stacked_kv, gather_dim=3, process_group=self.data_parallel_group
             )
             txt_key, txt_value = torch.unbind(txt_stacked_kv, dim=0)
 
@@ -299,6 +299,22 @@ def split_along_dim(tensor, dim, rank, data_parallel_group):
     return tensor
 
 
+def get_dp_rank_spmd(global_rank: torch.Tensor, tp_degree: int) -> torch.Tensor:
+    """
+    Compute DP rank from global rank for SPMD execution.
+
+    With world_size=8 and tp_degree=4:
+    - Ranks 0-3 are DP rank 0
+    - Ranks 4-7 are DP rank 1
+    """
+    dp_rank = torch.div(
+        global_rank,
+        tp_degree,
+        rounding_mode="floor",
+    ).to(torch.int32)
+    return dp_rank
+
+
 class NeuronQwenTransformerV3CP(nn.Module):
     """
     Neuron-optimized QwenImage Transformer with Context Parallel.
@@ -310,7 +326,7 @@ class NeuronQwenTransformerV3CP(nn.Module):
     - NKI Flash Attention
     """
 
-    def __init__(self, original_transformer, tp_degree, context_parallel_enabled=False):
+    def __init__(self, original_transformer, tp_degree, world_size, context_parallel_enabled=False):
         super().__init__()
 
         self.config = original_transformer.config
@@ -318,6 +334,14 @@ class NeuronQwenTransformerV3CP(nn.Module):
         self.out_channels = original_transformer.config.out_channels
         self.patch_size = original_transformer.config.patch_size
         self.context_parallel_enabled = context_parallel_enabled
+        self.tp_degree = tp_degree
+        self.world_size = world_size
+
+        # SPMDRank for getting global rank at runtime (crucial for SPMD scatter/gather)
+        self.global_rank = SPMDRank(world_size=world_size)
+
+        # DP group for CP communication
+        self.data_parallel_group = parallel_state.get_data_parallel_group()
 
         # Input projections
         self.img_in = original_transformer.img_in
@@ -353,13 +377,12 @@ class NeuronQwenTransformerV3CP(nn.Module):
         self.head_dim = 128
         self.num_heads = original_transformer.transformer_blocks[0].attn.heads
 
-        # For getting DP rank at runtime
-        self.data_parallel_group = None
-
     def _replace_attention(self):
         """Replace attention modules with CP+NKI versions."""
         for i, block in enumerate(self.transformer_blocks):
-            block.attn = CPNKIQwenAttention(block.attn, self.context_parallel_enabled)
+            block.attn = CPNKIQwenAttention(
+                block.attn, self.context_parallel_enabled, self.data_parallel_group
+            )
         print(f"Replaced attention with CP+NKI versions on {len(self.transformer_blocks)} blocks")
 
     def forward(
@@ -372,13 +395,10 @@ class NeuronQwenTransformerV3CP(nn.Module):
     ) -> torch.Tensor:
         """Forward pass with Context Parallel data splitting."""
 
-        # Get DP group for CP communication
-        if self.data_parallel_group is None:
-            self.data_parallel_group = parallel_state.get_data_parallel_group()
-
         # ========== CONTEXT PARALLEL: SPLIT DATA AT ENTRY ==========
         if self.context_parallel_enabled:
-            dp_rank = parallel_state.get_data_parallel_rank()
+            # Compute DP rank at runtime using SPMDRank (returns different values per rank)
+            dp_rank = get_dp_rank_spmd(self.global_rank.get_rank(), self.tp_degree)
 
             # Split hidden_states along sequence dim (dim=1)
             hidden_states = split_along_dim(
@@ -548,9 +568,9 @@ def compile_transformer_v3_cp(args):
         unsharded_state = pipe.transformer.state_dict()
 
         # Create Neuron transformer
-        print("\nCreating Neuron transformer (sharding layers with TP={})...".format(tp_degree))
+        print("\nCreating Neuron transformer (sharding layers with TP={}, world_size={})...".format(tp_degree, world_size))
         neuron_transformer = NeuronQwenTransformerV3CP(
-            pipe.transformer, tp_degree, context_parallel_enabled
+            pipe.transformer, tp_degree, world_size, context_parallel_enabled
         )
         neuron_transformer = neuron_transformer.to(torch.bfloat16)
         neuron_transformer.eval()
@@ -589,7 +609,13 @@ def compile_transformer_v3_cp(args):
 
         # Prepare checkpoint for sharding
         checkpoint = {}
+        global_rank_state = {}  # Save SPMDRank state separately (not sharded)
         for key, value in model.state_dict().items():
+            # Save SPMDRank module state separately - it's not sharded, same on all ranks
+            if 'global_rank' in key:
+                print(f"  Saving SPMDRank key separately: {key}")
+                global_rank_state[key] = value.clone()
+                continue
             # Use unsharded weights where available
             orig_key = key.replace("transformer.", "", 1)
             if orig_key in unsharded_state:
@@ -604,6 +630,21 @@ def compile_transformer_v3_cp(args):
             model=model,
             serialize_path=weights_path,
         )
+
+        # Add global_rank state to each sharded checkpoint (same value for all ranks)
+        # Note: shard_checkpoint creates files named tp{rank}_sharded_checkpoint.safetensors
+        if global_rank_state:
+            print("Adding SPMDRank state to sharded checkpoints...")
+            from safetensors.torch import load_file, save_file
+            for rank in range(tp_degree):  # Only TP checkpoints are created, CP duplicates them at load time
+                shard_file = os.path.join(weights_path, f"tp{rank}_sharded_checkpoint.safetensors")
+                if os.path.exists(shard_file):
+                    shard_data = dict(load_file(shard_file))
+                    shard_data.update(global_rank_state)
+                    save_file(shard_data, shard_file)
+                    print(f"  Updated {shard_file}")
+                else:
+                    print(f"  WARNING: {shard_file} not found")
 
         # Save config
         config = {
