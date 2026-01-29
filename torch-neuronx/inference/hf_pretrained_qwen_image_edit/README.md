@@ -308,7 +308,32 @@ Shapes are not compatible: f32[1,2048,3,128] vs f32[1,1024,1,128]
 | TRN2 V2 (ModelBuilder) | ~1.2s/step | ~96s |
 | TRN2 V1 (parallel_model_trace) | ~2.4s/step | ~190s |
 
-**Key Finding**: V1 Flash, V2 Flash, and V2 all achieve similar performance (~1.2s/step). NKI Flash Attention is the key performance driver - both V1 Flash and V2 Flash use it, achieving the same speed despite different compilation APIs.
+### Performance Analysis
+
+#### Why V1 → V2 achieved 2x speedup?
+
+The key difference is **RoPE (Rotary Position Embedding) handling**:
+
+| Version | RoPE Handling | Overhead |
+|---------|---------------|----------|
+| V1 | Computed inside model every forward pass | High - complex number operations, position encoding |
+| V2/V1 Flash/V2 Flash | Pre-computed once, passed as input | Low - just tensor passing |
+
+**Pre-computed RoPE is the main performance improvement** (2x speedup), not the compilation API or attention implementation.
+
+#### Why V2 ≈ V1 Flash ≈ V2 Flash?
+
+| Version | RoPE | Attention | Speed |
+|---------|------|-----------|-------|
+| V1 | Inside model | Standard SDPA | ~2.4s/step |
+| V2 | **Pre-computed** | Standard SDPA | ~1.2s/step |
+| V1 Flash | **Pre-computed** | NKI Flash | ~1.2s/step |
+| V2 Flash | **Pre-computed** | NKI Flash | ~1.2s/step |
+
+**Key Findings**:
+1. **Pre-computed RoPE** is the dominant optimization (V1 → V2: 2x speedup)
+2. **NKI Flash Attention vs Compiler-optimized SDPA**: No significant difference - Neuron compiler already optimizes SDPA very well
+3. **Compilation API (parallel_model_trace vs ModelBuilder)**: Minimal impact on final performance
 
 ### V1 vs V2 vs V1 Flash vs V2 Flash Comparison
 
@@ -318,9 +343,9 @@ Shapes are not compatible: f32[1,2048,3,128] vs f32[1,1024,1,128]
 | Attention | Standard SDPA | Standard SDPA | **NKI Flash Attention** | **NKI Flash Attention** |
 | RoPE Handling | Computed inside model | Pre-computed as input | Pre-computed as input | Pre-computed as input |
 | Speed | ~2.4s/step | ~1.2s/step | **~1.2s/step** | ~1.2s/step |
-| Key Advantage | Simple implementation | XLA optimization | Hardware-optimized attention | Both optimizations |
+| Key Advantage | Simple implementation | Pre-computed RoPE | Pre-computed RoPE + NKI | Both |
 
-**Finding**: V1 Flash and V2 Flash achieve identical performance, confirming that NKI Flash Attention is the dominant performance factor. ModelBuilder's XLA optimization provides no additional benefit when NKI is already optimizing the attention computation.
+**Recommendation**: Use **V1 Flash** for its simpler compilation path. V2 Flash offers no additional performance benefit.
 
 ### Compiler Optimizations
 
@@ -353,7 +378,7 @@ The transformer is the main bottleneck, accounting for ~80% of total inference t
 1. **Fixed dimensions**: Models are compiled for specific dimensions. Different sizes require recompilation.
 2. **Language model**: Runs on CPU due to GQA architecture (28Q/4KV heads incompatible with TP=8).
 3. **Sequence length**: Must match between compilation and inference.
-4. **NKI Flash Attention with ModelBuilder**: NKI kernels are not compatible with ModelBuilder API due to XLA functionalization. Use V1 Flash (parallel_model_trace) for NKI support.
+4. **NKI Flash Attention**: Requires `XLA_DISABLE_FUNCTIONALIZATION=1` to work with both parallel_model_trace (V1 Flash) and ModelBuilder (V2 Flash). Without this flag, NKI kernels fail with "immutable output parameter" error.
 
 ## References
 
