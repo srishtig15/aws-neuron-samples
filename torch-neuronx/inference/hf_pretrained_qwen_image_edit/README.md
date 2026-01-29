@@ -52,8 +52,19 @@ python neuron_qwen_image_edit/cache_hf_model.py
 
 ### 2. Compile Models
 
+Two compilation APIs are available:
+
+| API | Script | Speed | Notes |
+|-----|--------|-------|-------|
+| **V2 (Recommended)** | `compile_transformer_v2.py` | ~0.95s/step | ModelBuilder API, 2x faster |
+| V1 | `compile_transformer.py` | ~1.9s/step | parallel_model_trace API |
+
 ```bash
+# Compile with V2 (recommended)
 ./compile.sh
+
+# Or compile V1 only
+./compile.sh v1
 ```
 
 Default compilation settings:
@@ -66,7 +77,13 @@ Default compilation settings:
 ### 3. Run Inference
 
 ```bash
-# Two-image merging (default, requires patch_multiplier=3)
+# Two-image merging with V2 (recommended, 2x faster)
+python run_qwen_image_edit.py \
+    --images img1.png img2.png \
+    --prompt "combine these two people into a wedding photo" \
+    --use_v2
+
+# Two-image merging with V1
 python run_qwen_image_edit.py \
     --images img1.png img2.png \
     --prompt "combine these two people into a wedding photo"
@@ -75,13 +92,15 @@ python run_qwen_image_edit.py \
 python run_qwen_image_edit.py \
     --images input.jpg \
     --prompt "change the background to a beach" \
-    --patch_multiplier 2
+    --patch_multiplier 2 \
+    --use_v2
 
 # With custom CFG scale
 python run_qwen_image_edit.py \
     --images input.jpg \
     --prompt "change the background to a beach" \
-    --true_cfg_scale 6.0
+    --true_cfg_scale 6.0 \
+    --use_v2
 ```
 
 **Note**: CFG (Classifier-Free Guidance) runs the transformer twice sequentially per step, not with batch_size=2.
@@ -97,7 +116,8 @@ hf_pretrained_qwen_image_edit/
 ├── neuron_qwen_image_edit/
 │   ├── cache_hf_model.py          # Download model from HuggingFace
 │   ├── compile_vae.py             # VAE compilation
-│   ├── compile_transformer.py     # Transformer compilation (TP=8)
+│   ├── compile_transformer.py     # Transformer V1 compilation (parallel_model_trace)
+│   ├── compile_transformer_v2.py  # Transformer V2 compilation (ModelBuilder, 2x faster)
 │   ├── compile_text_encoder.py    # Text encoder compilation
 │   ├── neuron_commons.py          # Common utilities and wrappers
 │   ├── neuron_parallel_utils.py   # Tensor parallelism utilities
@@ -107,7 +127,8 @@ hf_pretrained_qwen_image_edit/
 └── compiled_models/               # Output directory for compiled models
     ├── vae_encoder/
     ├── vae_decoder/
-    ├── transformer/               # TP=8 sharded transformer
+    ├── transformer/               # V1: TP=8 sharded transformer
+    ├── transformer_v2/            # V2: ModelBuilder compiled transformer
     └── vision_encoder/            # Single device
 ```
 
@@ -153,6 +174,20 @@ Qwen2.5-VL uses Multimodal RoPE requiring 3D position_ids `[3, batch, seq]`:
 - Text tokens: sequential positions (same for t, h, w dimensions)
 - Image tokens: 3D grid positions based on spatial layout
 
+#### 5. V2 Pre-computed RoPE
+
+V2 uses ModelBuilder API which requires RoPE frequencies to be passed as input tensors (not computed inside the model). This avoids XLA constant-folding issues:
+
+```python
+# V1: RoPE computed inside model (causes XLA issues with ModelBuilder)
+# V2: RoPE pre-computed from original model and passed as input
+vid_freqs, txt_freqs = pipe.transformer.pos_embed(video_fhw, max_txt_seq_len=text_seq_len)
+img_rotary_emb = torch.stack([vid_freqs.real, vid_freqs.imag], dim=-1)  # [num_patches, 64, 2]
+txt_rotary_emb = torch.stack([txt_freqs.real, txt_freqs.imag], dim=-1)  # [text_seq, 64, 2]
+```
+
+The RoPE is cached during compilation and loaded at inference time.
+
 ## Compilation Options
 
 ```bash
@@ -170,6 +205,7 @@ Qwen2.5-VL uses Multimodal RoPE requiring 3D position_ids `[3, batch, seq]`:
 |----------|---------|-------------|
 | `--images` | Required | Input image path(s), 1-3 images |
 | `--prompt` | Required | Edit instruction |
+| `--use_v2` | False | Use V2 transformer (ModelBuilder, 2x faster) |
 | `--height` | 1024 | Output image height (must match compiled model) |
 | `--width` | 1024 | Output image width (must match compiled model) |
 | `--patch_multiplier` | 2 | 2=single image editing, 3=two-image merge |
@@ -211,7 +247,19 @@ Shapes are not compatible: f32[1,2048,3,128] vs f32[1,1024,1,128]
 | Platform | Transformer Speed | Total Time |
 |----------|------------------|------------|
 | H100 (without Flash Attention) | ~0.75s/step | ~60s |
-| TRN2 (TP=8, optimized) | **~1.9s/step** | ~190s |
+| **TRN2 V2 (ModelBuilder)** | **~0.95s/step** | **~95s** |
+| TRN2 V1 (parallel_model_trace) | ~1.9s/step | ~190s |
+
+**V2 is 2x faster than V1** thanks to the ModelBuilder API which provides better XLA graph optimization.
+
+### V1 vs V2 Comparison
+
+| Aspect | V1 (parallel_model_trace) | V2 (ModelBuilder) |
+|--------|---------------------------|-------------------|
+| Compilation API | `torch_neuronx.parallel_model_trace` | `neuronx_distributed.ModelBuilder` |
+| RoPE Handling | Computed inside model | Pre-computed, passed as input |
+| Speed | ~1.9s/step | ~0.95s/step |
+| XLA Graph | Separate per-rank graphs | Unified optimized graph |
 
 ### Compiler Optimizations
 
@@ -226,7 +274,7 @@ The following compiler flags are used for optimal performance:
 
 The `--enable-ccop-compute-overlap` flag is particularly important for tensor parallelism, as it allows all-reduce operations to overlap with computation, reducing synchronization overhead.
 
-### Component Timing Breakdown
+### Component Timing Breakdown (V2)
 
 | Component | Time |
 |-----------|------|
@@ -234,7 +282,7 @@ The `--enable-ccop-compute-overlap` flag is particularly important for tensor pa
 | Vision Encoder (CPU, cached) | ~0.7s |
 | Language Model (CPU) | ~1-4s |
 | VAE Encode | ~0.4s |
-| **Transformer (40 steps × 2 CFG)** | **~152s** |
+| **Transformer (40 steps × 2 CFG)** | **~76s** |
 | VAE Decode | ~1.6s |
 
 The transformer is the main bottleneck, accounting for ~80% of total inference time.
@@ -244,7 +292,7 @@ The transformer is the main bottleneck, accounting for ~80% of total inference t
 1. **Fixed dimensions**: Models are compiled for specific dimensions. Different sizes require recompilation.
 2. **Language model**: Runs on CPU due to GQA architecture (28Q/4KV heads incompatible with TP=8).
 3. **Sequence length**: Must match between compilation and inference.
-4. **NKI Flash Attention**: Not available with `parallel_model_trace` API due to XLA tracing limitations. Would require migration to `ModelBuilder` API.
+4. **NKI Flash Attention**: Not compatible with ModelBuilder/XLA tracing due to "immutable output parameter" limitation. V2 achieves 2x speedup without NKI.
 
 ## References
 

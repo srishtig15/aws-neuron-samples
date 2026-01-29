@@ -1,13 +1,13 @@
 """
-Transformer compilation using ModelBuilder (V2 API) with NKI Flash Attention.
+Transformer compilation using ModelBuilder (V2 API).
 
-Key approach (following Flux pattern):
+Key approach:
 1. RoPE frequencies computed OUTSIDE the model and passed as INPUT tensors
 2. Model does NOT compute RoPE internally - avoids XLA constant-folding
-3. Uses NKI Flash Attention kernel for better performance
-4. Uses ModelBuilder for compilation
+3. Uses ModelBuilder for compilation
 
 This avoids the RoPE buffer constant-folding issue that broke previous V2 attempts.
+Achieves ~2x speedup over V1 (parallel_model_trace) API.
 """
 
 import os
@@ -30,23 +30,6 @@ import argparse
 from typing import Optional, Tuple, List
 
 from diffusers import QwenImageEditPlusPipeline
-
-# NKI imports
-try:
-    import neuronxcc.nki as nki
-    from neuronxcc.nki.language import nc
-    try:
-        from neuronxcc.nki._private_kernels.attention import attention_isa_kernel
-    except ImportError:
-        from neuronxcc.nki.kernels.attention import attention_isa_kernel
-    _flash_fwd_call = nki.jit()(attention_isa_kernel)
-    NKI_AVAILABLE = True
-    print("NKI Flash Attention kernel loaded successfully")
-except ImportError as e:
-    _flash_fwd_call = None
-    NKI_AVAILABLE = False
-    nc = None
-    print(f"NKI Flash Attention not available: {e}")
 
 # ModelBuilder imports
 from neuronx_distributed import ModelBuilder, NxDParallelState, shard_checkpoint
@@ -157,40 +140,6 @@ def apply_rotary_emb_precomputed(
 import diffusers.models.transformers.transformer_qwenimage as qwen_module
 qwen_module.apply_rotary_emb_qwen = apply_rotary_emb_precomputed
 print("Patched apply_rotary_emb_qwen for pre-computed RoPE")
-
-
-def nki_flash_attention(query, key, value, scale):
-    """
-    NKI Flash Attention for TRN2.
-
-    Args:
-        query, key, value: [B, H, S, D]
-        scale: attention scale factor
-
-    Returns:
-        [B, H, S, D]
-    """
-    # TODO: Enable NKI after confirming RoPE-as-input works
-    # NKI has issues with XLA tracing (immutable output parameter)
-    # For now, use standard attention
-    attn = torch.matmul(query, key.transpose(-1, -2)) * scale
-    attn = F.softmax(attn, dim=-1)
-    return torch.matmul(attn, value)
-
-    # NKI code (disabled for now):
-    # if not NKI_AVAILABLE:
-    #     attn = torch.matmul(query, key.transpose(-1, -2)) * scale
-    #     attn = F.softmax(attn, dim=-1)
-    #     return torch.matmul(attn, value)
-    #
-    # bs, n_head, seq_len, d_head = query.shape
-    # q = query.permute(0, 1, 3, 2).reshape(bs * n_head, d_head, seq_len)
-    # k = key.permute(0, 1, 3, 2).reshape(bs * n_head, d_head, seq_len)
-    # v = value.reshape(bs * n_head, seq_len, d_head)
-    # out = torch.zeros(bs * n_head, seq_len, d_head, dtype=torch.bfloat16, device=query.device)
-    # grid = (nc(2),)
-    # _flash_fwd_call[grid](q, k, v, scale, out, kernel_name="AttentionMMSoftmaxMMWithoutSwap")
-    # return out.reshape(bs, n_head, seq_len, d_head)
 
 
 class NeuronQwenTransformerV2(nn.Module):
@@ -389,7 +338,6 @@ def compile_transformer_v2(args):
     print(f"Patches: {num_patches} ({temporal_frames}x{patch_h}x{patch_w})")
     print(f"Text seq: {text_seq_len}")
     print(f"TP degree: {tp_degree}")
-    print(f"NKI available: {NKI_AVAILABLE}")
 
     # Sample inputs
     sample_hidden_states = torch.randn(1, num_patches, in_channels, dtype=torch.bfloat16)
