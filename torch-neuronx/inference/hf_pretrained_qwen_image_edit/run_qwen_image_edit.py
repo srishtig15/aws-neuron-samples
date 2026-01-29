@@ -623,6 +623,114 @@ def load_transformer_v1_flash(compiled_models_dir: str, pipe, args):
     return wrapper
 
 
+def load_transformer_v2_flash(compiled_models_dir: str, pipe, args):
+    """
+    Load V2 Flash compiled transformer model using NxDModel API.
+
+    V2 Flash models combine ModelBuilder API with NKI Flash Attention:
+    1. nxd_model.pt - the compiled model
+    2. weights/ - sharded checkpoints
+    3. rope_cache.pt - pre-computed RoPE tensors
+    4. config.json - model configuration
+
+    Args:
+        compiled_models_dir: Directory containing compiled model artifacts
+        pipe: Pipeline with original transformer (for config)
+        args: Command line arguments
+
+    Returns:
+        NeuronTransformerWrapperV2 wrapping the loaded model (reuses V2 wrapper)
+    """
+    import json
+
+    if not NXD_MODEL_AVAILABLE:
+        raise RuntimeError(
+            "NxDModel is not available. Please ensure neuronx_distributed is installed correctly."
+        )
+
+    v2_flash_path = f"{compiled_models_dir}/transformer_v2_flash"
+    nxd_model_path = f"{v2_flash_path}/nxd_model.pt"
+    weights_path = f"{v2_flash_path}/weights"
+    rope_cache_path = f"{v2_flash_path}/rope_cache.pt"
+    config_path = f"{v2_flash_path}/config.json"
+
+    # Validate all required files exist
+    if not os.path.exists(nxd_model_path):
+        raise FileNotFoundError(
+            f"V2 Flash transformer model not found at {nxd_model_path}\n"
+            "Please run: python neuron_qwen_image_edit/compile_transformer_v2_flash.py"
+        )
+    if not os.path.exists(weights_path):
+        raise FileNotFoundError(
+            f"V2 Flash transformer weights not found at {weights_path}\n"
+            "Please run: python neuron_qwen_image_edit/compile_transformer_v2_flash.py"
+        )
+    if not os.path.exists(rope_cache_path):
+        raise FileNotFoundError(
+            f"V2 Flash RoPE cache not found at {rope_cache_path}\n"
+            "Please run: python neuron_qwen_image_edit/compile_transformer_v2_flash.py"
+        )
+
+    # Load config
+    print(f"  Loading V2 Flash config from {config_path}...")
+    with open(config_path, "r") as f:
+        config = json.load(f)
+
+    expected_num_patches = config["num_patches"]
+    expected_seq_len = config["text_seq_len"]
+    temporal_frames = config.get("frame", config.get("patch_multiplier", 3))
+    base_patches = expected_num_patches // temporal_frames
+    print(f"  V2 Flash config: patches={expected_num_patches}, seq_len={expected_seq_len}")
+    print(f"  V2 Flash config: temporal_frames={temporal_frames}, base_patches={base_patches}")
+    print(f"  NKI Flash Attention: {config.get('nki_flash_attention', False)}")
+
+    # Load pre-computed RoPE tensors
+    print(f"  Loading RoPE cache from {rope_cache_path}...")
+    rope_cache = torch.load(rope_cache_path)
+    img_rotary_emb = rope_cache["img_rotary_emb"].to(torch.bfloat16)
+    txt_rotary_emb = rope_cache["txt_rotary_emb"].to(torch.bfloat16)
+    print(f"  img_rotary_emb: {img_rotary_emb.shape}")
+    print(f"  txt_rotary_emb: {txt_rotary_emb.shape}")
+
+    # Load the compiled model using NxDModel.load()
+    print(f"  Loading V2 Flash model from {nxd_model_path}...")
+    nxd_model = NxDModel.load(nxd_model_path)
+
+    # Load sharded checkpoints
+    from safetensors.torch import load_file
+    tp_degree = config.get("tp_degree", 8)
+    print(f"  Loading sharded weights for TP={tp_degree}...")
+    sharded_checkpoints = []
+    for rank in range(tp_degree):
+        ckpt_path = f"{weights_path}/tp{rank}_sharded_checkpoint.safetensors"
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+        ckpt = load_file(ckpt_path)
+        sharded_checkpoints.append(ckpt)
+        if rank == 0:
+            print(f"    Rank 0 checkpoint keys: {len(ckpt)} tensors")
+
+    # Initialize model with weights and move to Neuron
+    print("  Setting weights...")
+    nxd_model.set_weights(sharded_checkpoints)
+    print("  Moving model to Neuron...")
+    nxd_model.to_neuron()
+    print("  V2 Flash model initialized on Neuron!")
+
+    # Create wrapper (reuse V2 wrapper since interface is the same)
+    wrapper = NeuronTransformerWrapperV2(
+        original_transformer=pipe.transformer,
+        nxd_model=nxd_model,
+        img_rotary_emb=img_rotary_emb,
+        txt_rotary_emb=txt_rotary_emb,
+        expected_num_patches=expected_num_patches,
+        expected_seq_len=expected_seq_len,
+        temporal_frames=temporal_frames,
+    )
+
+    return wrapper
+
+
 class NeuronVAEWrapper(torch.nn.Module):
     """
     Wrapper for VAE with compiled encoder and decoder on Trainium2.
@@ -1012,10 +1120,31 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     # the communicator with the correct world size
     use_v2 = getattr(args, 'use_v2', False)
     use_v1_flash = getattr(args, 'use_v1_flash', False)
+    use_v2_flash = getattr(args, 'use_v2_flash', False)
     v2_available = os.path.exists(f"{compiled_models_dir}/transformer_v2/nxd_model.pt")
     v1_flash_available = os.path.exists(f"{compiled_models_dir}/transformer_v1_flash")
+    v2_flash_available = os.path.exists(f"{compiled_models_dir}/transformer_v2_flash/nxd_model.pt")
 
-    if use_v1_flash:
+    if use_v2_flash:
+        print("\n[1/3] Loading Transformer V2 Flash (ModelBuilder + NKI Flash Attention, TP=8)...")
+        if not v2_flash_available:
+            raise FileNotFoundError(
+                f"Transformer V2 Flash not found at {compiled_models_dir}/transformer_v2_flash\n"
+                "Please run: python neuron_qwen_image_edit/compile_transformer_v2_flash.py"
+            )
+
+        # Store reference to original for wrapper
+        original_transformer = pipe.transformer
+
+        # Load V2 Flash model
+        pipe.transformer = load_transformer_v2_flash(compiled_models_dir, pipe, args)
+
+        # Delete original transformer to free ~40GB memory
+        del original_transformer
+        gc.collect()
+        print("  Transformer V2 Flash loaded!")
+        print("  Original transformer deleted to free memory.")
+    elif use_v1_flash:
         print("\n[1/3] Loading Transformer V1 Flash (parallel_model_trace + NKI Flash Attention, TP=8)...")
         if not v1_flash_available:
             raise FileNotFoundError(
@@ -1610,6 +1739,10 @@ if __name__ == "__main__":
                         help="Use V1 Flash transformer with NKI Flash Attention. "
                              "Combines V1's parallel_model_trace (supports NKI) with V2's RoPE handling. "
                              "Requires: python neuron_qwen_image_edit/compile_transformer_v1_flash.py")
+    parser.add_argument("--use_v2_flash", action="store_true",
+                        help="Use V2 Flash transformer with ModelBuilder + NKI Flash Attention. "
+                             "Combines ModelBuilder's XLA optimization with NKI's hardware attention. "
+                             "Requires: python neuron_qwen_image_edit/compile_transformer_v2_flash.py")
 
     # Other options
     parser.add_argument("--warmup", action="store_true",

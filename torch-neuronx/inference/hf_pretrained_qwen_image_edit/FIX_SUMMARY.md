@@ -145,6 +145,7 @@ V1 Flash combines the best of V1 and V2:
 | API | Speed | Notes |
 |-----|-------|-------|
 | **V1 Flash (NKI)** | **~1.2s/step** | NKI Flash Attention + pre-computed RoPE |
+| V2 Flash (ModelBuilder + NKI) | ~1.2s/step | ModelBuilder + NKI Flash Attention |
 | V2 (ModelBuilder) | ~1.2s/step | Pre-computed RoPE as input |
 | V1 (parallel_model_trace) | ~2.4s/step | RoPE computed inside model |
 
@@ -154,11 +155,27 @@ V1 Flash combines the best of V1 and V2:
 3. Uses same NKI import path as Flux: `from torch_neuronx.xla_impl.ops import nki_jit`
 4. Pre-computes RoPE and passes as input tensors (same as V2)
 
+### V2 Flash with ModelBuilder + NKI
+
+V2 Flash combines ModelBuilder API with NKI Flash Attention:
+- Uses `ModelBuilder` API for compilation
+- Uses NKI Flash Attention kernel
+- Requires `XLA_DISABLE_FUNCTIONALIZATION=1` to allow NKI in-place operations
+
+**Key Finding**: V1 Flash and V2 Flash achieve **identical performance** (~1.2s/step). This confirms that:
+1. NKI Flash Attention is the dominant performance factor
+2. ModelBuilder's XLA optimization provides no additional benefit when NKI is already optimizing attention
+3. The compilation API (parallel_model_trace vs ModelBuilder) doesn't significantly affect performance
+
+**Recommendation**: Use V1 Flash for its simpler compilation path.
+
 ### NKI Flash Attention Compatibility
 
-NKI Flash Attention kernel is **not compatible** with ModelBuilder API due to XLA functionalization. The kernel requires in-place modification of output tensor, which XLA's functionalization converts to out-of-place operations.
+NKI Flash Attention kernel requires `XLA_DISABLE_FUNCTIONALIZATION=1` to work with both APIs:
+- **V1 Flash**: Uses `parallel_model_trace` + disabled functionalization
+- **V2 Flash**: Uses `ModelBuilder` + disabled functionalization
 
-**Solution**: V1 Flash uses `parallel_model_trace` with `XLA_DISABLE_FUNCTIONALIZATION=1` to support NKI kernels.
+Without this flag, the kernel fails with "Cannot update immutable parameter `out`" because XLA's functionalization converts in-place operations to out-of-place.
 
 ## File Reference
 
@@ -171,5 +188,6 @@ NKI Flash Attention kernel is **not compatible** with ModelBuilder API due to XL
 | `compile_transformer.py` | V1 transformer compilation (parallel_model_trace) |
 | `compile_transformer_v2.py` | V2 transformer compilation (ModelBuilder) |
 | `compile_transformer_v1_flash.py` | V1 Flash compilation (NKI Flash Attention, recommended) |
+| `compile_transformer_v2_flash.py` | V2 Flash compilation (ModelBuilder + NKI) |
 | `compile_text_encoder.py` | Vision encoder compilation |
 | `compile_vae.py` | VAE encoder/decoder compilation |

@@ -52,17 +52,23 @@ python neuron_qwen_image_edit/cache_hf_model.py
 
 ### 2. Compile Models
 
-Three compilation APIs are available:
+Four compilation APIs are available:
 
 | API | Script | Speed | Notes |
 |-----|--------|-------|-------|
 | **V1 Flash (Recommended)** | `compile_transformer_v1_flash.py` | **~1.2s/step** | parallel_model_trace + NKI Flash Attention |
+| V2 Flash | `compile_transformer_v2_flash.py` | ~1.2s/step | ModelBuilder + NKI Flash Attention |
 | V2 | `compile_transformer_v2.py` | ~1.2s/step | ModelBuilder API |
 | V1 | `compile_transformer.py` | ~2.4s/step | parallel_model_trace API |
+
+**Note**: V1 Flash and V2 Flash have the same performance because NKI Flash Attention is the key performance driver. V1 Flash is recommended for its simpler compilation path.
 
 ```bash
 # Compile V1 Flash (recommended, uses NKI Flash Attention)
 python neuron_qwen_image_edit/compile_transformer_v1_flash.py --height 1024 --width 1024 --patch_multiplier 3
+
+# Or compile V2 Flash (ModelBuilder + NKI)
+python neuron_qwen_image_edit/compile_transformer_v2_flash.py --height 1024 --width 1024 --patch_multiplier 3
 
 # Or compile V2 (ModelBuilder)
 ./compile.sh v2
@@ -129,6 +135,7 @@ hf_pretrained_qwen_image_edit/
 │   ├── compile_transformer.py     # Transformer V1 compilation (parallel_model_trace)
 │   ├── compile_transformer_v2.py  # Transformer V2 compilation (ModelBuilder)
 │   ├── compile_transformer_v1_flash.py  # Transformer V1 Flash (NKI Flash Attention)
+│   ├── compile_transformer_v2_flash.py  # Transformer V2 Flash (ModelBuilder + NKI)
 │   ├── compile_text_encoder.py    # Text encoder compilation
 │   ├── neuron_commons.py          # Common utilities and wrappers
 │   ├── neuron_parallel_utils.py   # Tensor parallelism utilities
@@ -141,6 +148,7 @@ hf_pretrained_qwen_image_edit/
     ├── transformer/               # V1: TP=8 sharded transformer
     ├── transformer_v2/            # V2: ModelBuilder compiled transformer
     ├── transformer_v1_flash/      # V1 Flash: NKI Flash Attention
+    ├── transformer_v2_flash/      # V2 Flash: ModelBuilder + NKI
     └── vision_encoder/            # Single device
 ```
 
@@ -252,6 +260,7 @@ _flash_fwd_call = nki_jit()(attention_isa_kernel)
 | `--images` | Required | Input image path(s), 1-3 images |
 | `--prompt` | Required | Edit instruction |
 | `--use_v1_flash` | False | Use V1 Flash transformer (NKI Flash Attention, recommended) |
+| `--use_v2_flash` | False | Use V2 Flash transformer (ModelBuilder + NKI Flash Attention) |
 | `--use_v2` | False | Use V2 transformer (ModelBuilder) |
 | `--height` | 1024 | Output image height (must match compiled model) |
 | `--width` | 1024 | Output image width (must match compiled model) |
@@ -295,20 +304,23 @@ Shapes are not compatible: f32[1,2048,3,128] vs f32[1,1024,1,128]
 |----------|------------------|------------|
 | H100 (without Flash Attention) | ~0.75s/step | ~60s |
 | **TRN2 V1 Flash (NKI)** | **~1.2s/step** | **~96s** |
+| TRN2 V2 Flash (ModelBuilder + NKI) | ~1.2s/step | ~96s |
 | TRN2 V2 (ModelBuilder) | ~1.2s/step | ~96s |
 | TRN2 V1 (parallel_model_trace) | ~2.4s/step | ~190s |
 
-**V1 Flash and V2 are ~2x faster than V1** thanks to optimized attention implementations and better XLA graph optimization.
+**Key Finding**: V1 Flash, V2 Flash, and V2 all achieve similar performance (~1.2s/step). NKI Flash Attention is the key performance driver - both V1 Flash and V2 Flash use it, achieving the same speed despite different compilation APIs.
 
-### V1 vs V2 vs V1 Flash Comparison
+### V1 vs V2 vs V1 Flash vs V2 Flash Comparison
 
-| Aspect | V1 | V2 (ModelBuilder) | V1 Flash (Recommended) |
-|--------|-----|-------------------|------------------------|
-| Compilation API | `parallel_model_trace` | `ModelBuilder` | `parallel_model_trace` |
-| Attention | Standard SDPA | Standard SDPA | **NKI Flash Attention** |
-| RoPE Handling | Computed inside model | Pre-computed as input | Pre-computed as input |
-| Speed | ~2.4s/step | ~1.2s/step | **~1.2s/step** |
-| Key Advantage | Simple implementation | Better XLA optimization | Hardware-optimized attention |
+| Aspect | V1 | V2 | V1 Flash (Recommended) | V2 Flash |
+|--------|-----|-----|------------------------|----------|
+| Compilation API | `parallel_model_trace` | `ModelBuilder` | `parallel_model_trace` | `ModelBuilder` |
+| Attention | Standard SDPA | Standard SDPA | **NKI Flash Attention** | **NKI Flash Attention** |
+| RoPE Handling | Computed inside model | Pre-computed as input | Pre-computed as input | Pre-computed as input |
+| Speed | ~2.4s/step | ~1.2s/step | **~1.2s/step** | ~1.2s/step |
+| Key Advantage | Simple implementation | XLA optimization | Hardware-optimized attention | Both optimizations |
+
+**Finding**: V1 Flash and V2 Flash achieve identical performance, confirming that NKI Flash Attention is the dominant performance factor. ModelBuilder's XLA optimization provides no additional benefit when NKI is already optimizing the attention computation.
 
 ### Compiler Optimizations
 
