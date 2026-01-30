@@ -552,12 +552,10 @@ def compile_transformer_v3_cp(args):
     # world_size=8, tensor_model_parallel_size=4 means DP=2 (used for CP)
     with NxDParallelState(world_size=world_size, tensor_model_parallel_size=tp_degree):
         print("\nLoading model...")
-        pipe = QwenImageEditPlusPipeline.from_pretrained(
-            MODEL_ID,
-            torch_dtype=torch.bfloat16,
-            local_files_only=True,
-            cache_dir=CACHE_DIR
-        )
+        load_kwargs = {"torch_dtype": torch.bfloat16, "local_files_only": True}
+        if CACHE_DIR:
+            load_kwargs["cache_dir"] = CACHE_DIR
+        pipe = QwenImageEditPlusPipeline.from_pretrained(MODEL_ID, **load_kwargs)
 
         # Get full RoPE
         print("\nGetting RoPE...")
@@ -693,6 +691,8 @@ def compile_transformer_v3_cp(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--model_path", type=str, default=None,
+                        help="Path to model (local dir or HuggingFace ID). If not set, uses MODEL_ID with CACHE_DIR")
     parser.add_argument("--height", type=int, default=1024)
     parser.add_argument("--width", type=int, default=1024)
     parser.add_argument("--max_sequence_length", type=int, default=1024)
@@ -702,5 +702,10 @@ if __name__ == "__main__":
     parser.add_argument("--compiled_models_dir", type=str, default="/opt/dlami/nvme/compiled_models")
     parser.add_argument("--compiler_workdir", type=str, default="/opt/dlami/nvme/compiler_workdir")
     args = parser.parse_args()
+
+    # Override MODEL_ID and CACHE_DIR if model_path is provided
+    if args.model_path:
+        MODEL_ID = args.model_path
+        CACHE_DIR = None
 
     compile_transformer_v3_cp(args)

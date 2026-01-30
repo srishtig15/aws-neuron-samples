@@ -39,6 +39,14 @@ CACHE_DIR = "/opt/dlami/nvme/qwen_image_edit_hf_cache_dir"
 MODEL_ID = "Qwen/Qwen-Image-Edit-2509"
 
 
+def load_pipeline(dtype=torch.bfloat16):
+    """Load pipeline with appropriate kwargs based on MODEL_ID and CACHE_DIR."""
+    load_kwargs = {"torch_dtype": dtype, "local_files_only": True}
+    if CACHE_DIR:
+        load_kwargs["cache_dir"] = CACHE_DIR
+    return QwenImageEditPlusPipeline.from_pretrained(MODEL_ID, **load_kwargs)
+
+
 class VisionEncoderWrapper(nn.Module):
     """
     Wrapper for the Qwen2.5-VL Vision Encoder.
@@ -145,11 +153,7 @@ def upcast_norms_to_f32(module):
 
 def get_vision_encoder(tp_degree: int):
     """Load and prepare vision encoder for tracing."""
-    pipe = QwenImageEditPlusPipeline.from_pretrained(
-        MODEL_ID,
-        torch_dtype=torch.bfloat16,
-        local_files_only=True,
-        cache_dir=CACHE_DIR)
+    pipe = load_pipeline(torch.bfloat16)
 
     visual = pipe.text_encoder.model.visual
     visual.eval()
@@ -160,11 +164,7 @@ def get_vision_encoder(tp_degree: int):
 
 def get_language_model(tp_degree: int):
     """Load and shard language model for tensor parallelism."""
-    pipe = QwenImageEditPlusPipeline.from_pretrained(
-        MODEL_ID,
-        torch_dtype=torch.bfloat16,
-        local_files_only=True,
-        cache_dir=CACHE_DIR)
+    pipe = load_pipeline(torch.bfloat16)
 
     text_encoder = pipe.text_encoder
     lang_model = text_encoder.model.language_model
@@ -234,11 +234,7 @@ def compile_vision_encoder(args):
     print(f"  Num patches: {num_patches}")
     print(f"  Channels per patch: {channels_per_patch}")
 
-    pipe = QwenImageEditPlusPipeline.from_pretrained(
-        MODEL_ID,
-        torch_dtype=dtype,
-        local_files_only=True,
-        cache_dir=CACHE_DIR)
+    pipe = load_pipeline(dtype)
 
     visual = pipe.text_encoder.model.visual
     visual.eval()
@@ -276,11 +272,7 @@ def compile_vision_encoder(args):
 
 def get_vision_encoder_tp(tp_degree: int, image_size: int):
     """Load and shard vision encoder for tensor parallelism."""
-    pipe = QwenImageEditPlusPipeline.from_pretrained(
-        MODEL_ID,
-        torch_dtype=torch.bfloat16,
-        local_files_only=True,
-        cache_dir=CACHE_DIR)
+    pipe = load_pipeline(torch.bfloat16)
 
     visual = pipe.text_encoder.model.visual
     visual.eval()
@@ -537,11 +529,7 @@ def compile_text_encoder_full(args):
     print(f"  TP degree: {tp_degree}")
 
     def get_full_text_encoder(tp_degree):
-        pipe = QwenImageEditPlusPipeline.from_pretrained(
-            MODEL_ID,
-            torch_dtype=torch.bfloat16,
-            local_files_only=True,
-            cache_dir=CACHE_DIR)
+        pipe = load_pipeline(torch.bfloat16)
 
         text_encoder = pipe.text_encoder
         text_encoder.eval()
@@ -613,6 +601,10 @@ def run_in_subprocess(func_name, args, vision_tp=False):
         "--language_tp_degree", str(getattr(args, 'language_tp_degree', 4)),
     ]
 
+    # Pass model_path if set
+    if getattr(args, 'model_path', None):
+        cmd.extend(["--model_path", args.model_path])
+
     if func_name == "vision":
         cmd.append("--vision_only")
         if vision_tp:
@@ -654,7 +646,14 @@ if __name__ == "__main__":
                         help="Tensor parallel degree for language model. "
                              "TP=4: Standard sharding. TP=8: KV head replication mode. "
                              "Default=8 to match transformer TP degree.")
+    parser.add_argument("--model_path", type=str, default=None,
+                        help="Path to model (local dir or HuggingFace ID). If not set, uses MODEL_ID with CACHE_DIR")
     args = parser.parse_args()
+
+    # Override MODEL_ID and CACHE_DIR if model_path is provided
+    if args.model_path:
+        MODEL_ID = args.model_path
+        CACHE_DIR = None
 
     if args.mode == "separate":
         # If specific component requested, run directly
