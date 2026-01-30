@@ -1,5 +1,7 @@
 # Qwen-Image-Edit on AWS Trainium2
 
+[中文文档](README_CN.md) | English
+
 This project enables running the [Qwen-Image-Edit-2509](https://huggingface.co/Qwen/Qwen-Image-Edit-2509) model on AWS Trainium2 (trn2) instances using the Neuron SDK.
 
 ## Overview
@@ -52,23 +54,27 @@ python neuron_qwen_image_edit/cache_hf_model.py
 
 ### 2. Compile Models
 
-Four compilation APIs are available:
+Five compilation APIs are available:
 
 | API | Script | Speed | Notes |
 |-----|--------|-------|-------|
-| **V1 Flash (Recommended)** | `compile_transformer_v1_flash.py` | **~1.2s/step** | parallel_model_trace + NKI Flash Attention |
+| **V3 CP (Fastest)** | `compile_transformer_v3_cp.py` | **~0.77s/step** | Context Parallel (TP=4, CP=2) + NKI Flash Attention |
+| V1 Flash | `compile_transformer_v1_flash.py` | ~1.2s/step | parallel_model_trace + NKI Flash Attention |
 | V2 Flash | `compile_transformer_v2_flash.py` | ~1.2s/step | ModelBuilder + NKI Flash Attention |
 | V2 | `compile_transformer_v2.py` | ~1.2s/step | ModelBuilder API |
 | V1 | `compile_transformer.py` | ~2.4s/step | parallel_model_trace API |
 
-**Note**: V1 Flash and V2 Flash have the same performance because NKI Flash Attention is the key performance driver. V1 Flash is recommended for its simpler compilation path.
+**Note**: V3 CP achieves H100-comparable performance (~0.77s/step vs H100's ~0.75s/step) by using Context Parallel to split sequence across 2 data parallel ranks, allowing each rank to process half the sequence while all-gathering K/V for full attention context.
 
 ```bash
-# Compile V1 Flash (recommended, uses NKI Flash Attention)
-python neuron_qwen_image_edit/compile_transformer_v1_flash.py --height 1024 --width 1024 --patch_multiplier 3
+# Compile V3 CP (fastest, Context Parallel + NKI Flash Attention)
+./compile.sh v3_cp
+
+# Or compile V1 Flash (uses NKI Flash Attention)
+./compile.sh v1_flash
 
 # Or compile V2 Flash (ModelBuilder + NKI)
-python neuron_qwen_image_edit/compile_transformer_v2_flash.py --height 1024 --width 1024 --patch_multiplier 3
+./compile.sh v2_flash
 
 # Or compile V2 (ModelBuilder)
 ./compile.sh v2
@@ -87,36 +93,42 @@ Default compilation settings:
 ### 3. Run Inference
 
 ```bash
-# Two-image merging with V1 Flash (recommended, NKI Flash Attention)
-python run_qwen_image_edit.py \
+# Two-image merging with V3 CP (fastest, Context Parallel)
+NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py \
+    --images img1.png img2.png \
+    --prompt "combine these two people into a wedding photo" \
+    --use_v3_cp
+
+# Two-image merging with V1 Flash (NKI Flash Attention)
+NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py \
     --images img1.png img2.png \
     --prompt "combine these two people into a wedding photo" \
     --use_v1_flash
 
 # Two-image merging with V2 (ModelBuilder)
-python run_qwen_image_edit.py \
+NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py \
     --images img1.png img2.png \
     --prompt "combine these two people into a wedding photo" \
     --use_v2
 
 # Two-image merging with V1
-python run_qwen_image_edit.py \
+NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py \
     --images img1.png img2.png \
     --prompt "combine these two people into a wedding photo"
 
 # Single image editing (requires patch_multiplier=2)
-python run_qwen_image_edit.py \
+NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py \
     --images input.jpg \
     --prompt "change the background to a beach" \
     --patch_multiplier 2 \
     --use_v1_flash
 
 # With custom CFG scale
-python run_qwen_image_edit.py \
+NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py \
     --images input.jpg \
     --prompt "change the background to a beach" \
     --true_cfg_scale 6.0 \
-    --use_v1_flash
+    --use_v3_cp
 ```
 
 **Note**: CFG (Classifier-Free Guidance) runs the transformer twice sequentially per step, not with batch_size=2.
@@ -125,7 +137,8 @@ python run_qwen_image_edit.py \
 
 ```
 hf_pretrained_qwen_image_edit/
-├── README.md                      # This file
+├── README.md                      # English documentation
+├── README_CN.md                   # Chinese documentation
 ├── setup_nvme.sh                  # NVMe RAID0 mount script
 ├── compile.sh                     # Main compilation script
 ├── run_qwen_image_edit.py         # Inference script
@@ -136,6 +149,7 @@ hf_pretrained_qwen_image_edit/
 │   ├── compile_transformer_v2.py  # Transformer V2 compilation (ModelBuilder)
 │   ├── compile_transformer_v1_flash.py  # Transformer V1 Flash (NKI Flash Attention)
 │   ├── compile_transformer_v2_flash.py  # Transformer V2 Flash (ModelBuilder + NKI)
+│   ├── compile_transformer_v3_cp.py     # Transformer V3 CP (Context Parallel + NKI)
 │   ├── compile_text_encoder.py    # Text encoder compilation
 │   ├── neuron_commons.py          # Common utilities and wrappers
 │   ├── neuron_parallel_utils.py   # Tensor parallelism utilities
@@ -149,6 +163,7 @@ hf_pretrained_qwen_image_edit/
     ├── transformer_v2/            # V2: ModelBuilder compiled transformer
     ├── transformer_v1_flash/      # V1 Flash: NKI Flash Attention
     ├── transformer_v2_flash/      # V2 Flash: ModelBuilder + NKI
+    ├── transformer_v3_cp/         # V3 CP: Context Parallel (TP=4, CP=2) + NKI
     └── vision_encoder/            # Single device
 ```
 
@@ -158,7 +173,8 @@ hf_pretrained_qwen_image_edit/
 
 | Component | Total Params | Execution | Notes |
 |-----------|-------------|-----------|-------|
-| Transformer | 20.43B | TP=8 on Neuron | ~5.2 GB/shard |
+| Transformer (V3 CP) | 20.43B | **TP=4, CP=2** on Neuron | ~10.4 GB/shard, H100-comparable speed |
+| Transformer (V1/V2) | 20.43B | TP=8 on Neuron | ~5.2 GB/shard |
 | Language Model | 7.07B | CPU | GQA 28Q/4KV incompatible with TP=8 |
 | Vision Encoder | ~1.4B | CPU (default) | Can use Neuron with `--neuron_vision_encoder` |
 | VAE | ~300M | DP=8 on Neuron | Tiled processing for large images |
@@ -208,7 +224,54 @@ txt_rotary_emb = torch.stack([txt_freqs.real, txt_freqs.imag], dim=-1)  # [text_
 
 The RoPE is cached during compilation and loaded at inference time.
 
-#### 6. V1 Flash with NKI Flash Attention
+#### 6. V3 CP with Context Parallel
+
+V3 CP achieves H100-comparable performance by combining Context Parallel with Tensor Parallel:
+
+**Architecture**: TP=4, CP=2 (world_size=8)
+- **Tensor Parallel (TP=4)**: Shards model weights across 4 devices
+- **Context Parallel (CP=2)**: Each CP rank processes half the sequence
+
+**Key implementation details**:
+
+1. **SPMDRank for Runtime Rank Detection**: Uses `neuronx_distributed.parallel_layers.layers.SPMDRank` to get the correct global rank at runtime (not trace time). This is critical for proper scatter/gather operations.
+
+```python
+from neuronx_distributed.parallel_layers.layers import SPMDRank
+
+class NeuronQwenTransformerV3CP(nn.Module):
+    def __init__(self, ...):
+        self.global_rank = SPMDRank(world_size=world_size)
+        self.data_parallel_group = parallel_state.get_data_parallel_group()
+
+    def forward(self, hidden_states, ...):
+        # Compute DP rank at runtime
+        dp_rank = get_dp_rank_spmd(self.global_rank.get_rank(), self.tp_degree)
+        # Scatter input based on DP rank
+        hidden_states = scatter_to_process_group_spmd(hidden_states, dim=1, rank=dp_rank, ...)
+```
+
+2. **K/V All-Gather**: Each CP rank gathers full K/V from all CP ranks to see the complete context, while only computing attention for its local query portion.
+
+```python
+# In attention module
+if self.context_parallel_enabled:
+    # Gather full K/V across CP group
+    key = gather_from_tensor_model_parallel_region_with_dim(
+        key, dim=2, process_group=self.data_parallel_group
+    )
+    value = gather_from_tensor_model_parallel_region_with_dim(
+        value, dim=2, process_group=self.data_parallel_group
+    )
+```
+
+3. **Output All-Gather**: After attention, the outputs are all-gathered to reconstruct the full sequence.
+
+**Performance gain**: ~1.56x speedup over V1 Flash (0.77s/step vs 1.2s/step) because:
+- Each rank processes only 50% of the query sequence
+- Communication overhead is amortized by NKI Flash Attention efficiency
+
+#### 7. V1 Flash with NKI Flash Attention
 
 V1 Flash combines the best of both approaches:
 - Uses `parallel_model_trace` API (like V1) which supports NKI kernels
@@ -259,7 +322,8 @@ _flash_fwd_call = nki_jit()(attention_isa_kernel)
 |----------|---------|-------------|
 | `--images` | Required | Input image path(s), 1-3 images |
 | `--prompt` | Required | Edit instruction |
-| `--use_v1_flash` | False | Use V1 Flash transformer (NKI Flash Attention, recommended) |
+| `--use_v3_cp` | False | Use V3 CP transformer (Context Parallel + NKI, fastest) |
+| `--use_v1_flash` | False | Use V1 Flash transformer (NKI Flash Attention) |
 | `--use_v2_flash` | False | Use V2 Flash transformer (ModelBuilder + NKI Flash Attention) |
 | `--use_v2` | False | Use V2 transformer (ModelBuilder) |
 | `--height` | 1024 | Output image height (must match compiled model) |
@@ -303,10 +367,13 @@ Shapes are not compatible: f32[1,2048,3,128] vs f32[1,1024,1,128]
 | Platform | Transformer Speed | Total Time |
 |----------|------------------|------------|
 | H100 (without Flash Attention) | ~0.75s/step | ~60s |
-| **TRN2 V1 Flash (NKI)** | **~1.2s/step** | **~96s** |
+| **TRN2 V3 CP (Context Parallel + NKI)** | **~0.77s/step** | **~62s** |
+| TRN2 V1 Flash (NKI) | ~1.2s/step | ~96s |
 | TRN2 V2 Flash (ModelBuilder + NKI) | ~1.2s/step | ~96s |
 | TRN2 V2 (ModelBuilder) | ~1.2s/step | ~96s |
 | TRN2 V1 (parallel_model_trace) | ~2.4s/step | ~190s |
+
+**V3 CP achieves H100-comparable performance!** By using Context Parallel (CP=2) with Tensor Parallel (TP=4), each rank only processes half the sequence, achieving ~1.56x speedup over V1 Flash.
 
 ### Performance Analysis
 
@@ -335,17 +402,18 @@ The key difference is **RoPE (Rotary Position Embedding) handling**:
 2. **NKI Flash Attention vs Compiler-optimized SDPA**: No significant difference - Neuron compiler already optimizes SDPA very well
 3. **Compilation API (parallel_model_trace vs ModelBuilder)**: Minimal impact on final performance
 
-### V1 vs V2 vs V1 Flash vs V2 Flash Comparison
+### V1 vs V2 vs V1 Flash vs V2 Flash vs V3 CP Comparison
 
-| Aspect | V1 | V2 | V1 Flash (Recommended) | V2 Flash |
-|--------|-----|-----|------------------------|----------|
-| Compilation API | `parallel_model_trace` | `ModelBuilder` | `parallel_model_trace` | `ModelBuilder` |
-| Attention | Standard SDPA | Standard SDPA | **NKI Flash Attention** | **NKI Flash Attention** |
-| RoPE Handling | Computed inside model | Pre-computed as input | Pre-computed as input | Pre-computed as input |
-| Speed | ~2.4s/step | ~1.2s/step | **~1.2s/step** | ~1.2s/step |
-| Key Advantage | Simple implementation | Pre-computed RoPE | Pre-computed RoPE + NKI | Both |
+| Aspect | V1 | V2 | V1 Flash | V2 Flash | **V3 CP (Fastest)** |
+|--------|-----|-----|----------|----------|---------------------|
+| Compilation API | `parallel_model_trace` | `ModelBuilder` | `parallel_model_trace` | `ModelBuilder` | `ModelBuilder` |
+| Attention | Standard SDPA | Standard SDPA | NKI Flash | NKI Flash | **NKI Flash** |
+| RoPE Handling | Inside model | Pre-computed | Pre-computed | Pre-computed | Pre-computed |
+| Parallelism | TP=8 | TP=8 | TP=8 | TP=8 | **TP=4, CP=2** |
+| Speed | ~2.4s/step | ~1.2s/step | ~1.2s/step | ~1.2s/step | **~0.77s/step** |
+| Key Advantage | Simple | Pre-computed RoPE | NKI | Both | **Context Parallel** |
 
-**Recommendation**: Use **V1 Flash** for its simpler compilation path. V2 Flash offers no additional performance benefit.
+**Recommendation**: Use **V3 CP** for fastest performance (H100-comparable). Use V1 Flash if you need simpler debugging or don't want Context Parallel complexity.
 
 ### Compiler Optimizations
 
