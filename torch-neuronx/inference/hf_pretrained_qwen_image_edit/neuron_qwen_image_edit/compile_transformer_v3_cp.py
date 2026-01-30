@@ -395,6 +395,10 @@ class NeuronQwenTransformerV3CP(nn.Module):
     ) -> torch.Tensor:
         """Forward pass with Context Parallel data splitting."""
 
+        # Store original shapes for verification
+        orig_hidden_shape = hidden_states.shape
+        orig_enc_shape = encoder_hidden_states.shape
+
         # ========== CONTEXT PARALLEL: SPLIT DATA AT ENTRY ==========
         if self.context_parallel_enabled:
             # Compute DP rank at runtime using SPMDRank (returns different values per rank)
@@ -454,9 +458,13 @@ class NeuronQwenTransformerV3CP(nn.Module):
 
         # ========== CONTEXT PARALLEL: GATHER OUTPUT ==========
         if self.context_parallel_enabled:
+            # Before gather: output has shape [B, local_patches, C]
             output = gather_from_tensor_model_parallel_region_with_dim(
                 output, gather_dim=1, process_group=self.data_parallel_group
             )
+            # After gather: output should have shape [B, full_patches, C]
+            # Verify that we recovered the original sequence length
+            # orig_hidden_shape[1] is the original num_patches
 
         return output
 

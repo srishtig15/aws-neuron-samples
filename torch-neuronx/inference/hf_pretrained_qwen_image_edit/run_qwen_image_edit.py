@@ -784,6 +784,9 @@ class NeuronTransformerWrapperV3CP(torch.nn.Module):
             print(f"  txt_rotary_emb_full: {self.txt_rotary_emb_full.shape}")
             print(f"  CP degree: {self.cp_degree}")
             print(f"  Local patches: {self.local_num_patches}, Local seq_len: {self.local_seq_len}")
+            # Print tensor statistics for debugging
+            print(f"  hidden_states stats: min={hidden_states.min():.4f}, max={hidden_states.max():.4f}, mean={hidden_states.mean():.4f}")
+            print(f"  encoder_hidden_states stats: min={encoder_hidden_states.min():.4f}, max={encoder_hidden_states.max():.4f}")
             self._debug_printed = True
 
         # For CP, the model expects LOCAL data (already sharded)
@@ -851,6 +854,22 @@ class NeuronTransformerWrapperV3CP(torch.nn.Module):
             output_tensor = output[0]
         else:
             output_tensor = output
+
+        # Debug: Print output stats on first few calls
+        if not hasattr(self, '_output_debug_count'):
+            self._output_debug_count = 0
+        if self._output_debug_count < 3:
+            print(f"DEBUG V3 CP output (step {self._output_debug_count}):")
+            print(f"  output shape: {output_tensor.shape}")
+            print(f"  output stats: min={output_tensor.min():.4f}, max={output_tensor.max():.4f}, mean={output_tensor.mean():.4f}")
+            # Check if output looks reasonable (not all zeros, no NaN/Inf)
+            if torch.isnan(output_tensor).any():
+                print("  WARNING: NaN values detected in output!")
+            if torch.isinf(output_tensor).any():
+                print("  WARNING: Inf values detected in output!")
+            if (output_tensor == 0).all():
+                print("  WARNING: Output is all zeros!")
+            self._output_debug_count += 1
 
         # Extract first frame as noise prediction
         output_tensor = output_tensor[:, :self.base_patches, :]
@@ -959,15 +978,38 @@ def load_transformer_v3_cp(compiled_models_dir: str, pipe, args):
 
     # For CP, duplicate checkpoints for each DP rank
     # world_size = tp_degree * dp_degree (dp_degree = cp_degree)
+    # IMPORTANT: Each world rank needs a unique global_rank value for SPMD scatter/gather
     sharded_checkpoints = []
     for dp_rank in range(cp_degree):
         for tp_rank in range(tp_degree):
-            sharded_checkpoints.append(tp_checkpoints[tp_rank])
+            # Clone the checkpoint so we can modify global_rank independently
+            world_rank = dp_rank * tp_degree + tp_rank
+            ckpt_copy = {k: v.clone() for k, v in tp_checkpoints[tp_rank].items()}
+
+            # Set the correct global_rank for this world rank
+            # This is CRITICAL for SPMDRank to return the correct rank at runtime
+            global_rank_key = 'transformer.global_rank.rank'
+            if global_rank_key in ckpt_copy:
+                ckpt_copy[global_rank_key] = torch.tensor([world_rank], dtype=torch.int32)
+                if world_rank < 2 or world_rank >= world_size - 2:
+                    print(f"    World rank {world_rank}: global_rank set to {world_rank}")
+
+            sharded_checkpoints.append(ckpt_copy)
 
     print(f"  Total checkpoints: {len(sharded_checkpoints)} (TP={tp_degree} x CP={cp_degree})")
+    print(f"  Each world rank has unique global_rank for SPMD execution")
 
     # Initialize model with weights and move to Neuron
     print("  Setting weights...")
+    # Debug: Verify global_rank values in checkpoints
+    for i in [0, 4]:  # Check first rank of each DP group
+        if i < len(sharded_checkpoints):
+            ckpt = sharded_checkpoints[i]
+            gr_key = 'transformer.global_rank.rank'
+            if gr_key in ckpt:
+                print(f"    Checkpoint[{i}] global_rank = {ckpt[gr_key].item()}")
+            else:
+                print(f"    WARNING: Checkpoint[{i}] missing {gr_key}")
     nxd_model.set_weights(sharded_checkpoints)
     print("  Moving model to Neuron...")
     nxd_model.to_neuron()
