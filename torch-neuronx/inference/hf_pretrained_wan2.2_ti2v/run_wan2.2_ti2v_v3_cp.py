@@ -1,0 +1,356 @@
+"""
+Wan2.2 TI2V Inference with Context Parallel (V3 CP).
+
+This script uses:
+- NxDModel.load() for text_encoder (V2 API)
+- NxDModel.load() for transformer with CP (V3 CP API)
+- torch.jit.load() for decoder and post_quant_conv (V1 API)
+
+Key differences from v2:
+- Transformer uses TP=4, CP=2 (world_size=8)
+- Checkpoints are duplicated for CP ranks with unique global_rank
+- Pre-computed RoPE is loaded and passed to transformer
+
+Usage:
+    NEURON_RT_NUM_CORES=8 python run_wan2.2_ti2v_v3_cp.py --compiled_models_dir compile_workdir_v3_cp
+"""
+# IMPORTANT: Set environment variables BEFORE any imports
+import os
+os.environ["NEURON_RT_NUM_CORES"] = "8"  # Match world_size
+os.environ["LOCAL_WORLD_SIZE"] = "8"  # Required for NxD parallel state initialization
+os.environ["WORLD_SIZE"] = "8"  # Total world size for distributed
+os.environ["RANK"] = "0"  # Current rank (local process)
+os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "2"
+os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2"
+
+from diffusers import AutoencoderKLWan, WanPipeline
+from diffusers.utils import export_to_video
+
+import argparse
+import json
+import numpy as np
+import random
+import time
+import torch
+import torch_neuronx
+
+from neuronx_distributed import NxDModel, NxDParallelState
+from safetensors.torch import load_file
+
+from neuron_wan2_2_ti2v.neuron_commons_v2 import InferenceTextEncoderWrapperV2
+from neuron_wan2_2_ti2v.neuron_commons import SimpleWrapper, DecoderWrapper
+
+
+def set_seed(seed: int):
+    """Set all random seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    print(f"Random seed set to: {seed}")
+
+
+def load_model_config(model_path):
+    """Load model configuration from config.json."""
+    config_path = os.path.join(model_path, "config.json")
+    with open(config_path, "r") as f:
+        return json.load(f)
+
+
+def load_sharded_weights(model_path, tp_degree):
+    """Load TP sharded weights from safetensors files."""
+    weights_path = os.path.join(model_path, "weights")
+    sharded_weights = []
+    for rank in range(tp_degree):
+        ckpt_path = os.path.join(weights_path, f"tp{rank}_sharded_checkpoint.safetensors")
+        ckpt = load_file(ckpt_path)
+        sharded_weights.append(ckpt)
+    return sharded_weights
+
+
+def prepare_cp_checkpoints(tp_checkpoints, tp_degree, cp_degree):
+    """
+    Duplicate TP checkpoints for CP ranks with unique global_rank.
+
+    With TP=4, CP=2, world_size=8:
+    - Ranks 0-3 (CP rank 0): use tp_checkpoints[0-3]
+    - Ranks 4-7 (CP rank 1): use tp_checkpoints[0-3] with different global_rank
+
+    Args:
+        tp_checkpoints: List of TP checkpoint dicts (length = tp_degree)
+        tp_degree: Tensor parallel degree (4)
+        cp_degree: Context parallel degree (2)
+
+    Returns:
+        List of world_size checkpoints with unique global_rank per rank
+    """
+    world_size = tp_degree * cp_degree
+    sharded_checkpoints = []
+
+    for cp_rank in range(cp_degree):
+        for tp_rank in range(tp_degree):
+            world_rank = cp_rank * tp_degree + tp_rank
+
+            # Clone checkpoint
+            ckpt = {k: v.clone() for k, v in tp_checkpoints[tp_rank].items()}
+
+            # Set unique global_rank for SPMD scatter/gather
+            global_rank_key = "transformer.global_rank.rank"
+            if global_rank_key in ckpt:
+                ckpt[global_rank_key] = torch.tensor([world_rank], dtype=torch.int32)
+
+            sharded_checkpoints.append(ckpt)
+
+    print(f"Prepared {len(sharded_checkpoints)} checkpoints for world_size={world_size} (TP={tp_degree}, CP={cp_degree})")
+    return sharded_checkpoints
+
+
+class InferenceTransformerWrapperV3CP(torch.nn.Module):
+    """
+    Wrapper for transformer with Context Parallel (V3 CP).
+
+    Key differences from V2:
+    - Passes pre-computed RoPE (cos, sin) to transformer
+    - Handles CP-specific input shapes
+    """
+
+    def __init__(self, transformer, nxd_model, rotary_emb_cos, rotary_emb_sin):
+        super().__init__()
+        self.transformer = transformer  # Original transformer for config access
+        self.nxd_model = nxd_model
+        self.config = transformer.config
+        self.dtype = transformer.dtype
+        self.device = transformer.device
+        self.cache_context = transformer.cache_context
+
+        # Pre-computed RoPE
+        self.rotary_emb_cos = rotary_emb_cos
+        self.rotary_emb_sin = rotary_emb_sin
+
+    def forward(self, hidden_states, timestep=None, encoder_hidden_states=None, return_dict=False, **kwargs):
+        """Forward with pre-computed RoPE."""
+        # Call NxDModel with RoPE
+        if hasattr(self.nxd_model, 'inference'):
+            output = self.nxd_model.inference(
+                hidden_states=hidden_states,
+                timestep=timestep,
+                encoder_hidden_states=encoder_hidden_states,
+                rotary_emb_cos=self.rotary_emb_cos,
+                rotary_emb_sin=self.rotary_emb_sin,
+            )
+        else:
+            output = self.nxd_model(
+                hidden_states,
+                timestep,
+                encoder_hidden_states,
+                self.rotary_emb_cos,
+                self.rotary_emb_sin,
+            )
+
+        # Handle tuple return
+        if isinstance(output, (tuple, list)):
+            output = output[0]
+
+        return output
+
+
+def load_transformer_v3_cp(compiled_models_dir, pipe):
+    """
+    Load V3 CP compiled transformer.
+
+    Steps:
+    1. Load config to get TP/CP degrees
+    2. Load TP checkpoints
+    3. Duplicate for CP ranks with unique global_rank
+    4. Load NxDModel and set weights
+    5. Load pre-computed RoPE
+    6. Create wrapper
+
+    Args:
+        compiled_models_dir: Directory containing compiled models
+        pipe: Original pipeline for config access
+
+    Returns:
+        InferenceTransformerWrapperV3CP instance
+    """
+    v3_cp_path = f"{compiled_models_dir}/transformer_v3_cp"
+
+    # Load config
+    config = load_model_config(v3_cp_path)
+    tp_degree = config["tp_degree"]
+    cp_degree = config["cp_degree"]
+    world_size = config["world_size"]
+
+    print(f"Loading V3 CP transformer (TP={tp_degree}, CP={cp_degree}, world_size={world_size})...")
+
+    # Load TP checkpoints
+    tp_checkpoints = load_sharded_weights(v3_cp_path, tp_degree)
+
+    # Duplicate for CP ranks
+    cp_checkpoints = prepare_cp_checkpoints(tp_checkpoints, tp_degree, cp_degree)
+
+    # Load NxDModel
+    nxd_model_path = os.path.join(v3_cp_path, "nxd_model.pt")
+    nxd_model = NxDModel.load(nxd_model_path)
+    nxd_model.set_weights(cp_checkpoints)
+    nxd_model.to_neuron()
+
+    # Load pre-computed RoPE
+    rope_cache_path = os.path.join(v3_cp_path, "rope_cache.pt")
+    rope_cache = torch.load(rope_cache_path)
+    rotary_emb_cos = rope_cache["rotary_emb_cos"].to(torch.bfloat16)
+    rotary_emb_sin = rope_cache["rotary_emb_sin"].to(torch.bfloat16)
+    print(f"  Loaded RoPE: cos={rotary_emb_cos.shape}, sin={rotary_emb_sin.shape}")
+
+    # Create wrapper
+    wrapper = InferenceTransformerWrapperV3CP(
+        transformer=pipe.transformer,
+        nxd_model=nxd_model,
+        rotary_emb_cos=rotary_emb_cos,
+        rotary_emb_sin=rotary_emb_sin,
+    )
+
+    print("V3 CP transformer loaded.")
+    return wrapper
+
+
+# Defaults
+DEFAULT_COMPILED_MODELS_DIR = "compile_workdir_v3_cp"
+HUGGINGFACE_CACHE_DIR = "wan2.2_ti2v_hf_cache_dir"
+SEED = 42
+
+
+def main(args):
+    set_seed(SEED)
+    generator = torch.Generator().manual_seed(SEED)
+
+    DTYPE = torch.bfloat16
+    model_id = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+
+    # Load base pipeline
+    print("Loading base pipeline...")
+    vae = AutoencoderKLWan.from_pretrained(
+        model_id, subfolder="vae", torch_dtype=torch.float32, cache_dir=HUGGINGFACE_CACHE_DIR
+    )
+    pipe = WanPipeline.from_pretrained(
+        model_id, vae=vae, torch_dtype=DTYPE, cache_dir=HUGGINGFACE_CACHE_DIR
+    )
+
+    compiled_models_dir = args.compiled_models_dir
+    seqlen = args.max_sequence_length
+
+    # IMPORTANT: Load Transformer FIRST to set up correct process groups
+    # The transformer uses DP groups for Context Parallel communication
+    # Loading it first ensures the process groups are properly initialized
+    print("\nLoading transformer (V3 CP)...")
+    transformer_wrapper = load_transformer_v3_cp(compiled_models_dir, pipe)
+
+    # Load Text Encoder (V2) - after transformer to share process groups
+    print("\nLoading text encoder (V2)...")
+    text_encoder_dir = f"{compiled_models_dir}/text_encoder_v2"
+    text_encoder_wrapper = InferenceTextEncoderWrapperV2(
+        torch.bfloat16, pipe.text_encoder, seqlen
+    )
+    text_encoder_config = load_model_config(text_encoder_dir)
+    text_encoder_nxd = NxDModel.load(os.path.join(text_encoder_dir, "nxd_model.pt"))
+    text_encoder_weights = load_sharded_weights(text_encoder_dir, text_encoder_config["tp_degree"])
+    text_encoder_nxd.set_weights(text_encoder_weights)
+    text_encoder_nxd.to_neuron()
+    text_encoder_wrapper.t = text_encoder_nxd
+    print("Text encoder loaded.")
+
+    # Load Decoder (V1) - same as before
+    print("\nLoading decoder (V1)...")
+    decoder_model_path = f"{compiled_models_dir}/decoder/model.pt"
+    vae_decoder_wrapper = DecoderWrapper(pipe.vae.decoder)
+    vae_decoder_wrapper.model = torch.jit.load(decoder_model_path)
+    print("Decoder loaded.")
+
+    # Load post_quant_conv (V1) - same as before
+    print("\nLoading post_quant_conv (V1)...")
+    post_quant_conv_model_path = f"{compiled_models_dir}/post_quant_conv/model.pt"
+    vae_post_quant_conv_wrapper = SimpleWrapper(pipe.vae.post_quant_conv)
+    vae_post_quant_conv_wrapper.model = torch_neuronx.DataParallel(
+        torch.jit.load(post_quant_conv_model_path), [0, 1, 2, 3], False
+    )
+    print("post_quant_conv loaded.")
+
+    # Replace pipeline components
+    pipe.text_encoder = text_encoder_wrapper
+    pipe.transformer = transformer_wrapper
+    pipe.vae.decoder = vae_decoder_wrapper
+    pipe.vae.post_quant_conv = vae_post_quant_conv_wrapper
+
+    prompt = args.prompt
+    negative_prompt = args.negative_prompt
+
+    # Warmup
+    print("\nStarting warmup inference...")
+    start = time.time()
+    output_warmup = pipe(
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        height=args.height,
+        width=args.width,
+        num_frames=args.num_frames,
+        guidance_scale=5.0,
+        num_inference_steps=args.num_inference_steps,
+        max_sequence_length=seqlen,
+        generator=torch.Generator().manual_seed(SEED + 1000)
+    ).frames[0]
+    end = time.time()
+    print(f"Warmup time: {end - start:.2f}s")
+
+    # Reset generator
+    generator = torch.Generator().manual_seed(SEED)
+
+    # Main inference
+    print("\nStarting main inference...")
+    start = time.time()
+    output = pipe(
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        height=args.height,
+        width=args.width,
+        num_frames=args.num_frames,
+        guidance_scale=5.0,
+        num_inference_steps=args.num_inference_steps,
+        max_sequence_length=seqlen,
+        generator=generator
+    ).frames[0]
+    end = time.time()
+
+    inference_time = end - start
+    per_step_time = inference_time / args.num_inference_steps
+    print(f"\nInference time: {inference_time:.2f}s")
+    print(f"Per step: {per_step_time:.3f}s")
+    print(f"Output frames: {len(output)}")
+
+    # Save video
+    output_path = args.output
+    export_to_video(output, output_path, fps=24)
+    print(f"\nVideo saved to: {output_path}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Wan2.2 TI2V Inference with Context Parallel")
+    parser.add_argument("--compiled_models_dir", type=str, default=DEFAULT_COMPILED_MODELS_DIR,
+                        help="Directory containing compiled models")
+    parser.add_argument("--height", type=int, default=512, help="Video height")
+    parser.add_argument("--width", type=int, default=512, help="Video width")
+    parser.add_argument("--num_frames", type=int, default=81, help="Number of frames")
+    parser.add_argument("--max_sequence_length", type=int, default=512, help="Max text sequence length")
+    parser.add_argument("--num_inference_steps", type=int, default=50, help="Denoising steps")
+    parser.add_argument("--prompt", type=str, default="A cat walks on the grass, realistic",
+                        help="Text prompt")
+    parser.add_argument("--negative_prompt", type=str,
+                        default="Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards",
+                        help="Negative prompt")
+    parser.add_argument("--output", type=str, default="output_v3_cp.mp4", help="Output video path")
+    args = parser.parse_args()
+
+    # Initialize parallel state with world_size=8 and TP=4 (CP=2)
+    # This must wrap the entire execution to ensure process groups are available
+    print("Initializing NxDParallelState (world_size=8, TP=4, DP/CP=2)...")
+    with NxDParallelState(world_size=8, tensor_model_parallel_size=4):
+        main(args)
