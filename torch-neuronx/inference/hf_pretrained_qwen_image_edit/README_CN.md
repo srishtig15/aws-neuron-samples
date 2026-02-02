@@ -179,12 +179,14 @@ hf_pretrained_qwen_image_edit/
 | Transformer（V1/V2） | 204.3 亿 | TP=8 在 Neuron 上 | 约 5.2 GB/分片 |
 | 语言模型（V3） | 70.7 亿 | **TP=4** 在 Neuron 上 | 约 4.1 GB/分片，配合 V3 CP transformer 使用 |
 | 语言模型（V1/V2） | 70.7 亿 | CPU | GQA 28Q/4KV 与 TP=8 不兼容 |
-| 视觉编码器 | 约 14 亿 | CPU（默认） | 可通过 `--neuron_vision_encoder` 使用 Neuron |
+| 视觉编码器 | 约 14 亿 | 已编译到 Neuron（单设备），默认在 CPU 运行 | CPU 默认以获得更高精度 |
 | VAE | 约 3 亿 | DP=8 在 Neuron 上 | 大图使用分块处理 |
 
 **语言模型在 Neuron 上运行（V3）**：使用 V3 CP 时，语言模型可以使用 TP=4 在 Neuron 上运行。这是 GQA 的完美配置：28 个 Q 头 / 4 = 每 rank 7 个头，4 个 KV 头 / 4 = 每 rank 1 个头。使用 `--use_v3_language_model` 配合 `--use_v3_cp`。
 
 **为什么语言模型在 CPU 上运行（V1/V2）**：Qwen2.5-VL 语言模型使用分组查询注意力（GQA），28 个 Q 头和 4 个 KV 头（组大小为 7）。使用 TP=8 时，Q-KV 映射无法正确保持。有效的 TP 度只能是 1、2 或 4。
+
+**为什么视觉编码器默认在 CPU 运行**：视觉编码器已编译到 Neuron，但默认在 CPU 运行（`--cpu_vision_encoder`），因为编译版本可能存在精度损失，这些损失会被语言模型放大，可能导致输出质量下降。使用 `--neuron_vision_encoder` 可以在 Neuron 上运行以获得更快的速度，但会牺牲一些精度。
 
 ### 关键技术实现
 
@@ -366,8 +368,8 @@ _flash_fwd_call = nki_jit()(attention_isa_kernel)
 | `--max_sequence_length` | 1024 | 文本序列长度（必须与编译匹配） |
 | `--num_inference_steps` | 40 | 去噪步数 |
 | `--true_cfg_scale` | 4.0 | CFG 强度（每步运行两次 transformer） |
-| `--cpu_vision_encoder` | True | 在 CPU 上运行视觉编码器（默认） |
-| `--neuron_vision_encoder` | False | 在 Neuron 上运行视觉编码器 |
+| `--cpu_vision_encoder` | True | 在 CPU 上运行视觉编码器（默认，精度更高） |
+| `--neuron_vision_encoder` | False | 在 Neuron 上运行视觉编码器（更快，可能有精度损失） |
 | `--vae_tile_size` | 512 | VAE 分块处理尺寸 |
 
 ## 故障排除

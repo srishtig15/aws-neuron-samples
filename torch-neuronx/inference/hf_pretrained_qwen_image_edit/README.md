@@ -179,12 +179,14 @@ hf_pretrained_qwen_image_edit/
 | Transformer (V1/V2) | 20.43B | TP=8 on Neuron | ~5.2 GB/shard |
 | Language Model (V3) | 7.07B | **TP=4** on Neuron | ~4.1 GB/shard, used with V3 CP transformer |
 | Language Model (V1/V2) | 7.07B | CPU | GQA 28Q/4KV incompatible with TP=8 |
-| Vision Encoder | ~1.4B | CPU (default) | Can use Neuron with `--neuron_vision_encoder` |
+| Vision Encoder | ~1.4B | Compiled for Neuron (single device), runs on CPU by default | CPU default for higher accuracy |
 | VAE | ~300M | DP=8 on Neuron | Tiled processing for large images |
 
 **Language Model on Neuron (V3)**: With V3 CP, the language model can now run on Neuron using TP=4. This is a perfect fit for GQA: 28 Q heads / 4 = 7 heads per rank, 4 KV heads / 4 = 1 head per rank. Use `--use_v3_language_model` with `--use_v3_cp`.
 
 **Why Language Model runs on CPU (V1/V2)**: The Qwen2.5-VL language model uses Grouped Query Attention with 28 Q heads and 4 KV heads (group size = 7). With TP=8, the Q-KV mapping cannot be preserved correctly. Valid TP degrees are only 1, 2, or 4.
+
+**Why Vision Encoder defaults to CPU**: The Vision Encoder IS compiled for Neuron, but runs on CPU by default (`--cpu_vision_encoder`) because the compiled version can have precision loss that gets amplified by the language model, potentially causing lower quality outputs. Use `--neuron_vision_encoder` to run on Neuron for faster speed at the cost of some accuracy.
 
 ### Key Technical Implementations
 
@@ -366,8 +368,8 @@ _flash_fwd_call = nki_jit()(attention_isa_kernel)
 | `--max_sequence_length` | 1024 | Text sequence length (must match compilation) |
 | `--num_inference_steps` | 40 | Denoising steps |
 | `--true_cfg_scale` | 4.0 | CFG scale (runs transformer twice per step) |
-| `--cpu_vision_encoder` | True | Run vision encoder on CPU (default) |
-| `--neuron_vision_encoder` | False | Run vision encoder on Neuron |
+| `--cpu_vision_encoder` | True | Run vision encoder on CPU (default, higher accuracy) |
+| `--neuron_vision_encoder` | False | Run vision encoder on Neuron (faster, may have precision loss) |
 | `--vae_tile_size` | 512 | VAE tile size for tiled processing |
 
 ## Troubleshooting
