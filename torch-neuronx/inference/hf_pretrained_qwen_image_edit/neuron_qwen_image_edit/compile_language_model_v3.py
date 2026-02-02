@@ -298,14 +298,41 @@ def compile_language_model_v3(args):
             serialize_path=weights_path,
         )
 
-        # Verify checkpoint files
-        print("\nVerifying checkpoint files...")
+        # Post-process checkpoints: remove master_weight and add inv_freq
+        print("\nPost-processing checkpoints...")
+        from safetensors.torch import load_file, save_file
+
+        # Collect inv_freq buffers from original model (they are not in state_dict)
+        inv_freq_buffers = {}
+        for name, buf in neuron_language_model.language_model.named_buffers():
+            if 'inv_freq' in name:
+                full_key = f"language_model.language_model.{name}"
+                inv_freq_buffers[full_key] = buf.to(torch.bfloat16).clone()
+        print(f"  Collected {len(inv_freq_buffers)} inv_freq buffers")
+
         for rank in range(tp_degree):
             shard_file = os.path.join(weights_path, f"tp{rank}_sharded_checkpoint.safetensors")
-            if os.path.exists(shard_file):
-                print(f"  {shard_file}: OK")
-            else:
+            if not os.path.exists(shard_file):
                 print(f"  WARNING: {shard_file} not found!")
+                continue
+
+            # Load checkpoint
+            data = dict(load_file(shard_file))
+            original_count = len(data)
+            original_size = sum(v.numel() * v.element_size() for v in data.values())
+
+            # Remove master_weight tensors (they duplicate the sharded weights)
+            cleaned = {k: v for k, v in data.items() if 'master_weight' not in k}
+
+            # Add inv_freq buffers
+            cleaned.update(inv_freq_buffers)
+
+            cleaned_size = sum(v.numel() * v.element_size() for v in cleaned.values())
+
+            # Save optimized checkpoint
+            save_file(cleaned, shard_file)
+            print(f"  tp{rank}: {original_count} -> {len(cleaned)} tensors, "
+                  f"{original_size/1e9:.2f}GB -> {cleaned_size/1e9:.2f}GB")
 
         # Save config
         config = {

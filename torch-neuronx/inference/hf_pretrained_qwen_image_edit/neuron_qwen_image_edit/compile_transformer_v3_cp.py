@@ -644,20 +644,32 @@ def compile_transformer_v3_cp(args):
             serialize_path=weights_path,
         )
 
-        # Add global_rank state to each sharded checkpoint (same value for all ranks)
-        # Note: shard_checkpoint creates files named tp{rank}_sharded_checkpoint.safetensors
-        if global_rank_state:
-            print("Adding SPMDRank state to sharded checkpoints...")
-            from safetensors.torch import load_file, save_file
-            for rank in range(tp_degree):  # Only TP checkpoints are created, CP duplicates them at load time
-                shard_file = os.path.join(weights_path, f"tp{rank}_sharded_checkpoint.safetensors")
-                if os.path.exists(shard_file):
-                    shard_data = dict(load_file(shard_file))
-                    shard_data.update(global_rank_state)
-                    save_file(shard_data, shard_file)
-                    print(f"  Updated {shard_file}")
-                else:
-                    print(f"  WARNING: {shard_file} not found")
+        # Post-process sharded checkpoints:
+        # 1. Remove master_weight tensors (they duplicate sharded weights, wastes ~50% space)
+        # 2. Add global_rank state (SPMDRank) to each checkpoint
+        print("\nPost-processing sharded checkpoints...")
+        from safetensors.torch import load_file, save_file
+        for rank in range(tp_degree):  # Only TP checkpoints are created, CP duplicates them at load time
+            shard_file = os.path.join(weights_path, f"tp{rank}_sharded_checkpoint.safetensors")
+            if not os.path.exists(shard_file):
+                print(f"  WARNING: {shard_file} not found")
+                continue
+
+            shard_data = dict(load_file(shard_file))
+            original_count = len(shard_data)
+            original_size = sum(v.numel() * v.element_size() for v in shard_data.values())
+
+            # Remove master_weight tensors (they duplicate the sharded weights)
+            cleaned = {k: v for k, v in shard_data.items() if 'master_weight' not in k}
+
+            # Add SPMDRank state (same value for all ranks)
+            if global_rank_state:
+                cleaned.update(global_rank_state)
+
+            cleaned_size = sum(v.numel() * v.element_size() for v in cleaned.values())
+            save_file(cleaned, shard_file)
+            print(f"  tp{rank}: {original_count} -> {len(cleaned)} tensors, "
+                  f"{original_size/1e9:.2f}GB -> {cleaned_size/1e9:.2f}GB")
 
         # Save config
         config = {
