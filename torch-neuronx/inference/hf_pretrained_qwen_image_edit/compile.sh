@@ -141,14 +141,28 @@ if [[ "$VERSION_MODE" == "v3_cp" ]]; then
         --compiled_models_dir ${COMPILED_MODELS_DIR} \
         --compiler_workdir ${COMPILER_WORKDIR}
     echo "  V3 CP Transformer compiled successfully!"
+
+    # Also compile V3 Language Model (ModelBuilder API, TP=4, world_size=8)
+    echo ""
+    echo "  Compiling V3 Language Model (ModelBuilder API)..."
+    echo "  Using TP=4, world_size=8 (compatible with V3 CP transformer)"
+    python neuron_qwen_image_edit/compile_language_model_v3.py \
+        --max_sequence_length ${MAX_SEQ_LEN} \
+        --compiled_models_dir ${COMPILED_MODELS_DIR} \
+        --compiler_workdir ${COMPILER_WORKDIR}
+    echo "  V3 Language Model compiled successfully!"
 fi
 echo ""
 
-# Step 4: Vision Encoder (Language Model runs on CPU)
+# Step 4: Vision Encoder
 echo "[Step 4/4] Compiling Vision Encoder..."
 echo "Note: Text encoder (Qwen2.5-VL) has two components:"
 echo "  - Vision Encoder: compiled on single device (dims not divisible by TP=8)"
-echo "  - Language Model: runs on CPU (28Q/4KV heads incompatible with TP=8)"
+if [[ "$VERSION_MODE" == "v3_cp" ]]; then
+    echo "  - Language Model: compiled with V3 API (TP=4, world_size=8)"
+else
+    echo "  - Language Model: runs on CPU (28Q/4KV heads incompatible with TP=8)"
+fi
 python neuron_qwen_image_edit/compile_text_encoder.py \
     --vision_only \
     --image_size ${IMAGE_SIZE} \
@@ -178,13 +192,27 @@ if [[ "$VERSION_MODE" == "all" || "$VERSION_MODE" == "v2_flash" ]]; then
 fi
 if [[ "$VERSION_MODE" == "v3_cp" ]]; then
     echo "  - transformer_v3_cp/ (V3 CP, TP=4, CP=2, output: ${HEIGHT}x${WIDTH}, Context Parallel + NKI)"
+    echo "  - language_model_v3/ (V3, TP=4, world_size=8, ModelBuilder API)"
 fi
 echo "  - vision_encoder/"
 echo ""
-echo "Note: Language model runs on CPU (GQA 28Q/4KV incompatible with TP=8)"
+if [[ "$VERSION_MODE" == "v3_cp" ]]; then
+    echo "Note: Language model compiled with V3 API (TP=4, world_size=8)"
+    echo "      Compatible with V3 CP transformer"
+else
+    echo "Note: Language model runs on CPU (GQA 28Q/4KV incompatible with TP=8)"
+fi
 echo ""
 echo "To run inference on Trainium2:"
 echo ""
+if [[ "$VERSION_MODE" == "v3_cp" ]]; then
+    echo "  # V3 CP (Context Parallel + NKI, fastest, with V3 Language Model on Neuron):"
+    echo "  NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py \\"
+    echo "      --images input.jpg \\"
+    echo "      --prompt \"your edit instruction\" \\"
+    echo "      --use_v3_cp --use_v3_language_model"
+    echo ""
+fi
 echo "  # V1 Flash (recommended, NKI Flash Attention):"
 echo "  python run_qwen_image_edit.py \\"
 echo "      --images input.jpg \\"

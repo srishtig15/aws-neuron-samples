@@ -1030,6 +1030,103 @@ def load_transformer_v3_cp(compiled_models_dir: str, pipe, args):
     return wrapper
 
 
+def load_language_model_v3(compiled_models_dir: str):
+    """
+    Load V3 compiled language model using NxDModel.
+
+    V3 language models use:
+    - TP=4, world_size=8 (matching V3 CP transformer)
+    - ModelBuilder API (NxDModel)
+
+    Note: Unlike V3 CP transformer which splits sequence (Context Parallel),
+    the language model processes the full sequence on all ranks.
+    Checkpoints are simply duplicated for world_size=8.
+
+    Returns:
+        NxDModel wrapping the loaded language model
+    """
+    import json
+
+    if not NXD_MODEL_AVAILABLE:
+        raise RuntimeError(
+            "NxDModel is not available. Please ensure neuronx_distributed is installed correctly."
+        )
+
+    v3_path = f"{compiled_models_dir}/language_model_v3"
+    nxd_model_path = f"{v3_path}/nxd_model.pt"
+    weights_path = f"{v3_path}/weights"
+    config_path = f"{v3_path}/config.json"
+
+    # Validate files exist
+    if not os.path.exists(nxd_model_path):
+        raise FileNotFoundError(
+            f"V3 language model not found at {nxd_model_path}\n"
+            "Please run: python neuron_qwen_image_edit/compile_language_model_v3.py"
+        )
+    if not os.path.exists(weights_path):
+        raise FileNotFoundError(
+            f"V3 language model weights not found at {weights_path}\n"
+            "Please run: python neuron_qwen_image_edit/compile_language_model_v3.py"
+        )
+
+    # Load config
+    print(f"  Loading V3 language model config from {config_path}...")
+    with open(config_path, "r") as f:
+        config = json.load(f)
+
+    tp_degree = config.get("tp_degree", 4)
+    world_size = config.get("world_size", 8)
+    max_seq_len = config.get("max_sequence_length", 1024)
+    cp_degree = world_size // tp_degree  # 2
+
+    print(f"  V3 language model config:")
+    print(f"    TP={tp_degree}, world_size={world_size}")
+    print(f"    max_sequence_length={max_seq_len}")
+    print(f"    GQA: 28Q/4=7 heads/rank, 4KV/4=1 head/rank (perfect fit)")
+
+    # Load the compiled model using NxDModel.load()
+    print(f"  Loading V3 language model from {nxd_model_path}...")
+    nxd_model = NxDModel.load(nxd_model_path)
+
+    # Load sharded checkpoints
+    # For world_size=8 with TP=4: duplicate TP checkpoints for each CP rank
+    from safetensors.torch import load_file
+    print(f"  Loading sharded weights for TP={tp_degree}, world_size={world_size}...")
+
+    # First load the TP checkpoints (only tp_degree files exist)
+    tp_checkpoints = []
+    for rank in range(tp_degree):
+        ckpt_path = f"{weights_path}/tp{rank}_sharded_checkpoint.safetensors"
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+        ckpt = load_file(ckpt_path)
+        tp_checkpoints.append(ckpt)
+        if rank == 0:
+            print(f"    Rank 0 checkpoint keys: {len(ckpt)} tensors")
+
+    # Duplicate for world_size=8
+    # Unlike transformer CP which needs different global_rank values,
+    # language model processes full sequence on all ranks (no CP scatter/gather)
+    # So we simply duplicate the TP checkpoints
+    sharded_checkpoints = []
+    for cp_rank in range(cp_degree):
+        for tp_rank in range(tp_degree):
+            # Clone the checkpoint
+            ckpt_copy = {k: v.clone() for k, v in tp_checkpoints[tp_rank].items()}
+            sharded_checkpoints.append(ckpt_copy)
+
+    print(f"  Total checkpoints: {len(sharded_checkpoints)} (TP={tp_degree} x CP={cp_degree})")
+
+    # Initialize model with weights and move to Neuron
+    print("  Setting weights...")
+    nxd_model.set_weights(sharded_checkpoints)
+    print("  Moving model to Neuron...")
+    nxd_model.to_neuron()
+    print("  V3 language model initialized on Neuron!")
+
+    return nxd_model, config
+
+
 class NeuronVAEWrapper(torch.nn.Module):
     """
     Wrapper for VAE with compiled encoder and decoder on Trainium2.
@@ -1395,10 +1492,18 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     print("\n" + "=" * 60)
     print("Loading Compiled Models for Trainium2")
     print("=" * 60)
-    # Check if using CPU language model
-    # --neuron_language_model overrides --cpu_language_model
-    use_cpu_language_model = not getattr(args, 'neuron_language_model', False)
-    language_mode = "CPU" if use_cpu_language_model else "Neuron (compiled)"
+    # Check language model mode
+    # Priority: --use_v3_language_model > --neuron_language_model > --cpu_language_model (default)
+    use_v3_language_model = getattr(args, 'use_v3_language_model', False)
+    use_neuron_language_model = getattr(args, 'neuron_language_model', False)
+    use_cpu_language_model = not (use_v3_language_model or use_neuron_language_model)
+
+    if use_v3_language_model:
+        language_mode = "Neuron V3 (TP=4, world_size=8)"
+    elif use_neuron_language_model:
+        language_mode = "Neuron (TP=8, KV replication)"
+    else:
+        language_mode = "CPU"
 
     print("Parallel configuration:")
     print("  - VAE: Single device (avoid collective conflict)")
@@ -1407,7 +1512,10 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     print(f"  - Language Model: {language_mode}")
     if use_cpu_language_model:
         print("\nNOTE: Language Model on CPU (safe fallback mode)")
-        print("      Use --neuron_language_model for TP=8 compiled model")
+        print("      Use --use_v3_language_model for V3 compiled model (recommended with --use_v3_cp)")
+    elif use_v3_language_model:
+        print("\nNOTE: Language Model uses V3 (ModelBuilder API)")
+        print("      TP=4, world_size=8 - compatible with V3 CP transformer")
     else:
         print("\nNOTE: Language Model uses TP=8 with KV head replication")
         print("      (Q heads padded 28->32, KV heads replicated 4->8)")
@@ -1598,9 +1706,17 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
 
     # Load Language Model
     compiled_language_model = None
+    compiled_language_model_v3 = None
     cpu_language_model = None
+    language_model_config = None
 
-    if use_cpu_language_model:
+    if use_v3_language_model:
+        # V3 Language Model mode - uses ModelBuilder API with TP=4, world_size=8
+        # Compatible with V3 CP transformer
+        print("  Loading V3 Language Model (TP=4, world_size=8)...")
+        compiled_language_model_v3, language_model_config = load_language_model_v3(compiled_models_dir)
+        print("  V3 Language model loaded!")
+    elif use_cpu_language_model:
         # CPU Language Model mode - keeps original model on CPU
         # This avoids GQA alignment issues that occur with TP != 4
         print("  Using CPU Language Model (avoids GQA alignment issue)...")
@@ -1631,6 +1747,7 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
         original_text_encoder=original_text_encoder,
         compiled_vision_encoder=compiled_vision_encoder,
         compiled_language_model=compiled_language_model,
+        compiled_language_model_v3=compiled_language_model_v3,
         cpu_language_model=cpu_language_model,
         cpu_vision_encoder=cpu_vision_encoder,
         image_size=args.image_size,
@@ -1644,6 +1761,12 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
             print("  Language model kept on CPU.")
         if use_cpu_vision_encoder:
             print("  Vision encoder kept on CPU (highest accuracy mode).")
+    elif use_v3_language_model:
+        # V3 model loaded, can delete original
+        del original_text_encoder
+        gc.collect()
+        print("  Text encoder wrapper created!")
+        print("  Original text encoder deleted to free memory.")
     else:
         # Delete original text encoder to free ~16GB memory
         del original_text_encoder
@@ -2036,6 +2159,10 @@ if __name__ == "__main__":
     parser.add_argument("--neuron_language_model", action="store_true",
                         help="Use Neuron-compiled Language Model with TP=8 (KV head replication mode). "
                              "Requires: python compile_text_encoder.py --language_only --language_tp_degree 8")
+    parser.add_argument("--use_v3_language_model", action="store_true",
+                        help="Use V3 Language Model compiled with ModelBuilder API (TP=4, world_size=8). "
+                             "Compatible with V3 CP transformer. "
+                             "Requires: python neuron_qwen_image_edit/compile_language_model_v3.py")
 
     # Vision encoder mode
     parser.add_argument("--cpu_vision_encoder", action="store_true", default=True,

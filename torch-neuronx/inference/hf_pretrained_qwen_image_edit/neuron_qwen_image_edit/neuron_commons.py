@@ -53,15 +53,17 @@ class NeuronTextEncoderWrapper(nn.Module):
     This wrapper handles the embedding combination logic that normally
     happens inside the original text encoder.
 
-    Supports two modes for Language Model:
-    1. compiled_language_model: Neuron-compiled model (requires correct TP alignment)
-    2. cpu_language_model: Original model on CPU (slower but avoids GQA issues)
+    Supports three modes for Language Model:
+    1. compiled_language_model: Neuron-compiled model with parallel_model_trace (TP=8)
+    2. compiled_language_model_v3: Neuron-compiled model with ModelBuilder API (TP=4, world_size=8)
+    3. cpu_language_model: Original model on CPU (slower but avoids GQA issues)
 
     IMPORTANT: This wrapper COPIES necessary components and does NOT keep
     references to the original model, to avoid memory bloat.
     """
     def __init__(self, original_text_encoder, compiled_vision_encoder=None,
-                 compiled_language_model=None, cpu_language_model=None,
+                 compiled_language_model=None, compiled_language_model_v3=None,
+                 cpu_language_model=None,
                  cpu_vision_encoder=None,  # NEW: Option to use CPU vision encoder
                  image_size=448, max_seq_len=512):
         super().__init__()
@@ -94,6 +96,7 @@ class NeuronTextEncoderWrapper(nn.Module):
         # Compiled models
         self.compiled_vision_encoder = compiled_vision_encoder
         self.compiled_language_model = compiled_language_model
+        self.compiled_language_model_v3 = compiled_language_model_v3
 
         # CPU Vision Encoder (for better accuracy, avoids compilation precision loss)
         self.cpu_vision_encoder = cpu_vision_encoder
@@ -102,6 +105,9 @@ class NeuronTextEncoderWrapper(nn.Module):
         # CPU Language Model (alternative to compiled, avoids GQA alignment issues)
         self.cpu_language_model = cpu_language_model
         self.use_cpu_language_model = cpu_language_model is not None
+
+        # V3 Language Model (ModelBuilder API, TP=4, world_size=8)
+        self.use_v3_language_model = compiled_language_model_v3 is not None
 
         # DO NOT keep original_text_encoder - it's 16+ GB!
         # self.original_text_encoder = original_text_encoder  # REMOVED!
@@ -288,7 +294,7 @@ class NeuronTextEncoderWrapper(nn.Module):
         # - Image tokens: 3D grid positions based on spatial layout
         position_ids = self._get_rope_index(input_ids, image_grid_thw, attention_mask)
 
-        # Step 5: Run language model (CPU or compiled)
+        # Step 5: Run language model (CPU, V3, or compiled)
         _t2 = time.time()
         if self.use_cpu_language_model:
             # CPU Language Model mode - no padding needed, handles dynamic sequence lengths
@@ -304,6 +310,69 @@ class NeuronTextEncoderWrapper(nn.Module):
                 hidden_states = cpu_outputs.last_hidden_state
             _t3 = time.time()
             print(f"  [Profile] Language model (CPU): {_t3 - _t2:.2f}s")
+
+            # Create output similar to original
+            if return_dict:
+                return type('TextEncoderOutput', (), {
+                    'hidden_states': (hidden_states,),
+                    'last_hidden_state': hidden_states
+                })()
+            return hidden_states
+
+        elif self.use_v3_language_model:
+            # V3 Language Model mode (ModelBuilder API, TP=4, world_size=8)
+            # Compatible with V3 CP transformer
+            original_seq_len = inputs_embeds.shape[1]
+            hidden_size = inputs_embeds.shape[2]
+
+            if original_seq_len < self.max_seq_len:
+                # Pad inputs_embeds with zeros
+                pad_len = self.max_seq_len - original_seq_len
+                embed_padding = torch.zeros(
+                    batch_size, pad_len, hidden_size,
+                    dtype=inputs_embeds.dtype,
+                    device=inputs_embeds.device
+                )
+                inputs_embeds = torch.cat([inputs_embeds, embed_padding], dim=1)
+
+                # Pad attention_mask with zeros (masked positions)
+                if attention_mask is not None:
+                    mask_padding = torch.zeros(
+                        batch_size, pad_len,
+                        dtype=attention_mask.dtype,
+                        device=attention_mask.device
+                    )
+                    attention_mask = torch.cat([attention_mask, mask_padding], dim=1)
+
+                # Pad position_ids with sequential positions
+                if position_ids is not None:
+                    # position_ids shape: (3, batch, seq_len)
+                    last_pos = position_ids[:, :, -1:] + 1
+                    pad_positions = last_pos + torch.arange(pad_len, device=position_ids.device).view(1, 1, -1)
+                    position_ids = torch.cat([position_ids, pad_positions], dim=2)
+            elif original_seq_len > self.max_seq_len:
+                # Truncate if too long
+                print(f"  WARNING: Sequence length {original_seq_len} > max_seq_len {self.max_seq_len}, truncating")
+                inputs_embeds = inputs_embeds[:, :self.max_seq_len, :]
+                if attention_mask is not None:
+                    attention_mask = attention_mask[:, :self.max_seq_len]
+                if position_ids is not None:
+                    position_ids = position_ids[:, :, :self.max_seq_len]
+                original_seq_len = self.max_seq_len
+
+            # Run V3 compiled language model (NxDModel)
+            # V3 model expects: inputs_embeds, attention_mask, position_ids
+            hidden_states = self.compiled_language_model_v3(
+                inputs_embeds.to(torch.bfloat16),
+                attention_mask,
+                position_ids
+            )
+
+            # Remove padding from output
+            hidden_states = hidden_states[:, :original_seq_len, :]
+
+            _t3 = time.time()
+            print(f"  [Profile] Language model (Neuron V3): {_t3 - _t2:.2f}s")
 
             # Create output similar to original
             if return_dict:
@@ -372,8 +441,9 @@ class NeuronTextEncoderWrapper(nn.Module):
             # No language model available
             raise RuntimeError(
                 "No language model available! Please either:\n"
-                "1. Compile language model: python neuron_qwen_image_edit/compile_text_encoder.py --language_only\n"
-                "2. Use CPU language model by passing cpu_language_model to NeuronTextEncoderWrapper"
+                "1. Compile V3 language model: python neuron_qwen_image_edit/compile_language_model_v3.py\n"
+                "2. Compile V1 language model: python neuron_qwen_image_edit/compile_text_encoder.py --language_only\n"
+                "3. Use CPU language model by passing cpu_language_model to NeuronTextEncoderWrapper"
             )
 
     def _merge_embeddings(self, text_embeds, image_embeds, input_ids, image_token_id):

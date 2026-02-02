@@ -150,6 +150,7 @@ hf_pretrained_qwen_image_edit/
 │   ├── compile_transformer_v1_flash.py  # Transformer V1 Flash（NKI Flash Attention）
 │   ├── compile_transformer_v2_flash.py  # Transformer V2 Flash（ModelBuilder + NKI）
 │   ├── compile_transformer_v3_cp.py     # Transformer V3 CP（上下文并行 + NKI）
+│   ├── compile_language_model_v3.py     # 语言模型 V3（TP=4，配合 V3 CP）
 │   ├── compile_text_encoder.py    # 文本编码器编译
 │   ├── neuron_commons.py          # 通用工具和封装
 │   ├── neuron_parallel_utils.py   # 张量并行工具
@@ -164,6 +165,7 @@ hf_pretrained_qwen_image_edit/
     ├── transformer_v1_flash/      # V1 Flash：NKI Flash Attention
     ├── transformer_v2_flash/      # V2 Flash：ModelBuilder + NKI
     ├── transformer_v3_cp/         # V3 CP：上下文并行（TP=4, CP=2）+ NKI
+    ├── language_model_v3/         # 语言模型 V3：TP=4（配合 V3 CP）
     └── vision_encoder/            # 单设备
 ```
 
@@ -175,11 +177,14 @@ hf_pretrained_qwen_image_edit/
 |------|---------|---------|------|
 | Transformer（V3 CP） | 204.3 亿 | **TP=4, CP=2** 在 Neuron 上 | 约 10.4 GB/分片，达到 H100 性能水平 |
 | Transformer（V1/V2） | 204.3 亿 | TP=8 在 Neuron 上 | 约 5.2 GB/分片 |
-| 语言模型 | 70.7 亿 | CPU | GQA 28Q/4KV 与 TP=8 不兼容 |
+| 语言模型（V3） | 70.7 亿 | **TP=4** 在 Neuron 上 | 约 4.1 GB/分片，配合 V3 CP transformer 使用 |
+| 语言模型（V1/V2） | 70.7 亿 | CPU | GQA 28Q/4KV 与 TP=8 不兼容 |
 | 视觉编码器 | 约 14 亿 | CPU（默认） | 可通过 `--neuron_vision_encoder` 使用 Neuron |
 | VAE | 约 3 亿 | DP=8 在 Neuron 上 | 大图使用分块处理 |
 
-**为什么语言模型在 CPU 上运行**：Qwen2.5-VL 语言模型使用分组查询注意力（GQA），28 个 Q 头和 4 个 KV 头（组大小为 7）。使用 TP=8 时，Q-KV 映射无法正确保持。有效的 TP 度只能是 1、2 或 4。
+**语言模型在 Neuron 上运行（V3）**：使用 V3 CP 时，语言模型可以使用 TP=4 在 Neuron 上运行。这是 GQA 的完美配置：28 个 Q 头 / 4 = 每 rank 7 个头，4 个 KV 头 / 4 = 每 rank 1 个头。使用 `--use_v3_language_model` 配合 `--use_v3_cp`。
+
+**为什么语言模型在 CPU 上运行（V1/V2）**：Qwen2.5-VL 语言模型使用分组查询注意力（GQA），28 个 Q 头和 4 个 KV 头（组大小为 7）。使用 TP=8 时，Q-KV 映射无法正确保持。有效的 TP 度只能是 1、2 或 4。
 
 ### 关键技术实现
 
@@ -271,7 +276,34 @@ if self.context_parallel_enabled:
 - 每个 rank 只处理 50% 的 query 序列
 - 通信开销被 NKI Flash Attention 的效率所摊销
 
-#### 7. V1 Flash 与 NKI Flash Attention
+#### 7. 语言模型 V3 在 Neuron 上运行
+
+使用 V3 CP transformer（TP=4）时，语言模型也可以使用 TP=4 在 Neuron 上运行，而不是在 CPU 上：
+
+**为什么 TP=4 是语言模型的完美配置**：
+- Q 头：28 / 4 = 每 rank 7 个头（整除）
+- KV 头：4 / 4 = 每 rank 1 个头（整除）
+- 无需填充或复制！
+
+**编译**：语言模型使用 ModelBuilder API 编译，与 V3 CP transformer 使用相同的 `world_size=8`：
+
+```bash
+# 编译 V3 CP（包含语言模型 V3）
+./compile.sh v3_cp
+```
+
+**使用方法**：
+```bash
+NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py \
+    --images img1.png img2.png \
+    --prompt "将这两个人合成" \
+    --use_v3_cp \
+    --use_v3_language_model
+```
+
+**注意**：语言模型 V3 需要 V3 CP transformer（两者都使用 world_size=8）。使用 V1/V2/V1 Flash/V2 Flash（TP=8）时，语言模型必须在 CPU 上运行。
+
+#### 8. V1 Flash 与 NKI Flash Attention
 
 V1 Flash 结合了两种方法的优点：
 - 使用 `parallel_model_trace` API（与 V1 相同），支持 NKI 内核
@@ -323,6 +355,7 @@ _flash_fwd_call = nki_jit()(attention_isa_kernel)
 | `--images` | 必需 | 输入图像路径，支持 1-3 张图 |
 | `--prompt` | 必需 | 编辑指令 |
 | `--use_v3_cp` | False | 使用 V3 CP transformer（上下文并行 + NKI，最快） |
+| `--use_v3_language_model` | False | 使用 V3 语言模型在 Neuron 上运行（需要 V3 CP） |
 | `--use_v1_flash` | False | 使用 V1 Flash transformer（NKI Flash Attention） |
 | `--use_v2_flash` | False | 使用 V2 Flash transformer（ModelBuilder + NKI） |
 | `--use_v2` | False | 使用 V2 transformer（ModelBuilder） |
@@ -359,6 +392,69 @@ Failed to allocate X bytes
 Shapes are not compatible: f32[1,2048,3,128] vs f32[1,1024,1,128]
 ```
 **解决方案**：确保编译和推理之间的 `patch_multiplier` 匹配。
+
+### 检查点文件过大（master_weight 问题）
+
+编译后，如果检查点文件比预期大约 2 倍（例如 transformer 80GB 而不是 40GB，语言模型 28GB 而不是 14GB），说明 `shard_checkpoint()` 函数同时保存了 `master_weight`（完整未分片）和 `weight`（已分片）张量。
+
+**解决方案**：从检查点中删除 `master_weight` 张量：
+
+```python
+from safetensors.torch import load_file, save_file
+import os
+
+def cleanup_checkpoint(weights_dir):
+    """从分片检查点中删除 master_weight 张量"""
+    for rank in range(4):
+        path = os.path.join(weights_dir, f"tp{rank}_sharded_checkpoint.safetensors")
+        data = dict(load_file(path))
+        # 删除 master_weight 张量
+        cleaned = {k: v for k, v in data.items() if 'master_weight' not in k}
+        save_file(cleaned, path)
+        print(f"tp{rank}: {len(data)} -> {len(cleaned)} tensors")
+
+# 清理 transformer V3 CP
+cleanup_checkpoint("/path/to/compiled_models/transformer_v3_cp/weights")
+
+# 清理语言模型 V3
+cleanup_checkpoint("/path/to/compiled_models/language_model_v3/weights")
+```
+
+这可以将检查点大小减少约 50%，且不影响功能。
+
+### 缺少 inv_freq 张量（语言模型 V3）
+
+```
+RuntimeError: Missing weight tensor with key language_model.language_model.rotary_emb.inv_freq
+```
+
+**原因**：旋转位置编码的 `inv_freq` 缓冲区默认不包含在 `state_dict()` 中。
+
+**解决方案**：从原始模型添加 `inv_freq` 缓冲区到检查点：
+
+```python
+from safetensors.torch import load_file, save_file
+from diffusers import QwenImageEditPlusPipeline
+import torch
+
+# 加载原始模型
+pipe = QwenImageEditPlusPipeline.from_pretrained(model_path, torch_dtype=torch.bfloat16)
+lm = pipe.text_encoder.model.language_model
+
+# 收集 inv_freq 缓冲区
+inv_freq_buffers = {}
+for name, buf in lm.named_buffers():
+    if 'inv_freq' in name:
+        full_key = f"language_model.language_model.{name}"
+        inv_freq_buffers[full_key] = buf.to(torch.bfloat16).clone()
+
+# 添加到所有 TP 检查点
+for rank in range(4):
+    path = f"weights/tp{rank}_sharded_checkpoint.safetensors"
+    data = dict(load_file(path))
+    data.update(inv_freq_buffers)
+    save_file(data, path)
+```
 
 ## 性能
 
@@ -428,7 +524,20 @@ Shapes are not compatible: f32[1,2048,3,128] vs f32[1,1024,1,128]
 
 `--enable-ccop-compute-overlap` 标志对张量并行特别重要，它允许 all-reduce 操作与计算重叠，减少同步开销。
 
-### 组件耗时分解（V1 Flash / V2）
+### 组件耗时分解
+
+#### V3 CP 配合 V3 语言模型（最快）
+
+| 组件 | 时间 |
+|------|------|
+| 视觉编码器（CPU，首次调用） | ~21s |
+| 视觉编码器（CPU，缓存后） | ~0.7s |
+| **语言模型（Neuron V3）** | **~0.5s** |
+| VAE 编码 | ~0.4s |
+| **Transformer V3 CP（40 步 × 2 CFG）** | **~62s** |
+| VAE 解码 | ~1.6s |
+
+#### V1 Flash / V2 配合 CPU 语言模型
 
 | 组件 | 时间 |
 |------|------|
@@ -439,14 +548,15 @@ Shapes are not compatible: f32[1,2048,3,128] vs f32[1,1024,1,128]
 | **Transformer（40 步 × 2 CFG）** | **~96s** |
 | VAE 解码 | ~1.6s |
 
-Transformer 是主要瓶颈，占总推理时间的约 80%。
+Transformer 是主要瓶颈，占总推理时间的约 80%。V3 语言模型在 Neuron 上比 CPU 快约 2-8 倍。
 
 ## 已知限制
 
 1. **固定尺寸**：模型针对特定尺寸编译，不同尺寸需要重新编译。
-2. **语言模型**：由于 GQA 架构（28Q/4KV 头与 TP=8 不兼容），在 CPU 上运行。
+2. **语言模型（V1/V2）**：由于 GQA 架构（28Q/4KV 头与 TP=8 不兼容），在 CPU 上运行。使用 V3 CP 配合 V3 语言模型可在 Neuron 上运行。
 3. **序列长度**：编译和推理之间必须匹配。
 4. **NKI Flash Attention**：需要 `XLA_DISABLE_FUNCTIONALIZATION=1` 才能在 parallel_model_trace（V1 Flash）和 ModelBuilder（V2 Flash）中工作。没有此标志，NKI 内核会报"不可变输出参数"错误。
+5. **语言模型 V3**：仅与 V3 CP transformer 兼容（两者都使用 world_size=8，TP=4）。
 
 ## 参考资料
 

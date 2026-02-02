@@ -150,6 +150,7 @@ hf_pretrained_qwen_image_edit/
 │   ├── compile_transformer_v1_flash.py  # Transformer V1 Flash (NKI Flash Attention)
 │   ├── compile_transformer_v2_flash.py  # Transformer V2 Flash (ModelBuilder + NKI)
 │   ├── compile_transformer_v3_cp.py     # Transformer V3 CP (Context Parallel + NKI)
+│   ├── compile_language_model_v3.py     # Language Model V3 (TP=4, for V3 CP)
 │   ├── compile_text_encoder.py    # Text encoder compilation
 │   ├── neuron_commons.py          # Common utilities and wrappers
 │   ├── neuron_parallel_utils.py   # Tensor parallelism utilities
@@ -164,6 +165,7 @@ hf_pretrained_qwen_image_edit/
     ├── transformer_v1_flash/      # V1 Flash: NKI Flash Attention
     ├── transformer_v2_flash/      # V2 Flash: ModelBuilder + NKI
     ├── transformer_v3_cp/         # V3 CP: Context Parallel (TP=4, CP=2) + NKI
+    ├── language_model_v3/         # Language Model V3: TP=4 (for V3 CP)
     └── vision_encoder/            # Single device
 ```
 
@@ -175,11 +177,14 @@ hf_pretrained_qwen_image_edit/
 |-----------|-------------|-----------|-------|
 | Transformer (V3 CP) | 20.43B | **TP=4, CP=2** on Neuron | ~10.4 GB/shard, H100-comparable speed |
 | Transformer (V1/V2) | 20.43B | TP=8 on Neuron | ~5.2 GB/shard |
-| Language Model | 7.07B | CPU | GQA 28Q/4KV incompatible with TP=8 |
+| Language Model (V3) | 7.07B | **TP=4** on Neuron | ~4.1 GB/shard, used with V3 CP transformer |
+| Language Model (V1/V2) | 7.07B | CPU | GQA 28Q/4KV incompatible with TP=8 |
 | Vision Encoder | ~1.4B | CPU (default) | Can use Neuron with `--neuron_vision_encoder` |
 | VAE | ~300M | DP=8 on Neuron | Tiled processing for large images |
 
-**Why Language Model runs on CPU**: The Qwen2.5-VL language model uses Grouped Query Attention with 28 Q heads and 4 KV heads (group size = 7). With TP=8, the Q-KV mapping cannot be preserved correctly. Valid TP degrees are only 1, 2, or 4.
+**Language Model on Neuron (V3)**: With V3 CP, the language model can now run on Neuron using TP=4. This is a perfect fit for GQA: 28 Q heads / 4 = 7 heads per rank, 4 KV heads / 4 = 1 head per rank. Use `--use_v3_language_model` with `--use_v3_cp`.
+
+**Why Language Model runs on CPU (V1/V2)**: The Qwen2.5-VL language model uses Grouped Query Attention with 28 Q heads and 4 KV heads (group size = 7). With TP=8, the Q-KV mapping cannot be preserved correctly. Valid TP degrees are only 1, 2, or 4.
 
 ### Key Technical Implementations
 
@@ -271,7 +276,34 @@ if self.context_parallel_enabled:
 - Each rank processes only 50% of the query sequence
 - Communication overhead is amortized by NKI Flash Attention efficiency
 
-#### 7. V1 Flash with NKI Flash Attention
+#### 7. Language Model V3 on Neuron
+
+With V3 CP transformer using TP=4, the language model can also use TP=4 to run on Neuron instead of CPU:
+
+**Why TP=4 is perfect for Language Model**:
+- Q heads: 28 / 4 = 7 heads per rank (evenly divisible)
+- KV heads: 4 / 4 = 1 head per rank (evenly divisible)
+- No padding or replication needed!
+
+**Compilation**: The language model is compiled using ModelBuilder API with the same `world_size=8` as the V3 CP transformer:
+
+```bash
+# Compile V3 CP (includes language model V3)
+./compile.sh v3_cp
+```
+
+**Usage**:
+```bash
+NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py \
+    --images img1.png img2.png \
+    --prompt "combine these two people" \
+    --use_v3_cp \
+    --use_v3_language_model
+```
+
+**Note**: Language Model V3 requires V3 CP transformer (both use world_size=8). When using V1/V2/V1 Flash/V2 Flash (TP=8), the language model must run on CPU.
+
+#### 8. V1 Flash with NKI Flash Attention
 
 V1 Flash combines the best of both approaches:
 - Uses `parallel_model_trace` API (like V1) which supports NKI kernels
@@ -323,6 +355,7 @@ _flash_fwd_call = nki_jit()(attention_isa_kernel)
 | `--images` | Required | Input image path(s), 1-3 images |
 | `--prompt` | Required | Edit instruction |
 | `--use_v3_cp` | False | Use V3 CP transformer (Context Parallel + NKI, fastest) |
+| `--use_v3_language_model` | False | Use V3 language model on Neuron (requires V3 CP) |
 | `--use_v1_flash` | False | Use V1 Flash transformer (NKI Flash Attention) |
 | `--use_v2_flash` | False | Use V2 Flash transformer (ModelBuilder + NKI Flash Attention) |
 | `--use_v2` | False | Use V2 transformer (ModelBuilder) |
@@ -359,6 +392,69 @@ Failed to allocate X bytes
 Shapes are not compatible: f32[1,2048,3,128] vs f32[1,1024,1,128]
 ```
 **Solution**: Ensure `patch_multiplier` matches between compilation and inference.
+
+### Checkpoint Size Too Large (master_weight issue)
+
+After compilation, if checkpoint files are ~2x larger than expected (e.g., transformer 80GB instead of 40GB, language model 28GB instead of 14GB), the `shard_checkpoint()` function saved both `master_weight` (full unsharded) and `weight` (sharded) tensors.
+
+**Solution**: Remove `master_weight` tensors from checkpoints:
+
+```python
+from safetensors.torch import load_file, save_file
+import os
+
+def cleanup_checkpoint(weights_dir):
+    """Remove master_weight tensors from sharded checkpoints."""
+    for rank in range(4):
+        path = os.path.join(weights_dir, f"tp{rank}_sharded_checkpoint.safetensors")
+        data = dict(load_file(path))
+        # Remove master_weight tensors
+        cleaned = {k: v for k, v in data.items() if 'master_weight' not in k}
+        save_file(cleaned, path)
+        print(f"tp{rank}: {len(data)} -> {len(cleaned)} tensors")
+
+# Clean up transformer V3 CP
+cleanup_checkpoint("/path/to/compiled_models/transformer_v3_cp/weights")
+
+# Clean up language model V3
+cleanup_checkpoint("/path/to/compiled_models/language_model_v3/weights")
+```
+
+This reduces checkpoint size by ~50% without affecting functionality.
+
+### Missing inv_freq Tensors (Language Model V3)
+
+```
+RuntimeError: Missing weight tensor with key language_model.language_model.rotary_emb.inv_freq
+```
+
+**Cause**: The `inv_freq` buffers for rotary embeddings are not included in `state_dict()` by default.
+
+**Solution**: Add `inv_freq` buffers to checkpoints from the original model:
+
+```python
+from safetensors.torch import load_file, save_file
+from diffusers import QwenImageEditPlusPipeline
+import torch
+
+# Load original model
+pipe = QwenImageEditPlusPipeline.from_pretrained(model_path, torch_dtype=torch.bfloat16)
+lm = pipe.text_encoder.model.language_model
+
+# Collect inv_freq buffers
+inv_freq_buffers = {}
+for name, buf in lm.named_buffers():
+    if 'inv_freq' in name:
+        full_key = f"language_model.language_model.{name}"
+        inv_freq_buffers[full_key] = buf.to(torch.bfloat16).clone()
+
+# Add to all TP checkpoints
+for rank in range(4):
+    path = f"weights/tp{rank}_sharded_checkpoint.safetensors"
+    data = dict(load_file(path))
+    data.update(inv_freq_buffers)
+    save_file(data, path)
+```
 
 ## Performance
 
@@ -428,7 +524,20 @@ The following compiler flags are used for optimal performance:
 
 The `--enable-ccop-compute-overlap` flag is particularly important for tensor parallelism, as it allows all-reduce operations to overlap with computation, reducing synchronization overhead.
 
-### Component Timing Breakdown (V1 Flash / V2)
+### Component Timing Breakdown
+
+#### V3 CP with V3 Language Model (Fastest)
+
+| Component | Time |
+|-----------|------|
+| Vision Encoder (CPU, first call) | ~21s |
+| Vision Encoder (CPU, cached) | ~0.7s |
+| **Language Model (Neuron V3)** | **~0.5s** |
+| VAE Encode | ~0.4s |
+| **Transformer V3 CP (40 steps × 2 CFG)** | **~62s** |
+| VAE Decode | ~1.6s |
+
+#### V1 Flash / V2 with CPU Language Model
 
 | Component | Time |
 |-----------|------|
@@ -439,14 +548,15 @@ The `--enable-ccop-compute-overlap` flag is particularly important for tensor pa
 | **Transformer (40 steps × 2 CFG)** | **~96s** |
 | VAE Decode | ~1.6s |
 
-The transformer is the main bottleneck, accounting for ~80% of total inference time.
+The transformer is the main bottleneck, accounting for ~80% of total inference time. V3 Language Model on Neuron is ~2-8x faster than CPU.
 
 ## Known Limitations
 
 1. **Fixed dimensions**: Models are compiled for specific dimensions. Different sizes require recompilation.
-2. **Language model**: Runs on CPU due to GQA architecture (28Q/4KV heads incompatible with TP=8).
+2. **Language model (V1/V2)**: Runs on CPU due to GQA architecture (28Q/4KV heads incompatible with TP=8). Use V3 CP with V3 Language Model to run on Neuron.
 3. **Sequence length**: Must match between compilation and inference.
 4. **NKI Flash Attention**: Requires `XLA_DISABLE_FUNCTIONALIZATION=1` to work with both parallel_model_trace (V1 Flash) and ModelBuilder (V2 Flash). Without this flag, NKI kernels fail with "immutable output parameter" error.
+5. **Language Model V3**: Only compatible with V3 CP transformer (both use world_size=8, TP=4).
 
 ## References
 
