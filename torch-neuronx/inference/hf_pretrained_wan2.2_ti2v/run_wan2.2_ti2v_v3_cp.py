@@ -215,8 +215,8 @@ def load_transformer_v3_cp(compiled_models_dir, pipe):
 
 
 # Defaults
-DEFAULT_COMPILED_MODELS_DIR = "compile_workdir_v3_cp"
-HUGGINGFACE_CACHE_DIR = "wan2.2_ti2v_hf_cache_dir"
+DEFAULT_COMPILED_MODELS_DIR = "/opt/dlami/nvme/compile_workdir_v3_cp"
+HUGGINGFACE_CACHE_DIR = "/opt/dlami/nvme/wan2.2_ti2v_hf_cache_dir"
 SEED = 42
 
 
