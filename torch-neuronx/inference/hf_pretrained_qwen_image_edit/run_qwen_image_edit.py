@@ -1481,13 +1481,16 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     vision_encoder_tp_path = f"{compiled_models_dir}/vision_encoder_tp"
     use_vision_tp = args.vision_tp if hasattr(args, 'vision_tp') else False
     use_neuron_vision = getattr(args, 'neuron_vision_encoder', False)
+    use_vision_fp32 = getattr(args, 'vision_fp32', False)
     use_cpu_vision_encoder = not use_neuron_vision  # Default to CPU unless --neuron_vision_encoder
     if use_cpu_vision_encoder:
         vision_mode = "CPU (highest accuracy, default)"
     elif use_vision_tp or os.path.exists(vision_encoder_tp_path):
         vision_mode = "TP=8"
+    elif use_vision_fp32:
+        vision_mode = "single device (float32, higher precision)"
     else:
-        vision_mode = "single device"
+        vision_mode = "single device (bfloat16)"
 
     print("\n" + "=" * 60)
     print("Loading Compiled Models for Trainium2")
@@ -1690,6 +1693,18 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
         print(f"  Vision encoder loaded (TP={TP_DEGREE})!")
     else:
         # Load single-device vision encoder
+        # Check for fp32 version first if requested (use_vision_fp32 already defined at function start)
+        if use_vision_fp32:
+            vision_encoder_fp32_path = f"{compiled_models_dir}/vision_encoder_fp32/model.pt"
+            if os.path.exists(vision_encoder_fp32_path):
+                vision_encoder_single_path = vision_encoder_fp32_path
+                print("  Using float32 Vision Encoder for higher precision...")
+            else:
+                print(f"  WARNING: Float32 vision encoder not found at {vision_encoder_fp32_path}")
+                print("  Falling back to bfloat16 version.")
+                print("  To compile fp32 version: python compile_text_encoder.py --vision_only --vision_fp32")
+                use_vision_fp32 = False  # Reset flag since we're using bfloat16
+
         if not os.path.exists(vision_encoder_single_path):
             raise FileNotFoundError(
                 f"Vision encoder not found at {vision_encoder_single_path}\n"
@@ -1702,7 +1717,8 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
         # DataParallel would incorrectly split on patches dimension
         # Must use single device
         compiled_vision_encoder = vision_encoder_jit
-        print("  Vision encoder loaded (single device - input is patches, not batch)!")
+        dtype_str = "float32" if use_vision_fp32 else "bfloat16"
+        print(f"  Vision encoder loaded (single device, {dtype_str})!")
 
     # Load Language Model
     compiled_language_model = None
@@ -1743,6 +1759,8 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     # Create Text Encoder Wrapper
     # Store reference to original, then delete after wrapper is created
     original_text_encoder = pipe.text_encoder
+    # Determine if we're actually using fp32 vision encoder
+    actual_use_vision_fp32 = use_vision_fp32 and compiled_vision_encoder is not None
     pipe.text_encoder = NeuronTextEncoderWrapper(
         original_text_encoder=original_text_encoder,
         compiled_vision_encoder=compiled_vision_encoder,
@@ -1750,6 +1768,7 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
         compiled_language_model_v3=compiled_language_model_v3,
         cpu_language_model=cpu_language_model,
         cpu_vision_encoder=cpu_vision_encoder,
+        use_vision_fp32=actual_use_vision_fp32,
         image_size=args.image_size,
         max_seq_len=args.max_sequence_length
     )
@@ -2171,6 +2190,9 @@ if __name__ == "__main__":
     parser.add_argument("--neuron_vision_encoder", action="store_true",
                         help="Use Neuron-compiled Vision Encoder instead of CPU. "
                              "May have lower accuracy but faster speed.")
+    parser.add_argument("--vision_fp32", action="store_true",
+                        help="Use float32 Vision Encoder for higher precision (requires --neuron_vision_encoder). "
+                             "Compile with: python compile_text_encoder.py --vision_only --vision_fp32")
 
     # Inference settings
     parser.add_argument("--num_inference_steps", type=int, default=40,

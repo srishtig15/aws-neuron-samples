@@ -186,7 +186,10 @@ hf_pretrained_qwen_image_edit/
 
 **为什么语言模型在 CPU 上运行（V1/V2）**：Qwen2.5-VL 语言模型使用分组查询注意力（GQA），28 个 Q 头和 4 个 KV 头（组大小为 7）。使用 TP=8 时，Q-KV 映射无法正确保持。有效的 TP 度只能是 1、2 或 4。
 
-**为什么视觉编码器默认在 CPU 运行**：视觉编码器已编译到 Neuron，但默认在 CPU 运行（`--cpu_vision_encoder`），因为编译版本可能存在精度损失，这些损失会被语言模型放大，可能导致输出质量下降。使用 `--neuron_vision_encoder` 可以在 Neuron 上运行以获得更快的速度，但会牺牲一些精度。
+**为什么视觉编码器默认在 CPU 运行**：视觉编码器已编译到 Neuron，但默认在 CPU 运行（`--cpu_vision_encoder`），因为 bfloat16 编译版本可能存在精度损失，这些损失会被语言模型放大，可能导致输出质量下降。有三种运行方式：
+- `--cpu_vision_encoder`（默认）：在 CPU 上运行，精度最高但速度较慢
+- `--neuron_vision_encoder`：在 Neuron 上运行 bfloat16 版本，速度快但可能有精度损失
+- `--neuron_vision_encoder --vision_fp32`：在 Neuron 上运行 float32 版本，速度快且精度更高（需要先编译：`python compile_text_encoder.py --vision_only --vision_fp32`）
 
 ### 关键技术实现
 
@@ -370,6 +373,7 @@ _flash_fwd_call = nki_jit()(attention_isa_kernel)
 | `--true_cfg_scale` | 4.0 | CFG 强度（每步运行两次 transformer） |
 | `--cpu_vision_encoder` | True | 在 CPU 上运行视觉编码器（默认，精度更高） |
 | `--neuron_vision_encoder` | False | 在 Neuron 上运行视觉编码器（更快，可能有精度损失） |
+| `--vision_fp32` | False | 使用 float32 视觉编码器（需要 --neuron_vision_encoder，精度更高） |
 | `--vae_tile_size` | 512 | VAE 分块处理尺寸 |
 
 ## 故障排除

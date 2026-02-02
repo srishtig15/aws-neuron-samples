@@ -65,11 +65,13 @@ class NeuronTextEncoderWrapper(nn.Module):
                  compiled_language_model=None, compiled_language_model_v3=None,
                  cpu_language_model=None,
                  cpu_vision_encoder=None,  # NEW: Option to use CPU vision encoder
+                 use_vision_fp32=False,  # NEW: Use float32 vision encoder for higher precision
                  image_size=448, max_seq_len=512):
         super().__init__()
         # Copy config (small object)
         self.config = original_text_encoder.config
         self.dtype = torch.bfloat16
+        self.use_vision_fp32 = use_vision_fp32  # Track if we need fp32 input for vision encoder
 
         # IMPORTANT: Copy embed_tokens weights instead of keeping reference!
         # This allows the original model to be garbage collected.
@@ -225,8 +227,19 @@ class NeuronTextEncoderWrapper(nn.Module):
         # Step 1: Process images through vision encoder
         _t0 = time.time()
         if pixel_values is not None:
-            # Ensure pixel_values is bfloat16 and correct shape
-            pixel_values = pixel_values.to(torch.bfloat16)
+            # Determine dtype for vision encoder
+            # - CPU vision encoder: use original dtype (usually float32 from pipeline)
+            # - Compiled fp32: use float32
+            # - Compiled bfloat16: use bfloat16
+            if self.use_cpu_vision_encoder:
+                # Keep original dtype for CPU (highest precision)
+                pass
+            elif self.use_vision_fp32:
+                # Use float32 for compiled fp32 vision encoder
+                pixel_values = pixel_values.to(torch.float32)
+            else:
+                # Use bfloat16 for compiled bfloat16 vision encoder
+                pixel_values = pixel_values.to(torch.bfloat16)
 
             # Option 1: Use CPU Vision Encoder (highest accuracy)
             if self.use_cpu_vision_encoder:
@@ -235,30 +248,78 @@ class NeuronTextEncoderWrapper(nn.Module):
 
             # Option 2: Use compiled Vision Encoder (faster but may have precision loss)
             elif self.compiled_vision_encoder is not None:
-                # Check if we need to pad/reshape to expected size
-                expected_patches = (self.image_size // self.patch_size) ** 2  # 1024 for 448x448
+                # Compiled vision encoder expects fixed patch count for single image
+                expected_patches_per_image = (self.image_size // self.patch_size) ** 2  # 1024 for 448x448
                 actual_patches = pixel_values.shape[0]
+                num_images = image_grid_thw.shape[0]
 
-                if actual_patches != expected_patches:
-                    # Pad or truncate to expected size
-                    if actual_patches < expected_patches:
-                        # Pad with zeros
-                        padding = torch.zeros(
-                            expected_patches - actual_patches,
-                            pixel_values.shape[1],
-                            dtype=pixel_values.dtype,
-                            device=pixel_values.device
-                        )
-                        pixel_values = torch.cat([pixel_values, padding], dim=0)
-                    else:
-                        # Truncate
-                        pixel_values = pixel_values[:expected_patches]
+                # For multi-image input, process each image separately
+                if num_images > 1:
+                    # Process each image through compiled vision encoder
+                    all_embeds = []
+                    patch_idx = 0
+                    for img_idx in range(num_images):
+                        # Get grid dimensions for this image
+                        t, h, w = image_grid_thw[img_idx].tolist()
+                        img_patches = t * h * w  # patches for this image
 
-                    # Update image_grid_thw to match
-                    grid_size = self.image_size // self.patch_size
-                    image_grid_thw = torch.tensor([[1, grid_size, grid_size]], dtype=torch.int64)
+                        # Extract patches for this image
+                        img_pixel_values = pixel_values[patch_idx:patch_idx + img_patches]
+                        patch_idx += img_patches
 
-                image_embeds = self.compiled_vision_encoder(pixel_values, image_grid_thw)
+                        # Pad or truncate to expected size
+                        if img_patches < expected_patches_per_image:
+                            padding = torch.zeros(
+                                expected_patches_per_image - img_patches,
+                                img_pixel_values.shape[1],
+                                dtype=img_pixel_values.dtype,
+                                device=img_pixel_values.device
+                            )
+                            img_pixel_values = torch.cat([img_pixel_values, padding], dim=0)
+                        elif img_patches > expected_patches_per_image:
+                            img_pixel_values = img_pixel_values[:expected_patches_per_image]
+
+                        # Create grid_thw for single image
+                        grid_size = self.image_size // self.patch_size
+                        single_grid_thw = torch.tensor([[1, grid_size, grid_size]], dtype=torch.int64)
+
+                        # Run vision encoder for this image
+                        img_embeds = self.compiled_vision_encoder(img_pixel_values, single_grid_thw)
+
+                        # Calculate actual output tokens (after spatial merge)
+                        # merged_h = h // spatial_merge_size, merged_w = w // spatial_merge_size
+                        # But we need to use the original grid dimensions, not padded
+                        merged_h = h // self.spatial_merge_size
+                        merged_w = w // self.spatial_merge_size
+                        actual_output_tokens = t * merged_h * merged_w
+
+                        # Truncate to actual output size (remove padding)
+                        img_embeds = img_embeds[:actual_output_tokens]
+                        all_embeds.append(img_embeds)
+
+                    # Concatenate all image embeddings
+                    image_embeds = torch.cat(all_embeds, dim=0)
+                else:
+                    # Single image processing
+                    if actual_patches != expected_patches_per_image:
+                        if actual_patches < expected_patches_per_image:
+                            padding = torch.zeros(
+                                expected_patches_per_image - actual_patches,
+                                pixel_values.shape[1],
+                                dtype=pixel_values.dtype,
+                                device=pixel_values.device
+                            )
+                            pixel_values = torch.cat([pixel_values, padding], dim=0)
+                        else:
+                            pixel_values = pixel_values[:expected_patches_per_image]
+
+                        grid_size = self.image_size // self.patch_size
+                        image_grid_thw = torch.tensor([[1, grid_size, grid_size]], dtype=torch.int64)
+
+                    image_embeds = self.compiled_vision_encoder(pixel_values, image_grid_thw)
+
+                # Convert output to bfloat16 for downstream processing
+                image_embeds = image_embeds.to(torch.bfloat16)
                 # Note: merger is already included in compiled_vision_encoder
             else:
                 # No vision encoder available

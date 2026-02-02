@@ -186,7 +186,10 @@ hf_pretrained_qwen_image_edit/
 
 **Why Language Model runs on CPU (V1/V2)**: The Qwen2.5-VL language model uses Grouped Query Attention with 28 Q heads and 4 KV heads (group size = 7). With TP=8, the Q-KV mapping cannot be preserved correctly. Valid TP degrees are only 1, 2, or 4.
 
-**Why Vision Encoder defaults to CPU**: The Vision Encoder IS compiled for Neuron, but runs on CPU by default (`--cpu_vision_encoder`) because the compiled version can have precision loss that gets amplified by the language model, potentially causing lower quality outputs. Use `--neuron_vision_encoder` to run on Neuron for faster speed at the cost of some accuracy.
+**Why Vision Encoder defaults to CPU**: The Vision Encoder IS compiled for Neuron, but runs on CPU by default (`--cpu_vision_encoder`) because the bfloat16 compiled version can have precision loss that gets amplified by the language model, potentially causing lower quality outputs. There are three options:
+- `--cpu_vision_encoder` (default): Run on CPU, highest accuracy but slower
+- `--neuron_vision_encoder`: Run bfloat16 version on Neuron, fast but may have precision loss
+- `--neuron_vision_encoder --vision_fp32`: Run float32 version on Neuron, fast with higher precision (requires compilation: `python compile_text_encoder.py --vision_only --vision_fp32`)
 
 ### Key Technical Implementations
 
@@ -370,6 +373,7 @@ _flash_fwd_call = nki_jit()(attention_isa_kernel)
 | `--true_cfg_scale` | 4.0 | CFG scale (runs transformer twice per step) |
 | `--cpu_vision_encoder` | True | Run vision encoder on CPU (default, higher accuracy) |
 | `--neuron_vision_encoder` | False | Run vision encoder on Neuron (faster, may have precision loss) |
+| `--vision_fp32` | False | Use float32 vision encoder (requires --neuron_vision_encoder, higher precision) |
 | `--vae_tile_size` | 512 | VAE tile size for tiled processing |
 
 ## Troubleshooting

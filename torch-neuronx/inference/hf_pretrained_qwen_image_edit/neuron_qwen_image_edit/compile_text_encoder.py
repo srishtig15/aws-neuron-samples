@@ -224,7 +224,11 @@ def compile_vision_encoder(args):
 
     compiler_workdir = args.compiler_workdir
     compiled_models_dir = args.compiled_models_dir
-    dtype = torch.bfloat16
+
+    # Use float32 for higher precision if requested
+    use_fp32 = getattr(args, 'vision_fp32', False)
+    dtype = torch.float32 if use_fp32 else torch.bfloat16
+    dtype_str = "float32" if use_fp32 else "bfloat16"
 
     print("=" * 50)
     print("Compiling Vision Encoder (Single Device)")
@@ -233,12 +237,17 @@ def compile_vision_encoder(args):
     print(f"  Patch size: {patch_size}")
     print(f"  Num patches: {num_patches}")
     print(f"  Channels per patch: {channels_per_patch}")
+    print(f"  Dtype: {dtype_str}")
 
     pipe = load_pipeline(dtype)
 
     visual = pipe.text_encoder.model.visual
     visual.eval()
-    upcast_norms_to_f32(visual)
+
+    # For float32 mode, keep everything in float32 for maximum precision
+    # For bfloat16 mode, upcast norms to float32 for numerical stability
+    if not use_fp32:
+        upcast_norms_to_f32(visual)
 
     # Sample inputs
     # pixel_values: (total_patches, patch_dim)
@@ -248,17 +257,26 @@ def compile_vision_encoder(args):
 
     vision_wrapper = VisionEncoderWrapper(visual)
 
+    # Use --auto-cast=none for fp32 mode to prevent precision loss
+    vision_compiler_flags = compiler_flags
+    if use_fp32:
+        vision_compiler_flags = compiler_flags + " --auto-cast=none"
+
     with torch.no_grad():
         try:
             compiled_vision = torch_neuronx.trace(
                 vision_wrapper,
                 (sample_pixel_values, sample_grid_thw),
                 compiler_workdir=f"{compiler_workdir}/vision_encoder",
-                compiler_args=compiler_flags,
+                compiler_args=vision_compiler_flags,
                 inline_weights_to_neff=False
             )
 
-            vision_dir = f"{compiled_models_dir}/vision_encoder"
+            # Save to different directory for fp32 version
+            if use_fp32:
+                vision_dir = f"{compiled_models_dir}/vision_encoder_fp32"
+            else:
+                vision_dir = f"{compiled_models_dir}/vision_encoder"
             if not os.path.exists(vision_dir):
                 os.makedirs(vision_dir)
             torch.jit.save(compiled_vision, f"{vision_dir}/model.pt")
@@ -648,6 +666,10 @@ if __name__ == "__main__":
                              "Default=8 to match transformer TP degree.")
     parser.add_argument("--model_path", type=str, default=None,
                         help="Path to model (local dir or HuggingFace ID). If not set, uses MODEL_ID with CACHE_DIR")
+    parser.add_argument("--vision_fp32", action="store_true",
+                        help="Compile vision encoder in float32 for higher precision. "
+                             "This helps reduce precision loss when using --neuron_vision_encoder at inference. "
+                             "Output saved to vision_encoder_fp32/ directory.")
     args = parser.parse_args()
 
     # Override MODEL_ID and CACHE_DIR if model_path is provided
