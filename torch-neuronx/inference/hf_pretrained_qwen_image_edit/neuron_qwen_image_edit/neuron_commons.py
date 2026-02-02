@@ -64,14 +64,12 @@ class NeuronTextEncoderWrapper(nn.Module):
     def __init__(self, original_text_encoder, compiled_vision_encoder=None,
                  compiled_language_model=None, compiled_language_model_v3=None,
                  cpu_language_model=None,
-                 cpu_vision_encoder=None,  # NEW: Option to use CPU vision encoder
-                 use_vision_fp32=False,  # NEW: Use float32 vision encoder for higher precision
+                 cpu_vision_encoder=None,  # Option to use CPU vision encoder
                  image_size=448, max_seq_len=512):
         super().__init__()
         # Copy config (small object)
         self.config = original_text_encoder.config
         self.dtype = torch.bfloat16
-        self.use_vision_fp32 = use_vision_fp32  # Track if we need fp32 input for vision encoder
 
         # IMPORTANT: Copy embed_tokens weights instead of keeping reference!
         # This allows the original model to be garbage collected.
@@ -229,17 +227,13 @@ class NeuronTextEncoderWrapper(nn.Module):
         if pixel_values is not None:
             # Determine dtype for vision encoder
             # - CPU vision encoder: use original dtype (usually float32 from pipeline)
-            # - Compiled fp32: use float32
-            # - Compiled bfloat16: use bfloat16
+            # - Compiled vision encoder: always float32 (required for accuracy)
             if self.use_cpu_vision_encoder:
                 # Keep original dtype for CPU (highest precision)
                 pass
-            elif self.use_vision_fp32:
-                # Use float32 for compiled fp32 vision encoder
-                pixel_values = pixel_values.to(torch.float32)
             else:
-                # Use bfloat16 for compiled bfloat16 vision encoder
-                pixel_values = pixel_values.to(torch.bfloat16)
+                # Use float32 for compiled vision encoder (required for accuracy)
+                pixel_values = pixel_values.to(torch.float32)
 
             # Option 1: Use CPU Vision Encoder (highest accuracy)
             if self.use_cpu_vision_encoder:
@@ -331,7 +325,12 @@ class NeuronTextEncoderWrapper(nn.Module):
         else:
             image_embeds = None
         _t1 = time.time()
-        print(f"  [Profile] Vision encoder: {_t1 - _t0:.2f}s")
+        if self.use_cpu_vision_encoder:
+            print(f"  [Profile] Vision encoder (CPU): {_t1 - _t0:.2f}s")
+        elif self.compiled_vision_encoder is not None:
+            print(f"  [Profile] Vision encoder (Neuron, float32): {_t1 - _t0:.2f}s")
+        else:
+            print(f"  [Profile] Vision encoder (skipped): {_t1 - _t0:.2f}s")
 
         # Step 2: Get text embeddings
         text_embeds = self.embed_tokens(input_ids)

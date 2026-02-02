@@ -225,29 +225,24 @@ def compile_vision_encoder(args):
     compiler_workdir = args.compiler_workdir
     compiled_models_dir = args.compiled_models_dir
 
-    # Use float32 for higher precision if requested
-    use_fp32 = getattr(args, 'vision_fp32', False)
-    dtype = torch.float32 if use_fp32 else torch.bfloat16
-    dtype_str = "float32" if use_fp32 else "bfloat16"
+    # Always use float32 for vision encoder (required for accuracy)
+    dtype = torch.float32
 
     print("=" * 50)
-    print("Compiling Vision Encoder (Single Device)")
+    print("Compiling Vision Encoder (Single Device, float32)")
     print("=" * 50)
     print(f"  Image size: {image_size}x{image_size}")
     print(f"  Patch size: {patch_size}")
     print(f"  Num patches: {num_patches}")
     print(f"  Channels per patch: {channels_per_patch}")
-    print(f"  Dtype: {dtype_str}")
+    print(f"  Dtype: float32 (required for accuracy)")
 
     pipe = load_pipeline(dtype)
 
     visual = pipe.text_encoder.model.visual
     visual.eval()
 
-    # For float32 mode, keep everything in float32 for maximum precision
-    # For bfloat16 mode, upcast norms to float32 for numerical stability
-    if not use_fp32:
-        upcast_norms_to_f32(visual)
+    # Keep everything in float32 for maximum precision
 
     # Sample inputs
     # pixel_values: (total_patches, patch_dim)
@@ -257,10 +252,8 @@ def compile_vision_encoder(args):
 
     vision_wrapper = VisionEncoderWrapper(visual)
 
-    # Use --auto-cast=none for fp32 mode to prevent precision loss
-    vision_compiler_flags = compiler_flags
-    if use_fp32:
-        vision_compiler_flags = compiler_flags + " --auto-cast=none"
+    # Use --auto-cast=none to prevent precision loss
+    vision_compiler_flags = compiler_flags + " --auto-cast=none"
 
     with torch.no_grad():
         try:
@@ -272,15 +265,12 @@ def compile_vision_encoder(args):
                 inline_weights_to_neff=False
             )
 
-            # Save to different directory for fp32 version
-            if use_fp32:
-                vision_dir = f"{compiled_models_dir}/vision_encoder_fp32"
-            else:
-                vision_dir = f"{compiled_models_dir}/vision_encoder"
+            # Save to vision_encoder/ directory
+            vision_dir = f"{compiled_models_dir}/vision_encoder"
             if not os.path.exists(vision_dir):
                 os.makedirs(vision_dir)
             torch.jit.save(compiled_vision, f"{vision_dir}/model.pt")
-            print(f"Vision encoder compiled and saved to {vision_dir}")
+            print(f"Vision encoder (float32) compiled and saved to {vision_dir}")
             return True
 
         except Exception as e:
@@ -666,10 +656,7 @@ if __name__ == "__main__":
                              "Default=8 to match transformer TP degree.")
     parser.add_argument("--model_path", type=str, default=None,
                         help="Path to model (local dir or HuggingFace ID). If not set, uses MODEL_ID with CACHE_DIR")
-    parser.add_argument("--vision_fp32", action="store_true",
-                        help="Compile vision encoder in float32 for higher precision. "
-                             "This helps reduce precision loss when using --neuron_vision_encoder at inference. "
-                             "Output saved to vision_encoder_fp32/ directory.")
+    # Note: Vision encoder is always compiled in float32 for accuracy (required)
     args = parser.parse_args()
 
     # Override MODEL_ID and CACHE_DIR if model_path is provided

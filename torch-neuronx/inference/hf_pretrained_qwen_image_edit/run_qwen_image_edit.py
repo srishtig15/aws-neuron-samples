@@ -184,7 +184,7 @@ class NeuronTransformerWrapper(torch.nn.Module):
         self._step_times.append(time.time() - _t_start)
         if self._step_count % 10 == 0:
             avg_time = sum(self._step_times[-10:]) / 10
-            print(f"  [Profile] Transformer step {self._step_count}: avg {avg_time:.3f}s/step")
+            print(f"  [Profile] Transformer V1 (Neuron) step {self._step_count}: avg {avg_time:.3f}s/step")
 
         # 4. Remove padding from output if we padded hidden_states
         if actual_patches < self.expected_num_patches:
@@ -294,7 +294,7 @@ class NeuronTransformerWrapperV2(torch.nn.Module):
         self._step_times.append(time.time() - _t_start)
         if self._step_count % 10 == 0:
             avg_time = sum(self._step_times[-10:]) / 10
-            print(f"  [Profile] Transformer V2 step {self._step_count}: avg {avg_time:.3f}s/step")
+            print(f"  [Profile] Transformer V2 (Neuron) step {self._step_count}: avg {avg_time:.3f}s/step")
 
         # Extract tensor from output (handle tuple or tensor)
         if isinstance(output, tuple):
@@ -530,7 +530,7 @@ class NeuronTransformerWrapperV1Flash(torch.nn.Module):
         self._step_times.append(time.time() - _t_start)
         if self._step_count % 10 == 0:
             avg_time = sum(self._step_times[-10:]) / 10
-            print(f"  [Profile] Transformer V1 Flash step {self._step_count}: avg {avg_time:.3f}s/step")
+            print(f"  [Profile] Transformer V1 Flash (Neuron) step {self._step_count}: avg {avg_time:.3f}s/step")
 
         # Extract tensor from output
         if isinstance(output, tuple):
@@ -847,7 +847,7 @@ class NeuronTransformerWrapperV3CP(torch.nn.Module):
         self._step_times.append(time.time() - _t_start)
         if self._step_count % 10 == 0:
             avg_time = sum(self._step_times[-10:]) / 10
-            print(f"  [Profile] Transformer V3 CP step {self._step_count}: avg {avg_time:.3f}s/step")
+            print(f"  [Profile] Transformer V3 CP (Neuron) step {self._step_count}: avg {avg_time:.3f}s/step")
 
         # Extract tensor from output
         if isinstance(output, tuple):
@@ -1275,9 +1275,9 @@ class NeuronVAEWrapper(torch.nn.Module):
                 def __init__(self, latent_dist):
                     self.latent_dist = latent_dist
 
-            print(f"  [Profile] VAE encode: {time.time() - _t_enc_start:.2f}s")
+            print(f"  [Profile] VAE encode (Neuron): {time.time() - _t_enc_start:.2f}s")
             return EncoderOutput(LatentDist(sample, mean))
-        print(f"  [Profile] VAE encode: {time.time() - _t_enc_start:.2f}s")
+        print(f"  [Profile] VAE encode (Neuron): {time.time() - _t_enc_start:.2f}s")
         return sample
 
     def _tiled_encode(self, x):
@@ -1386,7 +1386,7 @@ class NeuronVAEWrapper(torch.nn.Module):
             if latent_h != expected_latent_h or latent_w != expected_latent_w:
                 dec = dec[:, :, :, :output_h, :output_w]
 
-        print(f"  [Profile] VAE decode: {time.time() - _t_dec_start:.2f}s")
+        print(f"  [Profile] VAE decode (Neuron): {time.time() - _t_dec_start:.2f}s")
         if return_dict:
             from diffusers.models.autoencoders.vae import DecoderOutput
             return DecoderOutput(sample=dec)
@@ -1477,20 +1477,17 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     import gc
 
     # Check for vision encoder mode
-    # --neuron_vision_encoder overrides default --cpu_vision_encoder
+    # CPU is the default for better accuracy, use --neuron_vision_encoder to use Neuron
     vision_encoder_tp_path = f"{compiled_models_dir}/vision_encoder_tp"
     use_vision_tp = args.vision_tp if hasattr(args, 'vision_tp') else False
-    use_neuron_vision = getattr(args, 'neuron_vision_encoder', False)
-    use_vision_fp32 = getattr(args, 'vision_fp32', False)
-    use_cpu_vision_encoder = not use_neuron_vision  # Default to CPU unless --neuron_vision_encoder
+    use_neuron_vision = getattr(args, 'neuron_vision_encoder', False)  # Default to CPU
+    use_cpu_vision_encoder = not use_neuron_vision
     if use_cpu_vision_encoder:
-        vision_mode = "CPU (highest accuracy, default)"
+        vision_mode = "CPU (default)"
     elif use_vision_tp or os.path.exists(vision_encoder_tp_path):
-        vision_mode = "TP=8"
-    elif use_vision_fp32:
-        vision_mode = "single device (float32, higher precision)"
+        vision_mode = "Neuron TP=8"
     else:
-        vision_mode = "single device (bfloat16)"
+        vision_mode = "Neuron (float32)"
 
     print("\n" + "=" * 60)
     print("Loading Compiled Models for Trainium2")
@@ -1692,19 +1689,7 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
         )
         print(f"  Vision encoder loaded (TP={TP_DEGREE})!")
     else:
-        # Load single-device vision encoder
-        # Check for fp32 version first if requested (use_vision_fp32 already defined at function start)
-        if use_vision_fp32:
-            vision_encoder_fp32_path = f"{compiled_models_dir}/vision_encoder_fp32/model.pt"
-            if os.path.exists(vision_encoder_fp32_path):
-                vision_encoder_single_path = vision_encoder_fp32_path
-                print("  Using float32 Vision Encoder for higher precision...")
-            else:
-                print(f"  WARNING: Float32 vision encoder not found at {vision_encoder_fp32_path}")
-                print("  Falling back to bfloat16 version.")
-                print("  To compile fp32 version: python compile_text_encoder.py --vision_only --vision_fp32")
-                use_vision_fp32 = False  # Reset flag since we're using bfloat16
-
+        # Load single-device vision encoder (always float32)
         if not os.path.exists(vision_encoder_single_path):
             raise FileNotFoundError(
                 f"Vision encoder not found at {vision_encoder_single_path}\n"
@@ -1717,8 +1702,7 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
         # DataParallel would incorrectly split on patches dimension
         # Must use single device
         compiled_vision_encoder = vision_encoder_jit
-        dtype_str = "float32" if use_vision_fp32 else "bfloat16"
-        print(f"  Vision encoder loaded (single device, {dtype_str})!")
+        print(f"  Vision encoder loaded (single device, float32)!")
 
     # Load Language Model
     compiled_language_model = None
@@ -1759,8 +1743,6 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     # Create Text Encoder Wrapper
     # Store reference to original, then delete after wrapper is created
     original_text_encoder = pipe.text_encoder
-    # Determine if we're actually using fp32 vision encoder
-    actual_use_vision_fp32 = use_vision_fp32 and compiled_vision_encoder is not None
     pipe.text_encoder = NeuronTextEncoderWrapper(
         original_text_encoder=original_text_encoder,
         compiled_vision_encoder=compiled_vision_encoder,
@@ -1768,7 +1750,6 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
         compiled_language_model_v3=compiled_language_model_v3,
         cpu_language_model=cpu_language_model,
         cpu_vision_encoder=cpu_vision_encoder,
-        use_vision_fp32=actual_use_vision_fp32,
         image_size=args.image_size,
         max_seq_len=args.max_sequence_length
     )
@@ -2184,15 +2165,11 @@ if __name__ == "__main__":
                              "Requires: python neuron_qwen_image_edit/compile_language_model_v3.py")
 
     # Vision encoder mode
-    parser.add_argument("--cpu_vision_encoder", action="store_true", default=True,
-                        help="Run Vision Encoder on CPU for higher accuracy (default). "
-                             "Compiled Vision Encoder has precision loss that gets amplified by LM.")
-    parser.add_argument("--neuron_vision_encoder", action="store_true",
-                        help="Use Neuron-compiled Vision Encoder instead of CPU. "
-                             "May have lower accuracy but faster speed.")
-    parser.add_argument("--vision_fp32", action="store_true",
-                        help="Use float32 Vision Encoder for higher precision (requires --neuron_vision_encoder). "
-                             "Compile with: python compile_text_encoder.py --vision_only --vision_fp32")
+    parser.add_argument("--cpu_vision_encoder", action="store_true",
+                        help="Run Vision Encoder on CPU (default behavior)")
+    parser.add_argument("--neuron_vision_encoder", action=argparse.BooleanOptionalAction, default=False,
+                        help="Use Neuron-compiled Vision Encoder (float32). "
+                             "CPU is used by default for better accuracy.")
 
     # Inference settings
     parser.add_argument("--num_inference_steps", type=int, default=40,
