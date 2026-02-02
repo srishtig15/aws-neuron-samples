@@ -2178,9 +2178,9 @@ if __name__ == "__main__":
     parser.add_argument("--neuron_language_model", action="store_true",
                         help="Use Neuron-compiled Language Model with TP=8 (KV head replication mode). "
                              "Requires: python compile_text_encoder.py --language_only --language_tp_degree 8")
-    parser.add_argument("--use_v3_language_model", action="store_true",
+    parser.add_argument("--use_v3_language_model", action=argparse.BooleanOptionalAction, default=True,
                         help="Use V3 Language Model compiled with ModelBuilder API (TP=4, world_size=8). "
-                             "Compatible with V3 CP transformer. "
+                             "Default: True. Use --no-use_v3_language_model to disable. "
                              "Requires: python neuron_qwen_image_edit/compile_language_model_v3.py")
 
     # Vision encoder mode
@@ -2221,9 +2221,9 @@ if __name__ == "__main__":
                         help="Use V2 Flash transformer with ModelBuilder + NKI Flash Attention. "
                              "Combines ModelBuilder's XLA optimization with NKI's hardware attention. "
                              "Requires: python neuron_qwen_image_edit/compile_transformer_v2_flash.py")
-    parser.add_argument("--use_v3_cp", action="store_true",
+    parser.add_argument("--use_v3_cp", action=argparse.BooleanOptionalAction, default=True,
                         help="Use V3 CP transformer with Context Parallel + NKI Flash Attention. "
-                             "Uses TP=4, CP=2 for improved performance (experimental). "
+                             "Default: True. Use --no-use_v3_cp to disable. "
                              "Requires: ./compile.sh v3_cp")
 
     # Other options
