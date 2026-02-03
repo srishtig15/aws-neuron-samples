@@ -89,6 +89,7 @@ Default compilation settings:
 - Max sequence length: 1024
 - TP degree: 8
 - Patch multiplier: 3 (for 2-image merging)
+- Batch size: 1 (for batched inference)
 
 ### 3. Run Inference
 
@@ -151,6 +152,7 @@ hf_pretrained_qwen_image_edit/
 │   ├── compile_transformer_v2_flash.py  # Transformer V2 Flash (ModelBuilder + NKI)
 │   ├── compile_transformer_v3_cp.py     # Transformer V3 CP (Context Parallel + NKI)
 │   ├── compile_language_model_v3.py     # Language Model V3 (TP=4, for V3 CP)
+│   ├── compile_vision_encoder_v3.py     # Vision Encoder V3 (TP=4, float32)
 │   ├── compile_text_encoder.py    # Text encoder compilation
 │   ├── neuron_commons.py          # Common utilities and wrappers
 │   ├── neuron_parallel_utils.py   # Tensor parallelism utilities
@@ -179,7 +181,8 @@ hf_pretrained_qwen_image_edit/
 | Transformer (V1/V2) | 20.43B | TP=8 on Neuron | ~5.2 GB/shard |
 | Language Model (V3) | 7.07B | **TP=4** on Neuron | ~4.1 GB/shard, used with V3 CP transformer |
 | Language Model (V1/V2) | 7.07B | CPU | GQA 28Q/4KV incompatible with TP=8 |
-| Vision Encoder | ~1.4B | Compiled for Neuron (single device), runs on CPU by default | CPU default for higher accuracy |
+| Vision Encoder (V3) | ~1.4B | **TP=4** on Neuron (float32) | 10-15x faster than CPU, used with V3 CP |
+| Vision Encoder (V1/V2) | ~1.4B | CPU by default | CPU for higher accuracy |
 | VAE | ~300M | DP=8 on Neuron | Tiled processing for large images |
 
 **Language Model on Neuron (V3)**: With V3 CP, the language model can now run on Neuron using TP=4. This is a perfect fit for GQA: 28 Q heads / 4 = 7 heads per rank, 4 KV heads / 4 = 1 head per rank. Use `--use_v3_language_model` with `--use_v3_cp`.
@@ -345,12 +348,14 @@ _flash_fwd_call = nki_jit()(attention_isa_kernel)
 ## Compilation Options
 
 ```bash
-./compile.sh [HEIGHT] [WIDTH] [IMAGE_SIZE] [TP_DEGREE] [MAX_SEQ_LEN] [PATCH_MULTIPLIER]
+./compile.sh [VERSION] [HEIGHT] [WIDTH] [IMAGE_SIZE] [TP_DEGREE] [MAX_SEQ_LEN] [PATCH_MULTIPLIER] [BATCH_SIZE]
 
 # Examples:
-./compile.sh 1024 1024 448 8 1024 3   # Default: 1024x1024, 2-image merge
-./compile.sh 1024 1024 448 8 1024 2   # Single image editing
-./compile.sh 512 512 224 8 512 2      # 512x512 output
+./compile.sh v3_cp                           # V3 CP with defaults
+./compile.sh v3_cp 1024 1024 448 8 1024 3 1  # V3 CP, batch_size=1 (default)
+./compile.sh v3_cp 1024 768 448 8 1024 3 2   # V3 CP, batch_size=2
+./compile.sh v1_flash 1024 1024 448 8 1024 2 # V1 Flash, single image editing
+./compile.sh 1024 1024 448 8 1024 3 1        # All versions, batch_size=1
 ```
 
 ## Inference Options
@@ -361,6 +366,7 @@ _flash_fwd_call = nki_jit()(attention_isa_kernel)
 | `--prompt` | Required | Edit instruction |
 | `--use_v3_cp` | False | Use V3 CP transformer (Context Parallel + NKI, fastest) |
 | `--use_v3_language_model` | False | Use V3 language model on Neuron (requires V3 CP) |
+| `--use_v3_vision_encoder` | False | Use V3 vision encoder on Neuron (TP=4, 10-15x faster than CPU) |
 | `--use_v1_flash` | False | Use V1 Flash transformer (NKI Flash Attention) |
 | `--use_v2_flash` | False | Use V2 Flash transformer (ModelBuilder + NKI Flash Attention) |
 | `--use_v2` | False | Use V2 transformer (ModelBuilder) |
@@ -532,7 +538,17 @@ The `--enable-ccop-compute-overlap` flag is particularly important for tensor pa
 
 ### Component Timing Breakdown
 
-#### V3 CP with V3 Language Model (Fastest)
+#### V3 CP with V3 Language Model and V3 Vision Encoder (Fastest)
+
+| Component | Time |
+|-----------|------|
+| **Vision Encoder (Neuron V3)** | **~1.5s** |
+| **Language Model (Neuron V3)** | **~0.5s** |
+| VAE Encode | ~0.4s |
+| **Transformer V3 CP (40 steps × 2 CFG)** | **~62s** |
+| VAE Decode | ~1.6s |
+
+#### V3 CP with CPU Vision Encoder
 
 | Component | Time |
 |-----------|------|
@@ -554,7 +570,7 @@ The `--enable-ccop-compute-overlap` flag is particularly important for tensor pa
 | **Transformer (40 steps × 2 CFG)** | **~96s** |
 | VAE Decode | ~1.6s |
 
-The transformer is the main bottleneck, accounting for ~80% of total inference time. V3 Language Model on Neuron is ~2-8x faster than CPU.
+The transformer is the main bottleneck, accounting for ~80% of total inference time. V3 Language Model on Neuron is ~2-8x faster than CPU. V3 Vision Encoder on Neuron is ~10-15x faster than CPU (first call).
 
 ## Known Limitations
 
@@ -563,6 +579,56 @@ The transformer is the main bottleneck, accounting for ~80% of total inference t
 3. **Sequence length**: Must match between compilation and inference.
 4. **NKI Flash Attention**: Requires `XLA_DISABLE_FUNCTIONALIZATION=1` to work with both parallel_model_trace (V1 Flash) and ModelBuilder (V2 Flash). Without this flag, NKI kernels fail with "immutable output parameter" error.
 5. **Language Model V3**: Only compatible with V3 CP transformer (both use world_size=8, TP=4).
+6. **Batch size**: Models compiled with batch_size > 1 have slower single-sample performance due to padding overhead (see Batch Inference below).
+
+## Batch Inference
+
+Models can be compiled with `batch_size > 1` to process multiple samples simultaneously, improving throughput for batch workloads.
+
+### Compilation
+
+```bash
+# Compile V3 CP with batch_size=2
+./compile.sh v3_cp 1024 768 448 8 1024 3 2
+```
+
+This compiles VAE, Transformer, and Language Model with batch_size=2.
+
+### How It Works
+
+When `batch_size=N` is specified during compilation:
+- **VAE**: Processes N tiles simultaneously during tiled encoding/decoding
+- **Transformer**: Processes N samples in parallel through diffusion steps
+- **Language Model (V3)**: Processes N text embeddings in a single forward pass
+
+At runtime, if the actual batch is smaller than compiled batch_size, inputs are automatically padded and outputs trimmed.
+
+### Trade-offs
+
+| Scenario | batch_size=1 | batch_size=2 | batch_size=4 |
+|----------|--------------|--------------|--------------|
+| Processing 1 sample | Fastest | Slower (padding overhead) | Slowest (more padding) |
+| Processing 2 samples | 2x time | ~1.7x time (batched) | Slower (padding) |
+| Processing 4 samples | 4x time | 2x time | ~2.8x time (batched) |
+
+**Recommendation**:
+- Use `batch_size=1` for interactive/single-sample workloads
+- Use `batch_size=2` or `batch_size=4` for batch processing pipelines where throughput matters more than single-sample latency
+
+### Runtime Usage
+
+The runtime automatically handles batch padding. No special flags needed:
+
+```bash
+# Single sample with batch_size=2 model (automatically padded)
+NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py \
+    --images input.jpg \
+    --prompt "edit instruction" \
+    --use_v3_cp
+
+# For true batch processing, use custom batch script
+# (see run_batch_tryon.py for example implementation)
+```
 
 ## References
 

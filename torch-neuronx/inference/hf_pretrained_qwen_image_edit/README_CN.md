@@ -89,6 +89,7 @@ python neuron_qwen_image_edit/cache_hf_model.py
 - 最大序列长度：1024
 - TP 度：8
 - Patch 倍数：3（用于双图合并）
+- 批处理大小：1（用于批量推理）
 
 ### 3. 运行推理
 
@@ -151,6 +152,7 @@ hf_pretrained_qwen_image_edit/
 │   ├── compile_transformer_v2_flash.py  # Transformer V2 Flash（ModelBuilder + NKI）
 │   ├── compile_transformer_v3_cp.py     # Transformer V3 CP（上下文并行 + NKI）
 │   ├── compile_language_model_v3.py     # 语言模型 V3（TP=4，配合 V3 CP）
+│   ├── compile_vision_encoder_v3.py     # 视觉编码器 V3（TP=4，float32）
 │   ├── compile_text_encoder.py    # 文本编码器编译
 │   ├── neuron_commons.py          # 通用工具和封装
 │   ├── neuron_parallel_utils.py   # 张量并行工具
@@ -179,7 +181,8 @@ hf_pretrained_qwen_image_edit/
 | Transformer（V1/V2） | 204.3 亿 | TP=8 在 Neuron 上 | 约 5.2 GB/分片 |
 | 语言模型（V3） | 70.7 亿 | **TP=4** 在 Neuron 上 | 约 4.1 GB/分片，配合 V3 CP transformer 使用 |
 | 语言模型（V1/V2） | 70.7 亿 | CPU | GQA 28Q/4KV 与 TP=8 不兼容 |
-| 视觉编码器 | 约 14 亿 | 已编译到 Neuron（单设备），默认在 CPU 运行 | CPU 默认以获得更高精度 |
+| 视觉编码器（V3） | 约 14 亿 | **TP=4** 在 Neuron 上（float32） | 比 CPU 快 10-15 倍，配合 V3 CP 使用 |
+| 视觉编码器（V1/V2） | 约 14 亿 | 默认在 CPU | CPU 以获得更高精度 |
 | VAE | 约 3 亿 | DP=8 在 Neuron 上 | 大图使用分块处理 |
 
 **语言模型在 Neuron 上运行（V3）**：使用 V3 CP 时，语言模型可以使用 TP=4 在 Neuron 上运行。这是 GQA 的完美配置：28 个 Q 头 / 4 = 每 rank 7 个头，4 个 KV 头 / 4 = 每 rank 1 个头。使用 `--use_v3_language_model` 配合 `--use_v3_cp`。
@@ -345,12 +348,14 @@ _flash_fwd_call = nki_jit()(attention_isa_kernel)
 ## 编译选项
 
 ```bash
-./compile.sh [HEIGHT] [WIDTH] [IMAGE_SIZE] [TP_DEGREE] [MAX_SEQ_LEN] [PATCH_MULTIPLIER]
+./compile.sh [VERSION] [HEIGHT] [WIDTH] [IMAGE_SIZE] [TP_DEGREE] [MAX_SEQ_LEN] [PATCH_MULTIPLIER] [BATCH_SIZE]
 
 # 示例：
-./compile.sh 1024 1024 448 8 1024 3   # 默认：1024x1024，双图合并
-./compile.sh 1024 1024 448 8 1024 2   # 单图编辑
-./compile.sh 512 512 224 8 512 2      # 512x512 输出
+./compile.sh v3_cp                           # V3 CP 使用默认参数
+./compile.sh v3_cp 1024 1024 448 8 1024 3 1  # V3 CP，batch_size=1（默认）
+./compile.sh v3_cp 1024 768 448 8 1024 3 2   # V3 CP，batch_size=2
+./compile.sh v1_flash 1024 1024 448 8 1024 2 # V1 Flash，单图编辑
+./compile.sh 1024 1024 448 8 1024 3 1        # 所有版本，batch_size=1
 ```
 
 ## 推理选项
@@ -361,6 +366,7 @@ _flash_fwd_call = nki_jit()(attention_isa_kernel)
 | `--prompt` | 必需 | 编辑指令 |
 | `--use_v3_cp` | False | 使用 V3 CP transformer（上下文并行 + NKI，最快） |
 | `--use_v3_language_model` | False | 使用 V3 语言模型在 Neuron 上运行（需要 V3 CP） |
+| `--use_v3_vision_encoder` | False | 使用 V3 视觉编码器在 Neuron 上运行（TP=4，比 CPU 快 10-15 倍） |
 | `--use_v1_flash` | False | 使用 V1 Flash transformer（NKI Flash Attention） |
 | `--use_v2_flash` | False | 使用 V2 Flash transformer（ModelBuilder + NKI） |
 | `--use_v2` | False | 使用 V2 transformer（ModelBuilder） |
@@ -532,7 +538,17 @@ for rank in range(4):
 
 ### 组件耗时分解
 
-#### V3 CP 配合 V3 语言模型（最快）
+#### V3 CP 配合 V3 语言模型和 V3 视觉编码器（最快）
+
+| 组件 | 时间 |
+|------|------|
+| **视觉编码器（Neuron V3）** | **~1.5s** |
+| **语言模型（Neuron V3）** | **~0.5s** |
+| VAE 编码 | ~0.4s |
+| **Transformer V3 CP（40 步 × 2 CFG）** | **~62s** |
+| VAE 解码 | ~1.6s |
+
+#### V3 CP 配合 CPU 视觉编码器
 
 | 组件 | 时间 |
 |------|------|
@@ -554,7 +570,7 @@ for rank in range(4):
 | **Transformer（40 步 × 2 CFG）** | **~96s** |
 | VAE 解码 | ~1.6s |
 
-Transformer 是主要瓶颈，占总推理时间的约 80%。V3 语言模型在 Neuron 上比 CPU 快约 2-8 倍。
+Transformer 是主要瓶颈，占总推理时间的约 80%。V3 语言模型在 Neuron 上比 CPU 快约 2-8 倍。V3 视觉编码器在 Neuron 上比 CPU 快约 10-15 倍（首次调用）。
 
 ## 已知限制
 
@@ -563,6 +579,56 @@ Transformer 是主要瓶颈，占总推理时间的约 80%。V3 语言模型在 
 3. **序列长度**：编译和推理之间必须匹配。
 4. **NKI Flash Attention**：需要 `XLA_DISABLE_FUNCTIONALIZATION=1` 才能在 parallel_model_trace（V1 Flash）和 ModelBuilder（V2 Flash）中工作。没有此标志，NKI 内核会报"不可变输出参数"错误。
 5. **语言模型 V3**：仅与 V3 CP transformer 兼容（两者都使用 world_size=8，TP=4）。
+6. **批处理大小**：使用 batch_size > 1 编译的模型在处理单个样本时会因填充开销而变慢（见下方批量推理章节）。
+
+## 批量推理
+
+模型可以使用 `batch_size > 1` 编译，以同时处理多个样本，提高批量工作负载的吞吐量。
+
+### 编译
+
+```bash
+# 使用 batch_size=2 编译 V3 CP
+./compile.sh v3_cp 1024 768 448 8 1024 3 2
+```
+
+这将使用 batch_size=2 编译 VAE、Transformer 和语言模型。
+
+### 工作原理
+
+在编译时指定 `batch_size=N`：
+- **VAE**：分块编解码时同时处理 N 个分块
+- **Transformer**：在扩散步骤中并行处理 N 个样本
+- **语言模型（V3）**：单次前向传播处理 N 个文本嵌入
+
+运行时，如果实际批次小于编译的 batch_size，输入会自动填充，输出会自动裁剪。
+
+### 权衡
+
+| 场景 | batch_size=1 | batch_size=2 | batch_size=4 |
+|------|--------------|--------------|--------------|
+| 处理 1 个样本 | 最快 | 较慢（填充开销） | 最慢（更多填充） |
+| 处理 2 个样本 | 2 倍时间 | ~1.7 倍时间（批处理） | 较慢（填充） |
+| 处理 4 个样本 | 4 倍时间 | 2 倍时间 | ~2.8 倍时间（批处理） |
+
+**建议**：
+- 交互式/单样本工作负载使用 `batch_size=1`
+- 吞吐量优先于单样本延迟的批处理流水线使用 `batch_size=2` 或 `batch_size=4`
+
+### 运行时使用
+
+运行时自动处理批次填充，无需特殊参数：
+
+```bash
+# 使用 batch_size=2 模型处理单个样本（自动填充）
+NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py \
+    --images input.jpg \
+    --prompt "编辑指令" \
+    --use_v3_cp
+
+# 真正的批处理，请使用自定义批处理脚本
+# （参见 run_batch_tryon.py 示例实现）
+```
 
 ## 参考资料
 
