@@ -62,6 +62,7 @@ class NeuronTextEncoderWrapper(nn.Module):
     references to the original model, to avoid memory bloat.
     """
     def __init__(self, original_text_encoder, compiled_vision_encoder=None,
+                 compiled_vision_encoder_v3=None,  # V3 vision encoder (TP=4, NxDModel)
                  compiled_language_model=None, compiled_language_model_v3=None,
                  cpu_language_model=None,
                  cpu_vision_encoder=None,  # Option to use CPU vision encoder
@@ -85,8 +86,9 @@ class NeuronTextEncoderWrapper(nn.Module):
               f"= {orig_embed.weight.numel() * 2 / 1e9:.2f} GB")
 
         # Copy visual_merger if it exists (small module)
-        if hasattr(original_text_encoder.model.visual, 'merger'):
-            # Deep copy the merger module
+        # Note: For V3 vision encoder, merger is included in the compiled model
+        if compiled_vision_encoder_v3 is None and hasattr(original_text_encoder.model.visual, 'merger'):
+            # Deep copy the merger module (only needed for non-V3 or CPU vision encoder)
             import copy
             self.visual_merger = copy.deepcopy(original_text_encoder.model.visual.merger)
             self.visual_merger = self.visual_merger.to(torch.bfloat16)
@@ -95,12 +97,16 @@ class NeuronTextEncoderWrapper(nn.Module):
 
         # Compiled models
         self.compiled_vision_encoder = compiled_vision_encoder
+        self.compiled_vision_encoder_v3 = compiled_vision_encoder_v3  # V3 (NxDModel, TP=4)
         self.compiled_language_model = compiled_language_model
         self.compiled_language_model_v3 = compiled_language_model_v3
 
         # CPU Vision Encoder (for better accuracy, avoids compilation precision loss)
         self.cpu_vision_encoder = cpu_vision_encoder
         self.use_cpu_vision_encoder = cpu_vision_encoder is not None
+
+        # V3 Vision Encoder (ModelBuilder API, TP=4, world_size=8, float32)
+        self.use_v3_vision_encoder = compiled_vision_encoder_v3 is not None
 
         # CPU Language Model (alternative to compiled, avoids GQA alignment issues)
         self.cpu_language_model = cpu_language_model
@@ -240,7 +246,82 @@ class NeuronTextEncoderWrapper(nn.Module):
                 with torch.no_grad():
                     image_embeds = self.cpu_vision_encoder(pixel_values, image_grid_thw)
 
-            # Option 2: Use compiled Vision Encoder (faster but may have precision loss)
+            # Option 2: Use V3 Vision Encoder (TP=4, NxDModel, float32, fast)
+            elif self.use_v3_vision_encoder:
+                # V3 vision encoder expects fixed patch count for single image
+                expected_patches_per_image = (self.image_size // self.patch_size) ** 2  # 1024 for 448x448
+                actual_patches = pixel_values.shape[0]
+                num_images = image_grid_thw.shape[0]
+
+                # For multi-image input, process each image separately
+                if num_images > 1:
+                    all_embeds = []
+                    patch_idx = 0
+                    for img_idx in range(num_images):
+                        t, h, w = image_grid_thw[img_idx].tolist()
+                        img_patches = t * h * w
+
+                        img_pixel_values = pixel_values[patch_idx:patch_idx + img_patches]
+                        patch_idx += img_patches
+
+                        # Pad or truncate to expected size
+                        if img_patches < expected_patches_per_image:
+                            padding = torch.zeros(
+                                expected_patches_per_image - img_patches,
+                                img_pixel_values.shape[1],
+                                dtype=img_pixel_values.dtype,
+                                device=img_pixel_values.device
+                            )
+                            img_pixel_values = torch.cat([img_pixel_values, padding], dim=0)
+                        elif img_patches > expected_patches_per_image:
+                            img_pixel_values = img_pixel_values[:expected_patches_per_image]
+
+                        # Create grid_thw for single image
+                        grid_size = self.image_size // self.patch_size
+                        single_grid_thw = torch.tensor([[1, grid_size, grid_size]], dtype=torch.int64)
+
+                        # Run V3 vision encoder (NxDModel)
+                        img_embeds = self.compiled_vision_encoder_v3(
+                            pixel_values=img_pixel_values,
+                            grid_thw=single_grid_thw
+                        )
+
+                        # Calculate actual output tokens (after spatial merge)
+                        merged_h = h // self.spatial_merge_size
+                        merged_w = w // self.spatial_merge_size
+                        actual_output_tokens = t * merged_h * merged_w
+
+                        # Truncate to actual output size (remove padding)
+                        img_embeds = img_embeds[:actual_output_tokens]
+                        all_embeds.append(img_embeds)
+
+                    image_embeds = torch.cat(all_embeds, dim=0)
+                else:
+                    # Single image processing
+                    if actual_patches != expected_patches_per_image:
+                        if actual_patches < expected_patches_per_image:
+                            padding = torch.zeros(
+                                expected_patches_per_image - actual_patches,
+                                pixel_values.shape[1],
+                                dtype=pixel_values.dtype,
+                                device=pixel_values.device
+                            )
+                            pixel_values = torch.cat([pixel_values, padding], dim=0)
+                        else:
+                            pixel_values = pixel_values[:expected_patches_per_image]
+
+                        grid_size = self.image_size // self.patch_size
+                        image_grid_thw = torch.tensor([[1, grid_size, grid_size]], dtype=torch.int64)
+
+                    image_embeds = self.compiled_vision_encoder_v3(
+                        pixel_values=pixel_values,
+                        grid_thw=image_grid_thw
+                    )
+
+                # Convert output to bfloat16 for downstream processing
+                image_embeds = image_embeds.to(torch.bfloat16)
+
+            # Option 3: Use single-device compiled Vision Encoder (slower)
             elif self.compiled_vision_encoder is not None:
                 # Compiled vision encoder expects fixed patch count for single image
                 expected_patches_per_image = (self.image_size // self.patch_size) ** 2  # 1024 for 448x448
@@ -327,8 +408,10 @@ class NeuronTextEncoderWrapper(nn.Module):
         _t1 = time.time()
         if self.use_cpu_vision_encoder:
             print(f"  [Profile] Vision encoder (CPU): {_t1 - _t0:.2f}s")
+        elif self.use_v3_vision_encoder:
+            print(f"  [Profile] Vision encoder (Neuron V3, TP=4, float32): {_t1 - _t0:.2f}s")
         elif self.compiled_vision_encoder is not None:
-            print(f"  [Profile] Vision encoder (Neuron, float32): {_t1 - _t0:.2f}s")
+            print(f"  [Profile] Vision encoder (Neuron, single device, float32): {_t1 - _t0:.2f}s")
         else:
             print(f"  [Profile] Vision encoder (skipped): {_t1 - _t0:.2f}s")
 

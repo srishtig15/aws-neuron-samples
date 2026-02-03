@@ -1127,6 +1127,103 @@ def load_language_model_v3(compiled_models_dir: str):
     return nxd_model, config
 
 
+def load_vision_encoder_v3(compiled_models_dir: str):
+    """
+    Load V3 compiled vision encoder using NxDModel.
+
+    V3 vision encoder uses:
+    - TP=4, world_size=8 (matching V3 CP transformer)
+    - ModelBuilder API (NxDModel)
+    - Float32 precision for accuracy
+
+    Note: Vision encoder dimensions require TP=4:
+    - QKV dim = 3420, 3420/4=855 (divisible)
+    - 3420/8=427.5 (NOT divisible, TP=8 doesn't work)
+
+    Returns:
+        NxDModel wrapping the loaded vision encoder, config dict
+    """
+    import json
+
+    if not NXD_MODEL_AVAILABLE:
+        raise RuntimeError(
+            "NxDModel is not available. Please ensure neuronx_distributed is installed correctly."
+        )
+
+    v3_path = f"{compiled_models_dir}/vision_encoder_v3"
+    nxd_model_path = f"{v3_path}/nxd_model.pt"
+    weights_path = f"{v3_path}/weights"
+    config_path = f"{v3_path}/config.json"
+
+    # Validate files exist
+    if not os.path.exists(nxd_model_path):
+        raise FileNotFoundError(
+            f"V3 vision encoder not found at {nxd_model_path}\n"
+            "Please run: python neuron_qwen_image_edit/compile_vision_encoder_v3.py"
+        )
+    if not os.path.exists(weights_path):
+        raise FileNotFoundError(
+            f"V3 vision encoder weights not found at {weights_path}\n"
+            "Please run: python neuron_qwen_image_edit/compile_vision_encoder_v3.py"
+        )
+
+    # Load config
+    print(f"  Loading V3 vision encoder config from {config_path}...")
+    with open(config_path, "r") as f:
+        config = json.load(f)
+
+    tp_degree = config.get("tp_degree", 4)
+    world_size = config.get("world_size", 8)
+    image_size = config.get("image_size", 448)
+    cp_degree = world_size // tp_degree  # 2
+
+    print(f"  V3 vision encoder config:")
+    print(f"    TP={tp_degree}, world_size={world_size}")
+    print(f"    image_size={image_size}")
+    print(f"    dtype=float32 (required for accuracy)")
+
+    # Load the compiled model using NxDModel.load()
+    print(f"  Loading V3 vision encoder from {nxd_model_path}...")
+    nxd_model = NxDModel.load(nxd_model_path)
+
+    # Load sharded checkpoints
+    # For world_size=8 with TP=4: duplicate TP checkpoints for each CP rank
+    from safetensors.torch import load_file
+    print(f"  Loading sharded weights for TP={tp_degree}, world_size={world_size}...")
+
+    # First load the TP checkpoints (only tp_degree files exist)
+    tp_checkpoints = []
+    for rank in range(tp_degree):
+        ckpt_path = f"{weights_path}/tp{rank}_sharded_checkpoint.safetensors"
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+        ckpt = load_file(ckpt_path)
+        tp_checkpoints.append(ckpt)
+        if rank == 0:
+            print(f"    Rank 0 checkpoint keys: {len(ckpt)} tensors")
+
+    # Duplicate for world_size=8
+    # Vision encoder processes fixed-size patches on all ranks (no CP scatter/gather)
+    # So we simply duplicate the TP checkpoints
+    sharded_checkpoints = []
+    for cp_rank in range(cp_degree):
+        for tp_rank in range(tp_degree):
+            # Clone the checkpoint
+            ckpt_copy = {k: v.clone() for k, v in tp_checkpoints[tp_rank].items()}
+            sharded_checkpoints.append(ckpt_copy)
+
+    print(f"  Total checkpoints: {len(sharded_checkpoints)} (TP={tp_degree} x CP={cp_degree})")
+
+    # Initialize model with weights and move to Neuron
+    print("  Setting weights...")
+    nxd_model.set_weights(sharded_checkpoints)
+    print("  Moving model to Neuron...")
+    nxd_model.to_neuron()
+    print("  V3 vision encoder initialized on Neuron (TP=4, float32)!")
+
+    return nxd_model, config
+
+
 class NeuronVAEWrapper(torch.nn.Module):
     """
     Wrapper for VAE with compiled encoder and decoder on Trainium2.
@@ -1477,17 +1574,24 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     import gc
 
     # Check for vision encoder mode
-    # CPU is the default for better accuracy, use --neuron_vision_encoder to use Neuron
+    # CPU is the default for better accuracy, use --neuron_vision_encoder or --use_v3_vision_encoder to use Neuron
     vision_encoder_tp_path = f"{compiled_models_dir}/vision_encoder_tp"
+    vision_encoder_v3_path = f"{compiled_models_dir}/vision_encoder_v3/nxd_model.pt"
     use_vision_tp = args.vision_tp if hasattr(args, 'vision_tp') else False
     use_neuron_vision = getattr(args, 'neuron_vision_encoder', False)  # Default to CPU
-    use_cpu_vision_encoder = not use_neuron_vision
-    if use_cpu_vision_encoder:
+    use_v3_vision_encoder = getattr(args, 'use_v3_vision_encoder', True)
+    # --use_v3_vision_encoder implies using Neuron (not CPU)
+    use_cpu_vision_encoder = not use_neuron_vision and not use_v3_vision_encoder
+    if use_v3_vision_encoder or (use_neuron_vision and os.path.exists(vision_encoder_v3_path)):
+        vision_mode = "Neuron V3 (TP=4, float32)"
+        use_v3_vision_encoder = True  # Enable V3 if path exists and neuron_vision is requested
+        use_cpu_vision_encoder = False
+    elif use_cpu_vision_encoder:
         vision_mode = "CPU (default)"
     elif use_vision_tp or os.path.exists(vision_encoder_tp_path):
         vision_mode = "Neuron TP=8"
     else:
-        vision_mode = "Neuron (float32)"
+        vision_mode = "Neuron (single device, float32)"
 
     print("\n" + "=" * 60)
     print("Loading Compiled Models for Trainium2")
@@ -1662,11 +1766,13 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     print("\n[2/3] Loading Text Encoder...")
 
     # Load Vision Encoder
-    # Check for TP version first (better memory distribution), then single device
-    # Note: vision_encoder_tp_path, use_vision_tp, use_cpu_vision_encoder are defined at the top
+    # Priority: CPU > V3 (TP=4) > TP=8 > single device
+    # Note: vision_encoder_tp_path, use_vision_tp, use_cpu_vision_encoder, use_v3_vision_encoder are defined at the top
     vision_encoder_single_path = f"{compiled_models_dir}/vision_encoder/model.pt"
     compiled_vision_encoder = None
+    compiled_vision_encoder_v3 = None
     cpu_vision_encoder = None
+    vision_encoder_config = None
 
     if use_cpu_vision_encoder:
         # CPU Vision Encoder mode - highest accuracy, avoids compilation precision loss
@@ -1676,8 +1782,14 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
         cpu_vision_encoder = pipe.text_encoder.model.visual
         cpu_vision_encoder.eval()
         print("  Vision encoder prepared on CPU!")
+    elif use_v3_vision_encoder:
+        # V3 Vision Encoder mode - uses ModelBuilder API with TP=4, world_size=8
+        # Faster than single device, maintains float32 precision
+        print("  Loading V3 Vision Encoder (TP=4, world_size=8, float32)...")
+        compiled_vision_encoder_v3, vision_encoder_config = load_vision_encoder_v3(compiled_models_dir)
+        print("  V3 Vision encoder loaded!")
     elif use_vision_tp or (os.path.exists(vision_encoder_tp_path) and not os.path.exists(vision_encoder_single_path)):
-        # Load TP-compiled vision encoder
+        # Load TP-compiled vision encoder (TP=8, but may have dimension issues)
         if not os.path.exists(vision_encoder_tp_path):
             raise FileNotFoundError(
                 f"Vision encoder (TP) not found at {vision_encoder_tp_path}\n"
@@ -1694,7 +1806,7 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
             raise FileNotFoundError(
                 f"Vision encoder not found at {vision_encoder_single_path}\n"
                 "Please run: python neuron_qwen_image_edit/compile_text_encoder.py --vision_only\n"
-                "Or for TP version: python neuron_qwen_image_edit/compile_text_encoder.py --vision_only --vision_tp"
+                "Or for V3 (faster): python neuron_qwen_image_edit/compile_vision_encoder_v3.py"
             )
         print(f"  Loading vision encoder from {vision_encoder_single_path}...")
         vision_encoder_jit = torch.jit.load(vision_encoder_single_path)
@@ -1746,6 +1858,7 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     pipe.text_encoder = NeuronTextEncoderWrapper(
         original_text_encoder=original_text_encoder,
         compiled_vision_encoder=compiled_vision_encoder,
+        compiled_vision_encoder_v3=compiled_vision_encoder_v3,
         compiled_language_model=compiled_language_model,
         compiled_language_model_v3=compiled_language_model_v3,
         cpu_language_model=cpu_language_model,
@@ -1761,8 +1874,8 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
             print("  Language model kept on CPU.")
         if use_cpu_vision_encoder:
             print("  Vision encoder kept on CPU (highest accuracy mode).")
-    elif use_v3_language_model:
-        # V3 model loaded, can delete original
+    elif use_v3_language_model or use_v3_vision_encoder:
+        # V3 models loaded, can delete original
         del original_text_encoder
         gc.collect()
         print("  Text encoder wrapper created!")
@@ -2170,6 +2283,9 @@ if __name__ == "__main__":
     parser.add_argument("--neuron_vision_encoder", action=argparse.BooleanOptionalAction, default=False,
                         help="Use Neuron-compiled Vision Encoder (float32). "
                              "CPU is used by default for better accuracy.")
+    parser.add_argument("--use_v3_vision_encoder", action=argparse.BooleanOptionalAction, default=True,
+                        help="Use V3 Vision Encoder with TP=4 (faster, requires --neuron_vision_encoder). "
+                             "Requires: python neuron_qwen_image_edit/compile_vision_encoder_v3.py")
 
     # Inference settings
     parser.add_argument("--num_inference_steps", type=int, default=40,

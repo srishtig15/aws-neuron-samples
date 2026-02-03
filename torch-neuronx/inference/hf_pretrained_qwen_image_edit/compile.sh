@@ -151,24 +151,33 @@ if [[ "$VERSION_MODE" == "v3_cp" ]]; then
         --compiled_models_dir ${COMPILED_MODELS_DIR} \
         --compiler_workdir ${COMPILER_WORKDIR}
     echo "  V3 Language Model compiled successfully!"
+
+    # Also compile V3 Vision Encoder (ModelBuilder API, TP=4, world_size=8, float32)
+    echo ""
+    echo "  Compiling V3 Vision Encoder (ModelBuilder API)..."
+    echo "  Using TP=4, world_size=8, float32 (faster than single device)"
+    python neuron_qwen_image_edit/compile_vision_encoder_v3.py \
+        --image_size ${IMAGE_SIZE} \
+        --compiled_models_dir ${COMPILED_MODELS_DIR} \
+        --compiler_workdir ${COMPILER_WORKDIR}
+    echo "  V3 Vision Encoder compiled successfully!"
 fi
 echo ""
 
-# Step 4: Vision Encoder (float32 for accuracy)
-echo "[Step 4/4] Compiling Vision Encoder (float32)..."
-echo "Note: Text encoder (Qwen2.5-VL) has two components:"
-echo "  - Vision Encoder: compiled in float32 for accuracy (single device)"
-if [[ "$VERSION_MODE" == "v3_cp" ]]; then
-    echo "  - Language Model: compiled with V3 API (TP=4, world_size=8)"
-else
+# Step 4: Vision Encoder (float32 for accuracy) - single device version
+# Skip for v3_cp mode since V3 vision encoder is already compiled above
+if [[ "$VERSION_MODE" != "v3_cp" ]]; then
+    echo "[Step 4/4] Compiling Vision Encoder (float32, single device)..."
+    echo "Note: Text encoder (Qwen2.5-VL) has two components:"
+    echo "  - Vision Encoder: compiled in float32 for accuracy (single device)"
     echo "  - Language Model: runs on CPU (28Q/4KV heads incompatible with TP=8)"
+    python neuron_qwen_image_edit/compile_text_encoder.py \
+        --vision_only \
+        --image_size ${IMAGE_SIZE} \
+        --compiled_models_dir ${COMPILED_MODELS_DIR} \
+        --compiler_workdir ${COMPILER_WORKDIR}
+    echo "Vision Encoder (float32) compiled!"
 fi
-python neuron_qwen_image_edit/compile_text_encoder.py \
-    --vision_only \
-    --image_size ${IMAGE_SIZE} \
-    --compiled_models_dir ${COMPILED_MODELS_DIR} \
-    --compiler_workdir ${COMPILER_WORKDIR}
-echo "Vision Encoder (float32) compiled!"
 echo ""
 
 echo "============================================"
@@ -193,12 +202,16 @@ fi
 if [[ "$VERSION_MODE" == "v3_cp" ]]; then
     echo "  - transformer_v3_cp/ (V3 CP, TP=4, CP=2, output: ${HEIGHT}x${WIDTH}, Context Parallel + NKI)"
     echo "  - language_model_v3/ (V3, TP=4, world_size=8, ModelBuilder API)"
+    echo "  - vision_encoder_v3/ (V3, TP=4, world_size=8, float32)"
+else
+    echo "  - vision_encoder/ (float32)"
 fi
-echo "  - vision_encoder/ (float32)"
 echo ""
 if [[ "$VERSION_MODE" == "v3_cp" ]]; then
-    echo "Note: Language model compiled with V3 API (TP=4, world_size=8)"
-    echo "      Compatible with V3 CP transformer"
+    echo "Note: V3 CP mode compiles all components with ModelBuilder API"
+    echo "      - Transformer: TP=4, CP=2 (Context Parallel)"
+    echo "      - Language Model: TP=4 (perfect GQA fit)"
+    echo "      - Vision Encoder: TP=4, float32 (faster)"
 else
     echo "Note: Language model runs on CPU (GQA 28Q/4KV incompatible with TP=8)"
 fi
@@ -206,14 +219,16 @@ echo ""
 echo "To run inference on Trainium2:"
 echo ""
 if [[ "$VERSION_MODE" == "v3_cp" ]]; then
-    echo "  # V3 CP (Context Parallel + NKI, fastest, with V3 Language Model on Neuron):"
+    echo "  # V3 CP (recommended, all V3 components enabled by default):"
     echo "  NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py \\"
     echo "      --images input.jpg \\"
-    echo "      --prompt \"your edit instruction\" \\"
-    echo "      --use_v3_cp --use_v3_language_model"
+    echo "      --prompt \"your edit instruction\""
+    echo ""
+    echo "  # Note: --use_v3_vision_encoder is now default (10-15x faster than CPU)"
+    echo "  #       Use --no-use_v3_vision_encoder to disable"
     echo ""
 fi
-echo "  # V1 Flash (recommended, NKI Flash Attention):"
+echo "  # V1 Flash (NKI Flash Attention):"
 echo "  python run_qwen_image_edit.py \\"
 echo "      --images input.jpg \\"
 echo "      --prompt \"your edit instruction\" \\"
@@ -246,6 +261,7 @@ echo ""
 # # 完整运行示例
 # NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "根据这图1中女性和图2中的男性，生成一组结婚照，并遵循以下描述：新郎穿着红色的中式马褂，新娘穿着精致的秀禾服，头戴金色凤冠。他们并肩站立在古老的朱红色宫墙前，背景是雕花的木窗。光线明亮柔和，构图对称，氛围喜庆而隆重。" --patch_multiplier 3 --warmup --use_v1
 # NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "根据这图1中女性和图2中的男性，生成一组结婚照，并遵循以下描述：新郎穿着红色的中式马褂，新娘穿着精致的秀禾服，头戴金色凤冠。他们并肩站立在古老的朱红色宫墙前，背景是雕花的木窗。光线明亮柔和，构图对称，氛围喜庆而隆重。" --patch_multiplier 3 --warmup --use_v2
-# NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "根据这图1中女性和图2中的男性，生成一组结婚照，并遵循以下描述：新郎穿着红色的中式马褂，新娘穿着精致的秀禾服，头戴金色凤冠。他们并肩站立在古老的朱红色宫墙前，背景是雕花的木窗。光线明亮柔和，构图对称，氛围喜庆而隆重。" --patch_multiplier 3 --warmup --use_v1_flash 
-# NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "根据这图1中女性和图2中的男性，生成一组结婚照，并遵循以下描述：新郎穿着红色的中式马褂，新娘穿着精致的秀禾服，头戴金色凤冠。他们并肩站立在古老的朱红色宫墙前，背景是雕花的木窗。光线明亮柔和，构图对称，氛围喜庆而隆重。" --patch_multiplier 3 --warmup --use_v2_flash 
-# NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "根据这图1中女性和图2中的男性，生成一组结婚照，并遵循以下描述：新郎穿着红色的中式马褂，新娘穿着精致的秀禾服，头戴金色凤冠。他们并肩站立在古老的朱红色宫墙前，背景是雕花的木窗。光线明亮柔和，构图对称，氛围喜庆而隆重。" --patch_multiplier 3 --warmup # --use_v3_cp
+# NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "根据这图1中女性和图2中的男性，生成一组结婚照，并遵循以下描述：新郎穿着红色的中式马褂，新娘穿着精致的秀禾服，头戴金色凤冠。他们并肩站立在古老的朱红色宫墙前，背景是雕花的木窗。光线明亮柔和，构图对称，氛围喜庆而隆重。" --patch_multiplier 3 --warmup --use_v1_flash
+# NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "根据这图1中女性和图2中的男性，生成一组结婚照，并遵循以下描述：新郎穿着红色的中式马褂，新娘穿着精致的秀禾服，头戴金色凤冠。他们并肩站立在古老的朱红色宫墙前，背景是雕花的木窗。光线明亮柔和，构图对称，氛围喜庆而隆重。" --patch_multiplier 3 --warmup --use_v2_flash
+# NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "根据这图1中女性和图2中的男性，生成一组结婚照，并遵循以下描述：新郎穿着红色的中式马褂，新娘穿着精致的秀禾服，头戴金色凤冠。他们并肩站立在古老的朱红色宫墙前，背景是雕花的木窗。光线明亮柔和，构图对称，氛围喜庆而隆重。" --patch_multiplier 3 --warmup --use_v3_cp
+NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py --images image1.png image2.png --prompt "根据这图1中女性和图2中的男性，生成一组结婚照，并遵循以下描述：新郎穿着红色的中式马褂，新娘穿着精致的秀禾服，头戴金色凤冠。他们并肩站立在古老的朱红色宫墙前，背景是雕花的木窗。光线明亮柔和，构图对称，氛围喜庆而隆重。" --patch_multiplier 3 --warmup --use_v3_vision_encoder
