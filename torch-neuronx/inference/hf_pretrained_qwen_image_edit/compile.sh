@@ -9,6 +9,7 @@
 #   - max_sequence_length: 1024
 #   - tp_degree: 8 (for transformer)
 #   - patch_multiplier: 3 (for 2-image merging)
+#   - batch_size: 1 (for inference batching)
 #
 # Usage:
 #   ./compile.sh                    # Compile all versions
@@ -16,8 +17,9 @@
 #   ./compile.sh v2                 # Compile V2 only
 #   ./compile.sh v1_flash           # Compile V1 Flash only (recommended, NKI Flash Attention)
 #   ./compile.sh v2_flash           # Compile V2 Flash only (ModelBuilder + NKI)
-#   ./compile.sh v3_cp              # Compile V3 CP (Context Parallel + NKI, experimental)
-#   ./compile.sh 1024 1024 448 8 1024 3  # Custom dimensions
+#   ./compile.sh v3_cp              # Compile V3 CP (Context Parallel + NKI, recommended)
+#   ./compile.sh v3_cp 1024 768 448 8 1024 3 2  # V3 CP with batch_size=2
+#   ./compile.sh v3_cp 1024 1024 448 8 1024 3 1  # Custom dimensions with batch_size
 
 set -e
 
@@ -42,6 +44,7 @@ IMAGE_SIZE=${3:-448}  # Vision encoder image size (must be divisible by 14 and r
 TP_DEGREE=${4:-8}
 MAX_SEQ_LEN=${5:-1024}
 PATCH_MULTIPLIER=${6:-3}  # 2 for single image editing, 3 for 2 images merging, 1 for generation
+BATCH_SIZE=${7:-1}  # Batch size for compiled models (for batched inference)
 
 echo "============================================"
 echo "Qwen-Image-Edit-2509 Compilation for Neuron"
@@ -53,6 +56,7 @@ echo "Vision Encoder Image Size: ${IMAGE_SIZE}"
 echo "TP Degree: ${TP_DEGREE}"
 echo "Max Sequence Length: ${MAX_SEQ_LEN}"
 echo "Patch Multiplier: ${PATCH_MULTIPLIER}"
+echo "Batch Size: ${BATCH_SIZE}"
 echo ""
 
 # Step 1: Download the model
@@ -69,6 +73,7 @@ python neuron_qwen_image_edit/compile_vae.py \
     --height ${VAE_TILE_SIZE} \
     --width ${VAE_TILE_SIZE} \
     --temporal_frames 1 \
+    --batch_size ${BATCH_SIZE} \
     --compiled_models_dir ${COMPILED_MODELS_DIR} \
     --compiler_workdir ${COMPILER_WORKDIR}
 echo "VAE compiled successfully!"
@@ -138,6 +143,7 @@ if [[ "$VERSION_MODE" == "v3_cp" ]]; then
         --world_size 8 \
         --patch_multiplier ${PATCH_MULTIPLIER} \
         --max_sequence_length ${MAX_SEQ_LEN} \
+        --batch_size ${BATCH_SIZE} \
         --compiled_models_dir ${COMPILED_MODELS_DIR} \
         --compiler_workdir ${COMPILER_WORKDIR}
     echo "  V3 CP Transformer compiled successfully!"
@@ -148,6 +154,7 @@ if [[ "$VERSION_MODE" == "v3_cp" ]]; then
     echo "  Using TP=4, world_size=8 (compatible with V3 CP transformer)"
     python neuron_qwen_image_edit/compile_language_model_v3.py \
         --max_sequence_length ${MAX_SEQ_LEN} \
+        --batch_size ${BATCH_SIZE} \
         --compiled_models_dir ${COMPILED_MODELS_DIR} \
         --compiler_workdir ${COMPILER_WORKDIR}
     echo "  V3 Language Model compiled successfully!"
@@ -185,8 +192,8 @@ echo "Compilation Complete!"
 echo "============================================"
 echo ""
 echo "Compiled models saved to: ${COMPILED_MODELS_DIR}/"
-echo "  - vae_encoder/ (tile: ${VAE_TILE_SIZE}x${VAE_TILE_SIZE})"
-echo "  - vae_decoder/ (tile: ${VAE_TILE_SIZE}x${VAE_TILE_SIZE})"
+echo "  - vae_encoder/ (tile: ${VAE_TILE_SIZE}x${VAE_TILE_SIZE}, batch: ${BATCH_SIZE})"
+echo "  - vae_decoder/ (tile: ${VAE_TILE_SIZE}x${VAE_TILE_SIZE}, batch: ${BATCH_SIZE})"
 if [[ "$VERSION_MODE" == "all" || "$VERSION_MODE" == "v1" ]]; then
     echo "  - transformer/ (V1, TP=${TP_DEGREE}, output: ${HEIGHT}x${WIDTH})"
 fi
@@ -200,8 +207,8 @@ if [[ "$VERSION_MODE" == "all" || "$VERSION_MODE" == "v2_flash" ]]; then
     echo "  - transformer_v2_flash/ (V2 Flash, TP=${TP_DEGREE}, output: ${HEIGHT}x${WIDTH}, ModelBuilder + NKI)"
 fi
 if [[ "$VERSION_MODE" == "v3_cp" ]]; then
-    echo "  - transformer_v3_cp/ (V3 CP, TP=4, CP=2, output: ${HEIGHT}x${WIDTH}, Context Parallel + NKI)"
-    echo "  - language_model_v3/ (V3, TP=4, world_size=8, ModelBuilder API)"
+    echo "  - transformer_v3_cp/ (V3 CP, TP=4, CP=2, output: ${HEIGHT}x${WIDTH}, batch: ${BATCH_SIZE})"
+    echo "  - language_model_v3/ (V3, TP=4, world_size=8, batch: ${BATCH_SIZE})"
     echo "  - vision_encoder_v3/ (V3, TP=4, world_size=8, float32)"
 else
     echo "  - vision_encoder/ (float32)"
