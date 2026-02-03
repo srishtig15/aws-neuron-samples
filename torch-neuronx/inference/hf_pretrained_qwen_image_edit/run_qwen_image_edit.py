@@ -742,8 +742,8 @@ class NeuronTransformerWrapperV3CP(torch.nn.Module):
     - RoPE is sharded per CP rank
     """
     def __init__(self, original_transformer, nxd_model, img_rotary_emb, txt_rotary_emb,
-                 expected_num_patches=1024, expected_seq_len=512, temporal_frames=3,
-                 cp_degree=2):
+                 expected_num_patches=1024, num_patches_padded=None, patches_padding=0,
+                 expected_seq_len=512, temporal_frames=3, cp_degree=2):
         super().__init__()
         self.config = original_transformer.config
         self.dtype = original_transformer.dtype
@@ -755,13 +755,15 @@ class NeuronTransformerWrapperV3CP(torch.nn.Module):
         self.txt_rotary_emb_full = txt_rotary_emb
 
         self.expected_num_patches = expected_num_patches
+        self.num_patches_padded = num_patches_padded if num_patches_padded else expected_num_patches
+        self.patches_padding = patches_padding
         self.expected_seq_len = expected_seq_len
         self.temporal_frames = temporal_frames
         self.base_patches = expected_num_patches // temporal_frames
         self.cp_degree = cp_degree
 
-        # Local dimensions (per CP rank)
-        self.local_num_patches = expected_num_patches // cp_degree
+        # Local dimensions (per CP rank) - use padded value for internal computation
+        self.local_num_patches = self.num_patches_padded // cp_degree
         self.local_seq_len = expected_seq_len // cp_degree
 
     @contextlib.contextmanager
@@ -793,7 +795,7 @@ class NeuronTransformerWrapperV3CP(torch.nn.Module):
         # Since we're running inference, we pass full data and let the model handle it
         # The compiled model has the gather/scatter logic built in
 
-        # Handle hidden_states padding to expected_num_patches
+        # Handle hidden_states padding to expected_num_patches first
         actual_patches = hidden_states.shape[1]
         if actual_patches != self.expected_num_patches:
             if actual_patches < self.expected_num_patches:
@@ -808,7 +810,17 @@ class NeuronTransformerWrapperV3CP(torch.nn.Module):
                 print(f"ERROR: hidden_states has {actual_patches} patches but model expects {self.expected_num_patches}")
                 hidden_states = hidden_states[:, :self.expected_num_patches, :]
 
-        # Handle encoder_hidden_states padding
+        # Apply CP alignment padding if needed (padding goes to patches, not text)
+        # This ensures CP split results in sequences aligned to 128 for NKI Flash Attention
+        if self.patches_padding > 0:
+            cp_padding = torch.zeros(
+                (batch_size, self.patches_padding, hidden_states.shape[2]),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device
+            )
+            hidden_states = torch.cat([hidden_states, cp_padding], dim=1)
+
+        # Handle encoder_hidden_states padding (no CP padding needed here, text_seq stays unchanged)
         actual_seq_len = encoder_hidden_states.shape[1]
         if actual_seq_len != self.expected_seq_len:
             if actual_seq_len < self.expected_seq_len:
@@ -933,6 +945,8 @@ def load_transformer_v3_cp(compiled_models_dir: str, pipe, args):
         config = json.load(f)
 
     expected_num_patches = config["num_patches"]
+    num_patches_padded = config.get("num_patches_padded", expected_num_patches)
+    patches_padding = config.get("patches_padding", 0)
     expected_seq_len = config["text_seq_len"]
     temporal_frames = config.get("frame", config.get("patch_multiplier", 3))
     tp_degree = config.get("tp_degree", 4)
@@ -941,6 +955,8 @@ def load_transformer_v3_cp(compiled_models_dir: str, pipe, args):
     base_patches = expected_num_patches // temporal_frames
 
     print(f"  V3 CP config: patches={expected_num_patches}, seq_len={expected_seq_len}")
+    if patches_padding > 0:
+        print(f"  V3 CP config: patches_padded={num_patches_padded} (+{patches_padding} for CP alignment)")
     print(f"  V3 CP config: temporal_frames={temporal_frames}, base_patches={base_patches}")
     print(f"  V3 CP config: TP={tp_degree}, world_size={world_size}, CP={cp_degree}")
     print(f"  Context Parallel: {config.get('context_parallel', False)}")
@@ -1022,6 +1038,8 @@ def load_transformer_v3_cp(compiled_models_dir: str, pipe, args):
         img_rotary_emb=img_rotary_emb,
         txt_rotary_emb=txt_rotary_emb,
         expected_num_patches=expected_num_patches,
+        num_patches_padded=num_patches_padded,
+        patches_padding=patches_padding,
         expected_seq_len=expected_seq_len,
         temporal_frames=temporal_frames,
         cp_degree=cp_degree,

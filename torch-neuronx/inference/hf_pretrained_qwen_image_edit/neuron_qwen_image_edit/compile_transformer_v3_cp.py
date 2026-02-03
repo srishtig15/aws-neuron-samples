@@ -532,19 +532,37 @@ def compile_transformer_v3_cp(args):
     in_channels = 64
     head_dim = 128
 
+    # Calculate CP alignment padding (padding goes to patches, not text)
+    # This keeps text_seq_len unchanged, avoiding RoPE position issues
+    if context_parallel_enabled:
+        local_patches = num_patches // cp_degree
+        local_text = text_seq_len // cp_degree
+        local_total = local_patches + local_text
+
+        # NKI Flash Attention requires sequence length to be multiple of 128
+        alignment = 128
+        need_padding = (alignment - local_total % alignment) % alignment
+        patches_padding = need_padding * cp_degree  # Total padding for patches
+        num_patches_padded = num_patches + patches_padding
+    else:
+        patches_padding = 0
+        num_patches_padded = num_patches
+
     print("=" * 60)
     print("Transformer V3 Context Parallel Compilation")
     print("=" * 60)
     print(f"Image: {args.height}x{args.width}")
-    print(f"Total patches: {num_patches}")
+    print(f"Original patches: {num_patches}")
+    if patches_padding > 0:
+        print(f"Padded patches: {num_patches_padded} (+{patches_padding} for CP alignment)")
     print(f"Total text seq: {text_seq_len}")
     print(f"TP degree: {tp_degree}")
     print(f"World size: {world_size}")
     print(f"Context Parallel: {context_parallel_enabled} (CP={cp_degree})")
     print(f"NKI Flash Attention: Enabled")
 
-    # Sample inputs (full size - CP handling is internal to the model)
-    sample_hidden_states = torch.randn(1, num_patches, in_channels, dtype=torch.bfloat16)
+    # Sample inputs (use padded num_patches for compilation)
+    sample_hidden_states = torch.randn(1, num_patches_padded, in_channels, dtype=torch.bfloat16)
     sample_encoder_hidden_states = torch.randn(1, text_seq_len, text_hidden_size, dtype=torch.bfloat16)
     sample_timestep = torch.randn(1, dtype=torch.float32)
 
@@ -567,8 +585,15 @@ def compile_transformer_v3_cp(args):
             text_seq_len=text_seq_len,
         )
 
-        print(f"  img RoPE: {img_rotary_emb.shape}")
+        print(f"  img RoPE (original): {img_rotary_emb.shape}")
         print(f"  txt RoPE: {txt_rotary_emb.shape}")
+
+        # Pad img_rotary_emb if needed for CP alignment
+        if patches_padding > 0:
+            # Repeat last position's RoPE for padding (position doesn't matter for padding tokens)
+            rope_padding = img_rotary_emb[-1:].repeat(patches_padding, 1, 1)
+            img_rotary_emb = torch.cat([img_rotary_emb, rope_padding], dim=0)
+            print(f"  img RoPE (padded): {img_rotary_emb.shape} (+{patches_padding})")
 
         # Save unsharded state dict before modifications
         unsharded_state = pipe.transformer.state_dict()
@@ -676,6 +701,8 @@ def compile_transformer_v3_cp(args):
             "height": args.height,
             "width": args.width,
             "num_patches": num_patches,
+            "num_patches_padded": num_patches_padded,
+            "patches_padding": patches_padding,
             "text_seq_len": text_seq_len,
             "patch_multiplier": args.patch_multiplier,
             "tp_degree": tp_degree,
