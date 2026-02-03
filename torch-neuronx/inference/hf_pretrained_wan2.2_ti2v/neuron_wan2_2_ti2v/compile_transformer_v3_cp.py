@@ -218,11 +218,11 @@ class CPWanSelfAttention(nn.Module):
     4. RoPE is applied before K/V gathering
     """
 
-    def __init__(self, orig_attn, context_parallel_enabled=False, data_parallel_group=None):
+    def __init__(self, orig_attn, context_parallel_enabled=False):
         super().__init__()
 
         self.context_parallel_enabled = context_parallel_enabled
-        self.data_parallel_group = data_parallel_group
+        # NOTE: Get data_parallel_group dynamically in forward(), not here
         self.heads = orig_attn.heads
 
         # Copy projections (already sharded for TP)
@@ -271,10 +271,12 @@ class CPWanSelfAttention(nn.Module):
 
         # Context Parallel: All-gather K/V across CP group
         if self.context_parallel_enabled:
+            # Get DP group dynamically at runtime (not captured during init)
+            dp_group = parallel_state.get_data_parallel_group()
             # Stack K, V and gather together for efficiency
             kv_stacked = torch.stack([key, value], dim=0)  # [2, B, H, local_S, D]
             kv_stacked = gather_from_tensor_model_parallel_region_with_dim(
-                kv_stacked, gather_dim=3, process_group=self.data_parallel_group
+                kv_stacked, gather_dim=3, process_group=dp_group
             )  # [2, B, H, full_S, D]
             key, value = torch.unbind(kv_stacked, dim=0)
 
@@ -305,11 +307,11 @@ class CPWanCrossAttention(nn.Module):
     For I2V tasks, also handles image context via add_k_proj, add_v_proj.
     """
 
-    def __init__(self, orig_attn, context_parallel_enabled=False, data_parallel_group=None):
+    def __init__(self, orig_attn, context_parallel_enabled=False):
         super().__init__()
 
         self.context_parallel_enabled = context_parallel_enabled
-        self.data_parallel_group = data_parallel_group
+        # NOTE: Cross-attention doesn't need data_parallel_group because K/V from text is not split
         self.heads = orig_attn.heads
 
         # Copy projections (already sharded for TP)
@@ -582,8 +584,8 @@ class NeuronWanTransformerV3CP(nn.Module):
         # SPMDRank for runtime rank detection (crucial for SPMD scatter/gather)
         self.global_rank = SPMDRank(world_size=world_size)
 
-        # DP group for CP communication
-        self.data_parallel_group = parallel_state.get_data_parallel_group()
+        # NOTE: We do NOT capture data_parallel_group here because it can't be serialized.
+        # Instead, we get it dynamically in forward() using parallel_state.get_data_parallel_group()
 
         # Patch embedding
         self.patch_embedding = original_transformer.patch_embedding
@@ -619,17 +621,16 @@ class NeuronWanTransformerV3CP(nn.Module):
         """Replace attention modules with CP+NKI versions."""
         for i, block in enumerate(self.blocks):
             # Replace self-attention (attn1) with CP version
+            # NOTE: Don't pass data_parallel_group - get it dynamically in forward()
             block.attn1 = CPWanSelfAttention(
                 block.attn1,
-                self.context_parallel_enabled,
-                self.data_parallel_group
+                self.context_parallel_enabled
             )
 
             # Replace cross-attention (attn2) with CP version
             block.attn2 = CPWanCrossAttention(
                 block.attn2,
-                self.context_parallel_enabled,
-                self.data_parallel_group
+                self.context_parallel_enabled
             )
 
         print(f"Replaced attention with CP+NKI versions on {len(self.blocks)} blocks")
@@ -697,12 +698,15 @@ class NeuronWanTransformerV3CP(nn.Module):
 
         # ========== CONTEXT PARALLEL: SPLIT DATA AT ENTRY ==========
         if self.context_parallel_enabled:
+            # Get DP group dynamically at runtime (not captured during init)
+            dp_group = parallel_state.get_data_parallel_group()
+
             # Get DP rank at runtime using SPMDRank
             dp_rank = get_dp_rank_spmd(self.global_rank.get_rank(), self.tp_degree)
 
             # Split hidden_states along sequence dim (dim=1)
             hidden_states = split_along_dim(
-                hidden_states, dim=1, rank=dp_rank, data_parallel_group=self.data_parallel_group
+                hidden_states, dim=1, rank=dp_rank, data_parallel_group=dp_group
             )
 
             # Split RoPE along sequence dim
@@ -710,10 +714,10 @@ class NeuronWanTransformerV3CP(nn.Module):
             # Find the sequence dimension (the one matching hidden_states seq_len)
             rope_seq_dim = self._find_rope_seq_dim(rotary_emb_cos, full_seq_len)
             rotary_emb_cos = split_along_dim(
-                rotary_emb_cos, dim=rope_seq_dim, rank=dp_rank, data_parallel_group=self.data_parallel_group
+                rotary_emb_cos, dim=rope_seq_dim, rank=dp_rank, data_parallel_group=dp_group
             )
             rotary_emb_sin = split_along_dim(
-                rotary_emb_sin, dim=rope_seq_dim, rank=dp_rank, data_parallel_group=self.data_parallel_group
+                rotary_emb_sin, dim=rope_seq_dim, rank=dp_rank, data_parallel_group=dp_group
             )
 
         # Condition embedding
@@ -752,8 +756,10 @@ class NeuronWanTransformerV3CP(nn.Module):
 
         # ========== CONTEXT PARALLEL: GATHER OUTPUT ==========
         if self.context_parallel_enabled:
+            # Get DP group dynamically at runtime
+            dp_group = parallel_state.get_data_parallel_group()
             output = gather_from_tensor_model_parallel_region_with_dim(
-                output, gather_dim=1, process_group=self.data_parallel_group
+                output, gather_dim=1, process_group=dp_group
             )
 
         # Unpatchify

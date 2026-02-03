@@ -87,16 +87,17 @@ def compile_text_encoder_v2(args):
     batch_size = 1
     sequence_length = args.max_sequence_length
     tp_degree = args.tp_degree
+    world_size = args.world_size  # Match transformer's world_size for compatibility
     compiled_models_dir = args.compiled_models_dir
 
-    print(f"Compiling text encoder with TP={tp_degree}, seq_len={sequence_length}")
+    print(f"Compiling text encoder with TP={tp_degree}, world_size={world_size}, seq_len={sequence_length}")
 
     # Prepare sample inputs
     sample_input_ids = torch.ones((batch_size, sequence_length), dtype=torch.int64)
     sample_attention_mask = torch.ones((batch_size, sequence_length), dtype=torch.int64)
 
-    # Use NxDParallelState context manager
-    with NxDParallelState(world_size=tp_degree, tensor_model_parallel_size=tp_degree):
+    # Use NxDParallelState context manager - MUST match transformer's world_size!
+    with NxDParallelState(world_size=world_size, tensor_model_parallel_size=tp_degree):
         print("Loading UMT5 text encoder...")
         model_id = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
         DTYPE = torch.bfloat16
@@ -191,6 +192,7 @@ def compile_text_encoder_v2(args):
             "batch_size": batch_size,
             "sequence_length": sequence_length,
             "tp_degree": tp_degree,
+            "world_size": world_size,
         }
         save_model_config(output_path, config)
 
@@ -200,7 +202,8 @@ def compile_text_encoder_v2(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Compile Wan2.2 Text Encoder using Model Builder V2")
     parser.add_argument("--max_sequence_length", type=int, default=512, help="Max sequence length")
-    parser.add_argument("--tp_degree", type=int, default=8, help="Tensor parallelism degree")
+    parser.add_argument("--tp_degree", type=int, default=4, help="Tensor parallelism degree")
+    parser.add_argument("--world_size", type=int, default=8, help="World size (must match transformer)")
     parser.add_argument("--compiled_models_dir", type=str, default="compiled_models", help="Output directory")
     args = parser.parse_args()
 

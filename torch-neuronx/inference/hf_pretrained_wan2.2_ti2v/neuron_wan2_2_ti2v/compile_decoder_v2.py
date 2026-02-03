@@ -30,12 +30,34 @@ torch.nn.functional.scaled_dot_product_attention = attention_wrapper
 
 
 class DecoderWrapper(nn.Module):
-    """Wrapper for VAE decoder to handle feat_cache as a single tensor."""
+    """Wrapper for VAE decoder to handle feat_cache as individual tensor arguments.
+
+    ModelBuilder V2 API requires all inputs to be tensors, so we accept 34 separate
+    feat_cache tensors and reconstruct the list inside forward().
+    """
+    NUM_FEAT_CACHE = 34
+
     def __init__(self, decoder):
         super().__init__()
         self.decoder = decoder
 
-    def forward(self, x, feat_cache: List[torch.Tensor]):
+    def forward(self, x,
+                feat_cache_0, feat_cache_1, feat_cache_2, feat_cache_3, feat_cache_4,
+                feat_cache_5, feat_cache_6, feat_cache_7, feat_cache_8, feat_cache_9,
+                feat_cache_10, feat_cache_11, feat_cache_12, feat_cache_13, feat_cache_14,
+                feat_cache_15, feat_cache_16, feat_cache_17, feat_cache_18, feat_cache_19,
+                feat_cache_20, feat_cache_21, feat_cache_22, feat_cache_23, feat_cache_24,
+                feat_cache_25, feat_cache_26, feat_cache_27, feat_cache_28, feat_cache_29,
+                feat_cache_30, feat_cache_31, feat_cache_32, feat_cache_33):
+        feat_cache = [
+            feat_cache_0, feat_cache_1, feat_cache_2, feat_cache_3, feat_cache_4,
+            feat_cache_5, feat_cache_6, feat_cache_7, feat_cache_8, feat_cache_9,
+            feat_cache_10, feat_cache_11, feat_cache_12, feat_cache_13, feat_cache_14,
+            feat_cache_15, feat_cache_16, feat_cache_17, feat_cache_18, feat_cache_19,
+            feat_cache_20, feat_cache_21, feat_cache_22, feat_cache_23, feat_cache_24,
+            feat_cache_25, feat_cache_26, feat_cache_27, feat_cache_28, feat_cache_29,
+            feat_cache_30, feat_cache_31, feat_cache_32, feat_cache_33
+        ]
         return self.decoder(x, feat_cache)
 
 
@@ -60,6 +82,8 @@ def compile_decoder_v2(args):
     latent_height = args.height // 16
     latent_width = args.width // 16
     compiled_models_dir = args.compiled_models_dir
+    world_size = args.world_size  # Must match transformer for compatibility
+    tp_degree = args.tp_degree
 
     batch_size = 1
     decoder_frames = 2  # Decoder needs CACHE_T=2 frames
@@ -68,6 +92,7 @@ def compile_decoder_v2(args):
 
     print(f"num_frames={args.num_frames} -> latent_frames={latent_frames}")
     print(f"Latent size: {latent_height}x{latent_width}")
+    print(f"World size: {world_size}, TP: {tp_degree}")
 
     # Load VAE
     print("Loading VAE...")
@@ -79,8 +104,9 @@ def compile_decoder_v2(args):
         cache_dir="wan2.2_ti2v_hf_cache_dir"
     )
 
-    # Use NxDParallelState with world_size=1 for single-device compilation
-    with NxDParallelState(world_size=1, tensor_model_parallel_size=1):
+    # Use NxDParallelState with matching world_size for compatibility with other models
+    # Even though decoder uses TP=1, world_size must match to share process groups
+    with NxDParallelState(world_size=world_size, tensor_model_parallel_size=tp_degree):
         # ========== Compile Decoder ==========
         print("Compiling decoder...")
         decoder = vae.decoder
@@ -137,11 +163,13 @@ def compile_decoder_v2(args):
         decoder_builder = ModelBuilder(model=decoder_wrapper)
 
         print("Tracing decoder...")
+        # Build kwargs with individual feat_cache tensors
+        trace_kwargs = {"x": decoder_input}
+        for i, fc in enumerate(feat_cache):
+            trace_kwargs[f"feat_cache_{i}"] = fc
+
         decoder_builder.trace(
-            kwargs={
-                "x": decoder_input,
-                "feat_cache": feat_cache,
-            },
+            kwargs=trace_kwargs,
             tag="decode",
         )
 
@@ -170,7 +198,8 @@ def compile_decoder_v2(args):
             "latent_frames": latent_frames,
             "decoder_frames": decoder_frames,
             "in_channels": in_channels,
-            "tp_degree": 1,
+            "tp_degree": tp_degree,
+            "world_size": world_size,
         }
         save_model_config(decoder_output_path, decoder_config)
 
@@ -214,7 +243,8 @@ def compile_decoder_v2(args):
             "latent_height": latent_height,
             "latent_width": latent_width,
             "in_channels": in_channels,
-            "tp_degree": 1,
+            "tp_degree": tp_degree,
+            "world_size": world_size,
         }
         save_model_config(pqc_output_path, pqc_config)
 
@@ -226,6 +256,8 @@ if __name__ == "__main__":
     parser.add_argument("--height", type=int, default=512, help="Height of generated video")
     parser.add_argument("--width", type=int, default=512, help="Width of generated video")
     parser.add_argument("--num_frames", type=int, default=81, help="Number of frames in generated video")
+    parser.add_argument("--tp_degree", type=int, default=4, help="Tensor parallelism degree")
+    parser.add_argument("--world_size", type=int, default=8, help="World size (must match transformer)")
     parser.add_argument("--compiled_models_dir", type=str, default="compiled_models", help="Output directory")
     args = parser.parse_args()
 

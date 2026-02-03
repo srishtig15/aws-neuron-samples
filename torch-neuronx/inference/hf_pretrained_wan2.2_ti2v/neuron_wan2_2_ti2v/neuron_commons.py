@@ -400,5 +400,141 @@ class f32Wrapper(nn.Module):
         y = x.to(torch.float32)
         output = self.original(y)
         return output.type(t)
-    
-    
+
+
+class DecoderWrapperV2(nn.Module):
+    """
+    Wrapper for V2 compiled VAE decoder using NxDModel.
+
+    The V2 compiled decoder accepts 34 individual feat_cache tensors as arguments
+    instead of a list, because ModelBuilder V2 API requires all inputs to be tensors.
+    """
+    NUM_FEAT_CACHE = 34
+
+    def __init__(self, original_decoder):
+        super().__init__()
+        self.original_decoder = original_decoder  # Keep reference for config
+        self.nxd_model = None  # Will be set after loading
+        self.feat_cache_shapes = None
+
+    def _init_feat_cache_shapes(self, x):
+        """Initialize feat_cache shapes based on input x"""
+        batch_size = x.shape[0]
+        latent_height = x.shape[3]
+        latent_width = x.shape[4]
+
+        # Create feat_cache shapes (matching compile_decoder_v2.py)
+        self.feat_cache_shapes = [
+            (batch_size, 48, 2, latent_height, latent_width),  # 0: conv_in
+            (batch_size, 1024, 2, latent_height, latent_width),  # 1: mid_block.resnets.0.conv1
+            (batch_size, 1024, 2, latent_height, latent_width),  # 2: mid_block.resnets.0.conv2
+            (batch_size, 1024, 2, latent_height, latent_width),  # 3: mid_block.resnets.1.conv1
+            (batch_size, 1024, 2, latent_height, latent_width),  # 4: mid_block.resnets.1.conv2
+            (batch_size, 1024, 2, latent_height, latent_width),  # 5: up_blocks.0.resnets.0.conv1
+            (batch_size, 1024, 2, latent_height, latent_width),  # 6: up_blocks.0.resnets.0.conv2
+            (batch_size, 1024, 2, latent_height, latent_width),  # 7: up_blocks.0.resnets.1.conv1
+            (batch_size, 1024, 2, latent_height, latent_width),  # 8: up_blocks.0.resnets.1.conv2
+            (batch_size, 1024, 2, latent_height, latent_width),  # 9: up_blocks.0.resnets.2.conv1
+            (batch_size, 1024, 2, latent_height, latent_width),  # 10: up_blocks.0.resnets.2.conv2
+            (batch_size, 1024, 2, latent_height, latent_width),  # 11: up_blocks.0.upsampler.time_conv
+            (batch_size, 1024, 2, latent_height*2, latent_width*2),  # 12: up_blocks.1.resnets.0.conv1
+            (batch_size, 1024, 2, latent_height*2, latent_width*2),  # 13: up_blocks.1.resnets.0.conv2
+            (batch_size, 1024, 2, latent_height*2, latent_width*2),  # 14: up_blocks.1.resnets.1.conv1
+            (batch_size, 1024, 2, latent_height*2, latent_width*2),  # 15: up_blocks.1.resnets.1.conv2
+            (batch_size, 1024, 2, latent_height*2, latent_width*2),  # 16: up_blocks.1.resnets.2.conv1
+            (batch_size, 1024, 2, latent_height*2, latent_width*2),  # 17: up_blocks.1.resnets.2.conv2
+            (batch_size, 1024, 2, latent_height*2, latent_width*2),  # 18: up_blocks.1.upsampler.time_conv
+            (batch_size, 1024, 2, latent_height*4, latent_width*4),  # 19: up_blocks.2.resnets.0.conv1
+            (batch_size, 512, 2, latent_height*4, latent_width*4),  # 20: up_blocks.2.resnets.0.conv2
+            (batch_size, 512, 2, latent_height*4, latent_width*4),  # 21: up_blocks.2.resnets.0.conv_shortcut
+            (batch_size, 512, 2, latent_height*4, latent_width*4),  # 22: up_blocks.2.resnets.1.conv1
+            (batch_size, 512, 2, latent_height*4, latent_width*4),  # 23: up_blocks.2.resnets.1.conv2
+            (batch_size, 512, 2, latent_height*4, latent_width*4),  # 24: up_blocks.2.resnets.2.conv1
+            (batch_size, 512, 2, latent_height*8, latent_width*8),  # 25: up_blocks.2.resnets.2.conv2
+            (batch_size, 256, 2, latent_height*8, latent_width*8),  # 26: up_blocks.3.resnets.0.conv1
+            (batch_size, 256, 2, latent_height*8, latent_width*8),  # 27: up_blocks.3.resnets.0.conv2
+            (batch_size, 256, 2, latent_height*8, latent_width*8),  # 28: up_blocks.3.resnets.0.conv_shortcut
+            (batch_size, 256, 2, latent_height*8, latent_width*8),  # 29: up_blocks.3.resnets.1.conv1
+            (batch_size, 256, 2, latent_height*8, latent_width*8),  # 30: up_blocks.3.resnets.1.conv2
+            (batch_size, 256, 2, latent_height*8, latent_width*8),  # 31: up_blocks.3.resnets.2.conv1
+            (batch_size, 256, 2, latent_height*8, latent_width*8),  # 32: up_blocks.3.resnets.2.conv2 (dummy)
+            (batch_size, 12, 2, latent_height*8, latent_width*8),  # 33: conv_out (dummy)
+        ]
+
+    def forward(self, x, **kwargs):
+        if 'feat_cache' not in kwargs:
+            # No feat_cache, use original decoder
+            return self.original_decoder(x)
+
+        feat_cache = kwargs['feat_cache']
+
+        # Compiled model expects 2 frames (CACHE_T=2)
+        original_frame_count = x.shape[2]
+        if original_frame_count == 1:
+            x = torch.cat([x, x], dim=2)
+
+        if self.feat_cache_shapes is None:
+            self._init_feat_cache_shapes(x)
+
+        # Prepare feat_cache tensors - replace None with zeros
+        feat_cache_tensors = []
+        for i in range(self.NUM_FEAT_CACHE):
+            if i < len(feat_cache) and feat_cache[i] is not None:
+                feat_cache_tensors.append(feat_cache[i])
+            else:
+                feat_cache_tensors.append(
+                    torch.zeros(self.feat_cache_shapes[i], dtype=x.dtype, device=x.device)
+                )
+
+        # Call NxDModel with individual feat_cache arguments
+        output = self.nxd_model(
+            x,
+            feat_cache_tensors[0], feat_cache_tensors[1], feat_cache_tensors[2],
+            feat_cache_tensors[3], feat_cache_tensors[4], feat_cache_tensors[5],
+            feat_cache_tensors[6], feat_cache_tensors[7], feat_cache_tensors[8],
+            feat_cache_tensors[9], feat_cache_tensors[10], feat_cache_tensors[11],
+            feat_cache_tensors[12], feat_cache_tensors[13], feat_cache_tensors[14],
+            feat_cache_tensors[15], feat_cache_tensors[16], feat_cache_tensors[17],
+            feat_cache_tensors[18], feat_cache_tensors[19], feat_cache_tensors[20],
+            feat_cache_tensors[21], feat_cache_tensors[22], feat_cache_tensors[23],
+            feat_cache_tensors[24], feat_cache_tensors[25], feat_cache_tensors[26],
+            feat_cache_tensors[27], feat_cache_tensors[28], feat_cache_tensors[29],
+            feat_cache_tensors[30], feat_cache_tensors[31], feat_cache_tensors[32],
+            feat_cache_tensors[33],
+        )
+
+        # Handle tuple return
+        if isinstance(output, (tuple, list)):
+            output = output[0]
+
+        # Propagate updates back to original feat_cache
+        for i in range(min(len(feat_cache), self.NUM_FEAT_CACHE)):
+            feat_cache[i] = feat_cache_tensors[i]
+
+        # If original input was 1 frame, take last 4 frames
+        if original_frame_count == 1:
+            output = output[:, :, -4:, :, :]
+
+        return output
+
+    def clear_cache(self):
+        pass
+
+
+class PostQuantConvWrapperV2(nn.Module):
+    """Wrapper for V2 compiled post_quant_conv using NxDModel."""
+
+    def __init__(self, original_conv):
+        super().__init__()
+        self.original_conv = original_conv
+        self.nxd_model = None  # Will be set after loading
+
+    def forward(self, x, **kwargs):
+        output = self.nxd_model(x)
+        # Handle tuple return
+        if isinstance(output, (tuple, list)):
+            output = output[0]
+        return output
+
+    def clear_cache(self):
+        pass
