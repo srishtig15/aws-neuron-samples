@@ -628,7 +628,8 @@ def compile_transformer_v3_cp(args):
         # Pass compiler args directly to compile() for State Buffer optimization
         # --enable-native-kernel=1: enables native kernel mode
         # --remat: enables rematerialization to save memory
-        compile_args = "--model-type=transformer -O2 --auto-cast=none --internal-hlo2tensorizer-options='--enable-native-kernel=1 --remat'"
+        # NOTE: Using -O1 instead of -O2 because -O2 can cause numerical issues in some cases
+        compile_args = "--model-type=transformer -O1 --auto-cast=none --internal-hlo2tensorizer-options='--enable-native-kernel=1 --remat'"
         traced_model = builder.compile(
             compiler_args=compile_args,
             compiler_workdir=args.compiler_workdir,
