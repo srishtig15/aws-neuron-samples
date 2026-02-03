@@ -66,7 +66,8 @@ class NeuronTextEncoderWrapper(nn.Module):
                  compiled_language_model=None, compiled_language_model_v3=None,
                  cpu_language_model=None,
                  cpu_vision_encoder=None,  # Option to use CPU vision encoder
-                 image_size=448, max_seq_len=512):
+                 image_size=448, max_seq_len=512,
+                 language_model_batch_size=1):  # Batch size for V3 language model
         super().__init__()
         # Copy config (small object)
         self.config = original_text_encoder.config
@@ -114,6 +115,7 @@ class NeuronTextEncoderWrapper(nn.Module):
 
         # V3 Language Model (ModelBuilder API, TP=4, world_size=8)
         self.use_v3_language_model = compiled_language_model_v3 is not None
+        self.language_model_batch_size = language_model_batch_size  # Compiled batch size
 
         # DO NOT keep original_text_encoder - it's 16+ GB!
         # self.original_text_encoder = original_text_encoder  # REMOVED!
@@ -503,6 +505,30 @@ class NeuronTextEncoderWrapper(nn.Module):
                     position_ids = position_ids[:, :, :self.max_seq_len]
                 original_seq_len = self.max_seq_len
 
+            # Handle batch padding if needed
+            actual_batch_size = inputs_embeds.shape[0]
+            if actual_batch_size < self.language_model_batch_size:
+                pad_batch = self.language_model_batch_size - actual_batch_size
+                # Pad inputs_embeds
+                inputs_embeds = torch.cat([
+                    inputs_embeds,
+                    torch.zeros((pad_batch, inputs_embeds.shape[1], inputs_embeds.shape[2]),
+                               dtype=inputs_embeds.dtype, device=inputs_embeds.device)
+                ], dim=0)
+                # Pad attention_mask
+                if attention_mask is not None:
+                    attention_mask = torch.cat([
+                        attention_mask,
+                        torch.zeros((pad_batch, attention_mask.shape[1]),
+                                   dtype=attention_mask.dtype, device=attention_mask.device)
+                    ], dim=0)
+                # Pad position_ids (shape: 3, batch, seq_len)
+                if position_ids is not None:
+                    position_ids = torch.cat([
+                        position_ids,
+                        position_ids[:, :1, :].repeat(1, pad_batch, 1)  # Repeat first sample's positions
+                    ], dim=1)
+
             # Run V3 compiled language model (NxDModel)
             # V3 model expects: inputs_embeds, attention_mask, position_ids
             hidden_states = self.compiled_language_model_v3(
@@ -511,7 +537,11 @@ class NeuronTextEncoderWrapper(nn.Module):
                 position_ids
             )
 
-            # Remove padding from output
+            # Remove batch padding from output
+            if actual_batch_size < self.language_model_batch_size:
+                hidden_states = hidden_states[:actual_batch_size]
+
+            # Remove sequence padding from output
             hidden_states = hidden_states[:, :original_seq_len, :]
 
             _t3 = time.time()

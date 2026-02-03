@@ -188,13 +188,14 @@ def compile_language_model_v3(args):
     tp_degree = 4  # Fixed: perfect GQA alignment
     world_size = 8  # Fixed: match V3 CP transformer
 
-    batch_size = 1
+    batch_size = args.batch_size
     sequence_length = args.max_sequence_length
     hidden_size = 3584  # Qwen2.5-VL hidden size
 
     print("=" * 60)
     print("Compiling Language Model V3 (ModelBuilder API)")
     print("=" * 60)
+    print(f"  Batch size: {batch_size}")
     print(f"  Sequence length: {sequence_length}")
     print(f"  Hidden size: {hidden_size}")
     print(f"  TP degree: {tp_degree}")
@@ -339,6 +340,7 @@ def compile_language_model_v3(args):
         config = {
             "max_sequence_length": sequence_length,
             "hidden_size": hidden_size,
+            "batch_size": batch_size,
             "tp_degree": tp_degree,
             "world_size": world_size,
             "num_hidden_layers": 28,
@@ -368,6 +370,8 @@ if __name__ == "__main__":
                         help="Path to model (local dir or HuggingFace ID). If not set, uses MODEL_ID with CACHE_DIR")
     parser.add_argument("--max_sequence_length", type=int, default=1024,
                         help="Maximum sequence length for compilation")
+    parser.add_argument("--batch_size", type=int, default=1,
+                        help="Batch size for language model (default: 1)")
     parser.add_argument("--compiled_models_dir", type=str, default="/opt/dlami/nvme/compiled_models",
                         help="Directory to save compiled models")
     parser.add_argument("--compiler_workdir", type=str, default="/opt/dlami/nvme/compiler_workdir",

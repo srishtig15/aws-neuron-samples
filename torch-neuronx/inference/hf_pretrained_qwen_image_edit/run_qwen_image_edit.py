@@ -1133,10 +1133,11 @@ def load_language_model_v3(compiled_models_dir: str):
     tp_degree = config.get("tp_degree", 4)
     world_size = config.get("world_size", 8)
     max_seq_len = config.get("max_sequence_length", 1024)
+    batch_size = config.get("batch_size", 1)
     cp_degree = world_size // tp_degree  # 2
 
     print(f"  V3 language model config:")
-    print(f"    TP={tp_degree}, world_size={world_size}")
+    print(f"    TP={tp_degree}, world_size={world_size}, batch_size={batch_size}")
     print(f"    max_sequence_length={max_seq_len}")
     print(f"    GQA: 28Q/4=7 heads/rank, 4KV/4=1 head/rank (perfect fit)")
 
@@ -1360,18 +1361,43 @@ class NeuronVAEWrapper(torch.nn.Module):
 
     def _encode_tile(self, x):
         """Encode a single tile through compiled encoder."""
+        actual_batch = x.shape[0]
+
+        # Pad batch dimension if needed
+        if actual_batch < self.compiled_batch_size:
+            pad_batch = self.compiled_batch_size - actual_batch
+            x = torch.cat([x, torch.zeros_like(x[:1]).repeat(pad_batch, 1, 1, 1, 1)], dim=0)
+
         h = self.compiled_encoder(x)
         if self.compiled_quant_conv is not None:
             moments = self.compiled_quant_conv(h)
         else:
             moments = h
+
+        # Remove batch padding
+        if actual_batch < self.compiled_batch_size:
+            moments = moments[:actual_batch]
+
         return moments
 
     def _decode_tile(self, z):
         """Decode a single tile through compiled decoder."""
+        actual_batch = z.shape[0]
+
+        # Pad batch dimension if needed
+        if actual_batch < self.compiled_batch_size:
+            pad_batch = self.compiled_batch_size - actual_batch
+            z = torch.cat([z, torch.zeros_like(z[:1]).repeat(pad_batch, 1, 1, 1, 1)], dim=0)
+
         if self.compiled_post_quant_conv is not None:
             z = self.compiled_post_quant_conv(z)
-        return self.compiled_decoder(z)
+        output = self.compiled_decoder(z)
+
+        # Remove batch padding
+        if actual_batch < self.compiled_batch_size:
+            output = output[:actual_batch]
+
+        return output
 
     def encode(self, x, return_dict=True):
         """Encode images to latents on Neuron. Supports tiled encoding for large images."""
@@ -1914,6 +1940,12 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     # Create Text Encoder Wrapper
     # Store reference to original, then delete after wrapper is created
     original_text_encoder = pipe.text_encoder
+
+    # Get language model batch size from config (default to 1)
+    language_model_batch_size = 1
+    if language_model_config is not None:
+        language_model_batch_size = language_model_config.get("batch_size", 1)
+
     pipe.text_encoder = NeuronTextEncoderWrapper(
         original_text_encoder=original_text_encoder,
         compiled_vision_encoder=compiled_vision_encoder,
@@ -1923,7 +1955,8 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
         cpu_language_model=cpu_language_model,
         cpu_vision_encoder=cpu_vision_encoder,
         image_size=args.image_size,
-        max_seq_len=args.max_sequence_length
+        max_seq_len=args.max_sequence_length,
+        language_model_batch_size=language_model_batch_size
     )
 
     if use_cpu_language_model or use_cpu_vision_encoder:
