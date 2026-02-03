@@ -128,54 +128,42 @@ def apply_rotary_emb_nki(hidden_states, freqs):
     """
     Apply rotary embeddings with pre-computed cos/sin tensors.
 
-    Args:
-        hidden_states: [batch, heads, seq_len, head_dim]
-        freqs: tuple of (cos, sin)
+    This implementation matches Wan's apply_rotary_emb but handles the
+    transposed tensor format used for NKI attention:
+    - hidden_states: [batch, heads, seq_len, head_dim] (transposed for NKI)
+    - freqs: tuple of (cos, sin), each with shape [1, seq_len, 1, head_dim] (Wan format)
+
+    Wan's original implementation expects [batch, seq_len, heads, head_dim].
+    We permute the RoPE tensors to broadcast with our [batch, heads, seq_len, head_dim] format.
 
     Returns:
         Tensor with rotary embeddings applied
     """
-    cos, sin = freqs
-    batch, heads, seq_len, head_dim = hidden_states.shape
+    freqs_cos, freqs_sin = freqs
     dtype = hidden_states.dtype
-    half_head_dim = head_dim // 2
 
-    # Reshape hidden_states: split into real/imag pairs
-    x = hidden_states.float().reshape(batch, heads, seq_len, half_head_dim, 2)
-    x_real = x[..., 0]
-    x_imag = x[..., 1]
+    # Match Wan's apply_rotary_emb implementation:
+    # x1, x2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
+    # cos = freqs_cos[..., 0::2]
+    # sin = freqs_sin[..., 1::2]
+    # out[..., 0::2] = x1 * cos - x2 * sin
+    # out[..., 1::2] = x1 * sin + x2 * cos
 
-    # Handle various RoPE shapes
-    if cos.dim() == 4:
-        if cos.shape[1] == 1 and cos.shape[2] == seq_len:
-            if cos.shape[3] != half_head_dim:
-                cos = cos[..., :half_head_dim]
-                sin = sin[..., :half_head_dim]
-        elif cos.shape[1] == seq_len and cos.shape[2] == 1:
-            cos = cos.permute(0, 2, 1, 3)
-            sin = sin.permute(0, 2, 1, 3)
-            if cos.shape[3] != half_head_dim:
-                cos = cos[..., :half_head_dim]
-                sin = sin[..., :half_head_dim]
-    elif cos.dim() == 3:
-        cos = cos.unsqueeze(1)
-        sin = sin.unsqueeze(1)
-        if cos.shape[3] != half_head_dim:
-            cos = cos[..., :half_head_dim]
-            sin = sin[..., :half_head_dim]
-    elif cos.dim() == 2:
-        cos = cos.unsqueeze(0).unsqueeze(0)
-        sin = sin.unsqueeze(0).unsqueeze(0)
-        if cos.shape[3] != half_head_dim:
-            cos = cos[..., :half_head_dim]
-            sin = sin[..., :half_head_dim]
+    # Unflatten last dim into pairs and separate
+    # hidden_states: [B, H, S, D] -> x1, x2: [B, H, S, D//2]
+    x1, x2 = hidden_states.float().unflatten(-1, (-1, 2)).unbind(-1)
 
-    # Complex multiplication
-    out_real = x_real * cos - x_imag * sin
-    out_imag = x_real * sin + x_imag * cos
+    # freqs_cos/sin shape: [1, seq_len, 1, head_dim] (Wan format: [B, S, 1, D])
+    # After [..., 0::2]: [1, seq_len, 1, head_dim//2]
+    # Permute to [1, 1, seq_len, head_dim//2] to broadcast with [B, H, S, D//2]
+    cos = freqs_cos[..., 0::2].permute(0, 2, 1, 3).float()  # [1, 1, S, D//2]
+    sin = freqs_sin[..., 1::2].permute(0, 2, 1, 3).float()  # [1, 1, S, D//2]
 
-    # Re-interleave
-    out = torch.stack([out_real, out_imag], dim=-1).flatten(-2)
+    # Apply rotation
+    out = torch.empty_like(hidden_states, dtype=torch.float32)
+    out[..., 0::2] = x1 * cos - x2 * sin
+    out[..., 1::2] = x1 * sin + x2 * cos
+
     return out.to(dtype)
 
 

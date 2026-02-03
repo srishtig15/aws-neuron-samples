@@ -244,10 +244,12 @@ def main(args):
     transformer_wrapper = load_transformer_v3_flash(compiled_models_dir, pipe)
 
     # Load Decoder - check for V2 first, fall back to V1
+    # Use --force_v1_decoder to always use V1 decoder (faster)
     decoder_v2_path = f"{compiled_models_dir}/decoder_v2"
     decoder_v1_path = f"{compiled_models_dir}/decoder/model.pt"
+    use_v2_decoder = os.path.exists(decoder_v2_path) and not args.force_v1_decoder
 
-    if os.path.exists(decoder_v2_path):
+    if use_v2_decoder:
         print("\nLoading decoder (V2)...")
         vae_decoder_wrapper = DecoderWrapperV2(pipe.vae.decoder)
         decoder_nxd = NxDModel.load(os.path.join(decoder_v2_path, "nxd_model.pt"))
@@ -270,8 +272,9 @@ def main(args):
     # Load post_quant_conv - check for V2 first, fall back to V1
     pqc_v2_path = f"{compiled_models_dir}/post_quant_conv_v2"
     pqc_v1_path = f"{compiled_models_dir}/post_quant_conv/model.pt"
+    use_v2_pqc = os.path.exists(pqc_v2_path) and not args.force_v1_decoder
 
-    if os.path.exists(pqc_v2_path):
+    if use_v2_pqc:
         print("\nLoading post_quant_conv (V2)...")
         vae_post_quant_conv_wrapper = PostQuantConvWrapperV2(pipe.vae.post_quant_conv)
         pqc_nxd = NxDModel.load(os.path.join(pqc_v2_path, "nxd_model.pt"))
@@ -365,6 +368,7 @@ if __name__ == "__main__":
                         default="Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards",
                         help="Negative prompt")
     parser.add_argument("--output", type=str, default="output_v3_flash.mp4", help="Output video path")
+    parser.add_argument("--force_v1_decoder", action="store_true", help="Force use V1 decoder (faster)")
     args = parser.parse_args()
 
     # Initialize parallel state with world_size=8 and TP=8 (no Context Parallel)
