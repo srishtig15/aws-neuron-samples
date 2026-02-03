@@ -488,7 +488,11 @@ def compute_rope(transformer, latent_frames, latent_height, latent_width, in_cha
 
 
 def fix_norm_weights_per_rank(weights_path, unsharded_norm_weights, tp_degree):
-    """Fix norm_k/norm_q weights for each rank after shard_checkpoint."""
+    """Fix norm_k/norm_q weights for each rank after shard_checkpoint.
+
+    shard_checkpoint doesn't recognize norm_q/norm_k inside NKI attention modules
+    as parallel layers, so they remain unsharded. This function manually shards them.
+    """
     print(f"Fixing norm weights for {tp_degree} ranks...")
 
     for rank in range(tp_degree):
@@ -503,20 +507,27 @@ def fix_norm_weights_per_rank(weights_path, unsharded_norm_weights, tp_degree):
                 expected_shard_size = unsharded_dim // tp_degree
 
                 if ckpt_shape == expected_shard_size:
+                    # Already correctly sharded, just slice from unsharded
+                    start = expected_shard_size * rank
+                    end = expected_shard_size * (rank + 1)
+                    correct_slice = unsharded_weight[start:end].clone()
+                elif ckpt_shape == unsharded_dim:
+                    # Not sharded at all - shard it now
                     start = expected_shard_size * rank
                     end = expected_shard_size * (rank + 1)
                     correct_slice = unsharded_weight[start:end].clone()
                 else:
-                    total_padded_dim = ckpt_shape * tp_degree
-                    padded_weight = torch.ones(total_padded_dim, dtype=unsharded_weight.dtype)
+                    # Dimension needs padding (not evenly divisible)
+                    padded_dim = ((unsharded_dim + tp_degree - 1) // tp_degree) * tp_degree
+                    padded_weight = torch.ones(padded_dim, dtype=unsharded_weight.dtype)
                     padded_weight[:unsharded_dim] = unsharded_weight
-                    start = ckpt_shape * rank
-                    end = ckpt_shape * (rank + 1)
+                    shard_size = padded_dim // tp_degree
+                    start = shard_size * rank
+                    end = shard_size * (rank + 1)
                     correct_slice = padded_weight[start:end].clone()
 
-                if correct_slice.shape == ckpt[key].shape:
-                    ckpt[key] = correct_slice
-                    fixed_count += 1
+                ckpt[key] = correct_slice
+                fixed_count += 1
 
         save_file(ckpt, ckpt_path)
         print(f"  Rank {rank}: Fixed {fixed_count} norm weights")
@@ -629,14 +640,18 @@ def compile_transformer_v3_flash(args):
         weights_path = os.path.join(output_path, "weights")
         os.makedirs(weights_path, exist_ok=True)
 
-        # Prepare checkpoint
+        # Prepare checkpoint - convert all to bfloat16
         checkpoint = {}
         for key, value in model.state_dict().items():
             orig_key = key.replace("transformer.", "", 1)
             if orig_key in unsharded_state:
-                checkpoint[key] = unsharded_state[orig_key].clone()
+                val = unsharded_state[orig_key].clone()
             else:
-                checkpoint[key] = value.clone()
+                val = value.clone()
+            # Convert to bfloat16 (model expects bfloat16)
+            if val.dtype == torch.float32:
+                val = val.to(torch.bfloat16)
+            checkpoint[key] = val
 
         print("Sharding weights...")
         shard_checkpoint(
@@ -645,8 +660,9 @@ def compile_transformer_v3_flash(args):
             serialize_path=weights_path,
         )
 
-        # Fix norm weights
-        fix_norm_weights_per_rank(weights_path, unsharded_norm_weights, tp_degree)
+        # Fix norm weights - also convert to bfloat16
+        unsharded_norm_weights_bf16 = {k: v.to(torch.bfloat16) for k, v in unsharded_norm_weights.items()}
+        fix_norm_weights_per_rank(weights_path, unsharded_norm_weights_bf16, tp_degree)
 
         # Save config
         config = {

@@ -160,6 +160,18 @@ class InferenceTransformerWrapperV3CP(torch.nn.Module):
 
     def forward(self, hidden_states, timestep=None, encoder_hidden_states=None, return_dict=False, **kwargs):
         """Forward with pre-computed RoPE."""
+        # Ensure timestep has correct shape [batch_size]
+        # The pipeline may pass timestep in different formats
+        if timestep is not None:
+            if timestep.dim() > 1:
+                # If timestep is expanded (e.g., [1, seq_len]), take first element
+                timestep = timestep.flatten()[0:1]
+            elif timestep.dim() == 0:
+                # If scalar, add batch dimension
+                timestep = timestep.unsqueeze(0)
+            # Ensure correct dtype (float32 for timestep)
+            timestep = timestep.to(torch.float32)
+
         # Call NxDModel with RoPE
         if hasattr(self.nxd_model, 'inference'):
             output = self.nxd_model.inference(
