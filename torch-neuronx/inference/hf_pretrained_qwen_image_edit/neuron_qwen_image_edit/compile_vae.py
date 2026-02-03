@@ -71,7 +71,7 @@ def compile_vae(args):
 
     compiler_workdir = args.compiler_workdir
     compiled_models_dir = args.compiled_models_dir
-    batch_size = 1
+    batch_size = args.batch_size
     dtype = torch.bfloat16
 
     load_kwargs = {"local_files_only": True, "torch_dtype": dtype}
@@ -184,6 +184,22 @@ def compile_vae(args):
             torch.jit.save(compiled_post_quant, f"{post_quant_dir}/model.pt")
             print(f"post_quant_conv compiled and saved to {post_quant_dir}")
 
+    # Save VAE config
+    import json
+    vae_config = {
+        "height": args.height,
+        "width": args.width,
+        "temporal_frames": temporal_frames,
+        "batch_size": batch_size,
+        "z_dim": z_dim,
+        "latent_height": latent_height,
+        "latent_width": latent_width,
+    }
+    config_path = f"{compiled_models_dir}/vae_config.json"
+    with open(config_path, "w") as f:
+        json.dump(vae_config, f, indent=2)
+    print(f"VAE config saved to {config_path}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -195,6 +211,8 @@ if __name__ == "__main__":
                         help="Width of generated image (compile tile size)")
     parser.add_argument("--temporal_frames", type=int, default=1,
                         help="Number of temporal frames (1 for single image)")
+    parser.add_argument("--batch_size", type=int, default=1,
+                        help="Batch size for VAE (default: 1)")
     parser.add_argument("--compiler_workdir", type=str, default="compiler_workdir",
                         help="Directory for compiler artifacts")
     parser.add_argument("--compiled_models_dir", type=str, default="compiled_models",
@@ -210,10 +228,12 @@ if __name__ == "__main__":
     print("VAE Compilation for Neuron")
     print("=" * 60)
     print(f"Compile tile size: {args.height}x{args.width}")
+    print(f"Batch size: {args.batch_size}")
     print("")
     print("NOTE: For inference at larger resolutions (e.g., 1024x1024),")
     print("      tiled VAE processing will be used automatically.")
     print("      The VAE is compiled at this tile size for memory efficiency.")
+    print("      With batch_size > 1, multiple tiles can be processed in parallel.")
     print("")
 
     compile_vae(args)

@@ -560,11 +560,13 @@ def compile_transformer_v3_cp(args):
     print(f"World size: {world_size}")
     print(f"Context Parallel: {context_parallel_enabled} (CP={cp_degree})")
     print(f"NKI Flash Attention: Enabled")
+    print(f"Batch size: {args.batch_size}")
 
     # Sample inputs (use padded num_patches for compilation)
-    sample_hidden_states = torch.randn(1, num_patches_padded, in_channels, dtype=torch.bfloat16)
-    sample_encoder_hidden_states = torch.randn(1, text_seq_len, text_hidden_size, dtype=torch.bfloat16)
-    sample_timestep = torch.randn(1, dtype=torch.float32)
+    batch_size = args.batch_size
+    sample_hidden_states = torch.randn(batch_size, num_patches_padded, in_channels, dtype=torch.bfloat16)
+    sample_encoder_hidden_states = torch.randn(batch_size, text_seq_len, text_hidden_size, dtype=torch.bfloat16)
+    sample_timestep = torch.randn(batch_size, dtype=torch.float32)
 
     # Use NxDParallelState context for compilation
     # world_size=8, tensor_model_parallel_size=4 means DP=2 (used for CP)
@@ -715,6 +717,7 @@ def compile_transformer_v3_cp(args):
             "patch_h": patch_h,
             "patch_w": patch_w,
             "nki_flash_attention": True,
+            "batch_size": batch_size,
         }
         with open(os.path.join(output_path, "config.json"), "w") as f:
             json.dump(config, f, indent=2)
@@ -739,6 +742,8 @@ if __name__ == "__main__":
     parser.add_argument("--patch_multiplier", type=int, default=3)
     parser.add_argument("--tp_degree", type=int, default=4)
     parser.add_argument("--world_size", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=1,
+                        help="Batch size for compiled model (default: 1)")
     parser.add_argument("--compiled_models_dir", type=str, default="/opt/dlami/nvme/compiled_models")
     parser.add_argument("--compiler_workdir", type=str, default="/opt/dlami/nvme/compiler_workdir")
     args = parser.parse_args()

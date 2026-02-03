@@ -743,7 +743,7 @@ class NeuronTransformerWrapperV3CP(torch.nn.Module):
     """
     def __init__(self, original_transformer, nxd_model, img_rotary_emb, txt_rotary_emb,
                  expected_num_patches=1024, num_patches_padded=None, patches_padding=0,
-                 expected_seq_len=512, temporal_frames=3, cp_degree=2):
+                 expected_seq_len=512, temporal_frames=3, cp_degree=2, compiled_batch_size=1):
         super().__init__()
         self.config = original_transformer.config
         self.dtype = original_transformer.dtype
@@ -761,6 +761,7 @@ class NeuronTransformerWrapperV3CP(torch.nn.Module):
         self.temporal_frames = temporal_frames
         self.base_patches = expected_num_patches // temporal_frames
         self.cp_degree = cp_degree
+        self.compiled_batch_size = compiled_batch_size
 
         # Local dimensions (per CP rank) - use padded value for internal computation
         self.local_num_patches = self.num_patches_padded // cp_degree
@@ -774,7 +775,7 @@ class NeuronTransformerWrapperV3CP(torch.nn.Module):
     def forward(self, hidden_states, encoder_hidden_states=None,
                 timestep=None, img_shapes=None, return_dict=False, **kwargs):
         """Forward pass with Context Parallel."""
-        batch_size = hidden_states.shape[0]
+        actual_batch_size = hidden_states.shape[0]
 
         # Debug: Print shapes on first call
         if not hasattr(self, '_debug_printed'):
@@ -785,11 +786,41 @@ class NeuronTransformerWrapperV3CP(torch.nn.Module):
             print(f"  img_rotary_emb_full: {self.img_rotary_emb_full.shape}")
             print(f"  txt_rotary_emb_full: {self.txt_rotary_emb_full.shape}")
             print(f"  CP degree: {self.cp_degree}")
+            print(f"  Compiled batch size: {self.compiled_batch_size}")
             print(f"  Local patches: {self.local_num_patches}, Local seq_len: {self.local_seq_len}")
             # Print tensor statistics for debugging
             print(f"  hidden_states stats: min={hidden_states.min():.4f}, max={hidden_states.max():.4f}, mean={hidden_states.mean():.4f}")
             print(f"  encoder_hidden_states stats: min={encoder_hidden_states.min():.4f}, max={encoder_hidden_states.max():.4f}")
             self._debug_printed = True
+
+        # Handle batch size padding if needed
+        # If actual batch size < compiled batch size, we need to pad
+        if actual_batch_size < self.compiled_batch_size:
+            pad_batch = self.compiled_batch_size - actual_batch_size
+            # Pad hidden_states
+            hidden_states = torch.cat([
+                hidden_states,
+                torch.zeros((pad_batch, hidden_states.shape[1], hidden_states.shape[2]),
+                           dtype=hidden_states.dtype, device=hidden_states.device)
+            ], dim=0)
+            # Pad encoder_hidden_states
+            encoder_hidden_states = torch.cat([
+                encoder_hidden_states,
+                torch.zeros((pad_batch, encoder_hidden_states.shape[1], encoder_hidden_states.shape[2]),
+                           dtype=encoder_hidden_states.dtype, device=encoder_hidden_states.device)
+            ], dim=0)
+            # Pad timestep
+            timestep = torch.cat([
+                timestep,
+                timestep[-1:].repeat(pad_batch)  # Repeat last timestep for padding
+            ], dim=0)
+        elif actual_batch_size > self.compiled_batch_size:
+            raise ValueError(
+                f"Input batch size ({actual_batch_size}) exceeds compiled batch size ({self.compiled_batch_size}). "
+                f"Please recompile the model with --batch_size {actual_batch_size} or higher."
+            )
+
+        batch_size = hidden_states.shape[0]  # Now equals compiled_batch_size
 
         # For CP, the model expects LOCAL data (already sharded)
         # Since we're running inference, we pass full data and let the model handle it
@@ -886,6 +917,10 @@ class NeuronTransformerWrapperV3CP(torch.nn.Module):
         # Extract first frame as noise prediction
         output_tensor = output_tensor[:, :self.base_patches, :]
 
+        # Remove batch padding if we added it
+        if actual_batch_size < self.compiled_batch_size:
+            output_tensor = output_tensor[:actual_batch_size]
+
         if return_dict:
             from diffusers.models.modeling_outputs import Transformer2DModelOutput
             return Transformer2DModelOutput(sample=output_tensor)
@@ -952,6 +987,7 @@ def load_transformer_v3_cp(compiled_models_dir: str, pipe, args):
     tp_degree = config.get("tp_degree", 4)
     world_size = config.get("world_size", 8)
     cp_degree = config.get("cp_degree", 2)
+    compiled_batch_size = config.get("batch_size", 1)
     base_patches = expected_num_patches // temporal_frames
 
     print(f"  V3 CP config: patches={expected_num_patches}, seq_len={expected_seq_len}")
@@ -959,6 +995,7 @@ def load_transformer_v3_cp(compiled_models_dir: str, pipe, args):
         print(f"  V3 CP config: patches_padded={num_patches_padded} (+{patches_padding} for CP alignment)")
     print(f"  V3 CP config: temporal_frames={temporal_frames}, base_patches={base_patches}")
     print(f"  V3 CP config: TP={tp_degree}, world_size={world_size}, CP={cp_degree}")
+    print(f"  V3 CP config: batch_size={compiled_batch_size}")
     print(f"  Context Parallel: {config.get('context_parallel', False)}")
     print(f"  NKI Flash Attention: {config.get('nki_flash_attention', False)}")
 
@@ -1043,6 +1080,7 @@ def load_transformer_v3_cp(compiled_models_dir: str, pipe, args):
         expected_seq_len=expected_seq_len,
         temporal_frames=temporal_frames,
         cp_degree=cp_degree,
+        compiled_batch_size=compiled_batch_size,
     )
 
     return wrapper
@@ -1251,7 +1289,7 @@ class NeuronVAEWrapper(torch.nn.Module):
     def __init__(self, original_vae, compiled_encoder, compiled_decoder,
                  compiled_quant_conv=None, compiled_post_quant_conv=None,
                  expected_height=512, expected_width=512,
-                 cpu_decode=False):
+                 compiled_batch_size=1, cpu_decode=False):
         super().__init__()
         self.config = original_vae.config
         self.dtype = original_vae.dtype
@@ -1261,6 +1299,9 @@ class NeuronVAEWrapper(torch.nn.Module):
         self.compiled_decoder = compiled_decoder
         self.compiled_quant_conv = compiled_quant_conv
         self.compiled_post_quant_conv = compiled_post_quant_conv
+
+        # Batch size the VAE was compiled with (for batched encode/decode)
+        self.compiled_batch_size = compiled_batch_size
 
         # CPU decode mode for debugging
         self.cpu_decode = cpu_decode
@@ -1972,6 +2013,17 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     cpu_decode = getattr(args, 'cpu_vae_decode', False)
     # Use vae_tile_size for the compiled model's expected input size
     vae_tile_size = getattr(args, 'vae_tile_size', 512)
+
+    # Load VAE config to get compiled_batch_size
+    vae_config_path = f"{compiled_models_dir}/vae_config.json"
+    vae_compiled_batch_size = 1
+    if os.path.exists(vae_config_path):
+        import json
+        with open(vae_config_path, 'r') as f:
+            vae_config = json.load(f)
+        vae_compiled_batch_size = vae_config.get('batch_size', 1)
+        print(f"  VAE compiled batch_size: {vae_compiled_batch_size}")
+
     pipe.vae = NeuronVAEWrapper(
         original_vae=neuron_vae,
         compiled_encoder=compiled_encoder,
@@ -1980,6 +2032,7 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
         compiled_post_quant_conv=compiled_post_quant_conv,
         expected_height=vae_tile_size,
         expected_width=vae_tile_size,
+        compiled_batch_size=vae_compiled_batch_size,
         cpu_decode=cpu_decode
     )
     # Delete the neuron_vae (original VAE copy) - small but still free it
