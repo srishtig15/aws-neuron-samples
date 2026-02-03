@@ -378,7 +378,7 @@ def compile_vision_encoder_v3(args):
 
         print("Compiling model...")
         # Use --auto-cast=none to preserve float32 precision
-        compile_args = "--model-type=transformer --auto-cast=none"
+        compile_args = "--model-type=transformer -O2 --auto-cast=none"
         traced_model = builder.compile(
             compiler_args=compile_args,
             compiler_workdir=args.compiler_workdir,

@@ -260,7 +260,7 @@ def compile_language_model_v3(args):
         )
 
         print("Compiling model...")
-        compile_args = "--model-type=transformer --auto-cast=none"
+        compile_args = "--model-type=transformer -O2 --auto-cast=none"
         traced_model = builder.compile(
             compiler_args=compile_args,
             compiler_workdir=args.compiler_workdir,
