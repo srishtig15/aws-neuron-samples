@@ -28,7 +28,7 @@ os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "2"
 os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2"
 
 # Compiler flags - same as Flux for CP mode
-compiler_flags = """ --target=trn2 --lnc=2 --model-type=transformer -O1 --auto-cast=none --enable-fast-loading-neuron-binaries --tensorizer-options='--enable-ccop-compute-overlap' --internal-hlo2tensorizer-options='--enable-state-buffer-mode=hybrid --remat-by-default' """
+compiler_flags = """ --target=trn2 --lnc=2 --model-type=transformer --auto-cast=none --enable-fast-loading-neuron-binaries --tensorizer-options='--enable-ccop-compute-overlap' --internal-hlo2tensorizer-options='--enable-state-buffer-mode=hybrid --remat-by-default' """
 os.environ["NEURON_CC_FLAGS"] = os.environ.get("NEURON_CC_FLAGS", "") + compiler_flags
 
 import torch
@@ -603,7 +603,7 @@ def compile_transformer_v3_cp(args):
         # Pass compiler args directly to compile() for State Buffer optimization
         # --enable-native-kernel=1: enables native kernel mode
         # --remat: enables rematerialization to save memory
-        compile_args = "--model-type=transformer -O1 --auto-cast=none --internal-hlo2tensorizer-options='--enable-native-kernel=1 --remat'"
+        compile_args = "--model-type=transformer --auto-cast=none --internal-hlo2tensorizer-options='--enable-native-kernel=1 --remat'"
         traced_model = builder.compile(
             compiler_args=compile_args,
             compiler_workdir=args.compiler_workdir,
