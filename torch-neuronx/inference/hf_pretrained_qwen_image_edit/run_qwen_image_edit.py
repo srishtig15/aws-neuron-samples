@@ -169,22 +169,11 @@ class NeuronTransformerWrapper(torch.nn.Module):
         timestep = timestep.to(torch.float32)
 
         # Run on compiled Neuron model
-        import time
-        _t_start = time.time()
         output = self.compiled_transformer(
             hidden_states,
             encoder_hidden_states,
             timestep
         )
-        # Profile transformer step (print every 10 steps to avoid spam)
-        if not hasattr(self, '_step_count'):
-            self._step_count = 0
-            self._step_times = []
-        self._step_count += 1
-        self._step_times.append(time.time() - _t_start)
-        if self._step_count % 10 == 0:
-            avg_time = sum(self._step_times[-10:]) / 10
-            print(f"  [Profile] Transformer V1 (Neuron) step {self._step_count}: avg {avg_time:.3f}s/step")
 
         # 4. Remove padding from output if we padded hidden_states
         if actual_patches < self.expected_num_patches:
@@ -276,8 +265,6 @@ class NeuronTransformerWrapperV2(torch.nn.Module):
         timestep = timestep.to(torch.float32)
 
         # Run V2 model with RoPE as input
-        import time
-        _t_start = time.time()
         output = self.nxd_model(
             hidden_states,
             encoder_hidden_states,
@@ -285,16 +272,6 @@ class NeuronTransformerWrapperV2(torch.nn.Module):
             self.img_rotary_emb,
             self.txt_rotary_emb
         )
-
-        # Profile
-        if not hasattr(self, '_step_count'):
-            self._step_count = 0
-            self._step_times = []
-        self._step_count += 1
-        self._step_times.append(time.time() - _t_start)
-        if self._step_count % 10 == 0:
-            avg_time = sum(self._step_times[-10:]) / 10
-            print(f"  [Profile] Transformer V2 (Neuron) step {self._step_count}: avg {avg_time:.3f}s/step")
 
         # Extract tensor from output (handle tuple or tensor)
         if isinstance(output, tuple):
@@ -381,16 +358,6 @@ def load_transformer_v2(compiled_models_dir: str, pipe, args):
     txt_rotary_emb = rope_cache["txt_rotary_emb"].to(torch.bfloat16)
     print(f"  img_rotary_emb: {img_rotary_emb.shape}")
     print(f"  txt_rotary_emb: {txt_rotary_emb.shape}")
-
-    # Debug: Print RoPE statistics
-    img_cos = img_rotary_emb[..., 0]
-    img_sin = img_rotary_emb[..., 1]
-    txt_cos = txt_rotary_emb[..., 0]
-    txt_sin = txt_rotary_emb[..., 1]
-    print(f"  img_cos stats: min={img_cos.min():.4f}, max={img_cos.max():.4f}, mean={img_cos.mean():.4f}")
-    print(f"  img_sin stats: min={img_sin.min():.4f}, max={img_sin.max():.4f}, mean={img_sin.mean():.4f}")
-    print(f"  txt_cos stats: min={txt_cos.min():.4f}, max={txt_cos.max():.4f}, mean={txt_cos.mean():.4f}")
-    print(f"  txt_sin stats: min={txt_sin.min():.4f}, max={txt_sin.max():.4f}, mean={txt_sin.mean():.4f}")
 
     # Load the compiled model using NxDModel.load()
     print(f"  Loading V2 model from {nxd_model_path}...")
@@ -512,8 +479,6 @@ class NeuronTransformerWrapperV1Flash(torch.nn.Module):
         timestep = timestep.to(torch.float32)
 
         # Run compiled transformer with RoPE as input
-        import time
-        _t_start = time.time()
         output = self.compiled_transformer(
             hidden_states,
             encoder_hidden_states,
@@ -521,16 +486,6 @@ class NeuronTransformerWrapperV1Flash(torch.nn.Module):
             self.img_rotary_emb,
             self.txt_rotary_emb
         )
-
-        # Profile
-        if not hasattr(self, '_step_count'):
-            self._step_count = 0
-            self._step_times = []
-        self._step_count += 1
-        self._step_times.append(time.time() - _t_start)
-        if self._step_count % 10 == 0:
-            avg_time = sum(self._step_times[-10:]) / 10
-            print(f"  [Profile] Transformer V1 Flash (Neuron) step {self._step_count}: avg {avg_time:.3f}s/step")
 
         # Extract tensor from output
         if isinstance(output, tuple):
@@ -777,7 +732,7 @@ class NeuronTransformerWrapperV3CP(torch.nn.Module):
         """Forward pass with Context Parallel."""
         actual_batch_size = hidden_states.shape[0]
 
-        # Debug: Print shapes on first call
+        # Debug: Print shapes on first call (avoid .min()/.max()/.mean() to prevent CPU sync)
         if not hasattr(self, '_debug_printed'):
             print(f"DEBUG Transformer V3 CP input shapes:")
             print(f"  hidden_states: {hidden_states.shape}")
@@ -788,9 +743,6 @@ class NeuronTransformerWrapperV3CP(torch.nn.Module):
             print(f"  CP degree: {self.cp_degree}")
             print(f"  Compiled batch size: {self.compiled_batch_size}")
             print(f"  Local patches: {self.local_num_patches}, Local seq_len: {self.local_seq_len}")
-            # Print tensor statistics for debugging
-            print(f"  hidden_states stats: min={hidden_states.min():.4f}, max={hidden_states.max():.4f}, mean={hidden_states.mean():.4f}")
-            print(f"  encoder_hidden_states stats: min={encoder_hidden_states.min():.4f}, max={encoder_hidden_states.max():.4f}")
             self._debug_printed = True
 
         # Handle batch size padding if needed
@@ -872,8 +824,6 @@ class NeuronTransformerWrapperV3CP(torch.nn.Module):
         # Run model
         # Note: For CP models compiled with ModelBuilder, the sharding is handled internally
         # We pass full data and full RoPE - the model handles the rest
-        import time
-        _t_start = time.time()
         output = self.nxd_model(
             hidden_states,
             encoder_hidden_states,
@@ -882,37 +832,11 @@ class NeuronTransformerWrapperV3CP(torch.nn.Module):
             self.txt_rotary_emb_full
         )
 
-        # Profile
-        if not hasattr(self, '_step_count'):
-            self._step_count = 0
-            self._step_times = []
-        self._step_count += 1
-        self._step_times.append(time.time() - _t_start)
-        if self._step_count % 10 == 0:
-            avg_time = sum(self._step_times[-10:]) / 10
-            print(f"  [Profile] Transformer V3 CP (Neuron) step {self._step_count}: avg {avg_time:.3f}s/step")
-
         # Extract tensor from output
         if isinstance(output, tuple):
             output_tensor = output[0]
         else:
             output_tensor = output
-
-        # Debug: Print output stats on first few calls
-        if not hasattr(self, '_output_debug_count'):
-            self._output_debug_count = 0
-        if self._output_debug_count < 3:
-            print(f"DEBUG V3 CP output (step {self._output_debug_count}):")
-            print(f"  output shape: {output_tensor.shape}")
-            print(f"  output stats: min={output_tensor.min():.4f}, max={output_tensor.max():.4f}, mean={output_tensor.mean():.4f}")
-            # Check if output looks reasonable (not all zeros, no NaN/Inf)
-            if torch.isnan(output_tensor).any():
-                print("  WARNING: NaN values detected in output!")
-            if torch.isinf(output_tensor).any():
-                print("  WARNING: Inf values detected in output!")
-            if (output_tensor == 0).all():
-                print("  WARNING: Output is all zeros!")
-            self._output_debug_count += 1
 
         # Extract first frame as noise prediction
         output_tensor = output_tensor[:, :self.base_patches, :]
@@ -1401,9 +1325,6 @@ class NeuronVAEWrapper(torch.nn.Module):
 
     def encode(self, x, return_dict=True):
         """Encode images to latents on Neuron. Supports tiled encoding for large images."""
-        import time
-        _t_enc_start = time.time()
-
         # Ensure 5D format: (batch, channels, temporal, height, width)
         if len(x.shape) == 4:
             x = x.unsqueeze(2)  # Add temporal dimension
@@ -1457,9 +1378,7 @@ class NeuronVAEWrapper(torch.nn.Module):
                 def __init__(self, latent_dist):
                     self.latent_dist = latent_dist
 
-            print(f"  [Profile] VAE encode (Neuron): {time.time() - _t_enc_start:.2f}s")
             return EncoderOutput(LatentDist(sample, mean))
-        print(f"  [Profile] VAE encode (Neuron): {time.time() - _t_enc_start:.2f}s")
         return sample
 
     def _tiled_encode(self, x):
@@ -1522,9 +1441,6 @@ class NeuronVAEWrapper(torch.nn.Module):
 
     def decode(self, z, return_dict=True):
         """Decode latents to images on Neuron. Supports tiled decoding for large latents."""
-        import time
-        _t_dec_start = time.time()
-
         # NOTE: Do NOT unscale latents here!
         # The pipeline already unscales latents before calling decode
 
@@ -1568,7 +1484,6 @@ class NeuronVAEWrapper(torch.nn.Module):
             if latent_h != expected_latent_h or latent_w != expected_latent_w:
                 dec = dec[:, :, :, :output_h, :output_w]
 
-        print(f"  [Profile] VAE decode (Neuron): {time.time() - _t_dec_start:.2f}s")
         if return_dict:
             from diffusers.models.autoencoders.vae import DecoderOutput
             return DecoderOutput(sample=dec)

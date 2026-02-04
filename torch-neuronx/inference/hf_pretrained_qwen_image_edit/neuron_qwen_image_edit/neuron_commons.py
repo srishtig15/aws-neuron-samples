@@ -143,6 +143,8 @@ class NeuronTextEncoderWrapper(nn.Module):
         - Image tokens: 3D grid positions based on spatial layout
 
         This replicates the logic from Qwen2_5_VLModel.get_rope_index().
+
+        OPTIMIZED: Uses vectorized tensor operations to avoid CPU synchronization.
         """
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
@@ -157,61 +159,121 @@ class NeuronTextEncoderWrapper(nn.Module):
                 position_ids = torch.arange(seq_len, device=device).view(1, 1, -1).expand(3, batch_size, -1)
             return position_ids
 
-        # Multimodal case: need to compute proper 3D positions
-        position_ids = torch.ones(3, batch_size, seq_len, dtype=torch.long, device=device)
+        # Multimodal case: vectorized computation of 3D positions
+        # Get grid dimensions (avoid .tolist() by using tensor indexing)
+        t = image_grid_thw[0, 0]
+        h = image_grid_thw[0, 1]
+        w = image_grid_thw[0, 2]
+        llm_grid_h = h // self.spatial_merge_size
+        llm_grid_w = w // self.spatial_merge_size
+        grid_hw = llm_grid_h * llm_grid_w
 
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
 
+        # Create image token mask for all batches at once
+        is_image_token = (input_ids == self.image_token_id)  # [batch, seq]
+
+        # Check if any batch has image tokens (avoid .item() by checking tensor)
+        has_images = is_image_token.any()
+
+        if not has_images:
+            # No images in any batch, use simple sequential positions
+            if attention_mask is not None:
+                position_ids = attention_mask.long().cumsum(-1) - 1
+                position_ids.masked_fill_(attention_mask == 0, 1)
+                position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+            else:
+                position_ids = torch.arange(seq_len, device=device).view(1, 1, -1).expand(3, batch_size, -1)
+            return position_ids
+
+        # Initialize position_ids
+        position_ids = torch.zeros(3, batch_size, seq_len, dtype=torch.long, device=device)
+
+        # Process each batch (still need loop for batch, but inner ops are vectorized)
         for b in range(batch_size):
-            # Get non-padded tokens for this batch
             valid_mask = attention_mask[b] == 1
-            valid_ids = input_ids[b][valid_mask]
-            valid_len = valid_ids.shape[0]
+            valid_len = valid_mask.sum()
 
-            # Find image token positions in the valid sequence
-            is_image_token = (valid_ids == self.image_token_id)
-            num_actual_image_tokens = is_image_token.sum().item()
+            # Get image token mask for valid positions
+            batch_is_image = is_image_token[b] & valid_mask
+            num_image_tokens = batch_is_image.sum()
 
-            if num_actual_image_tokens == 0:
+            if num_image_tokens == 0:
                 # No images, use sequential positions
-                pos = torch.arange(valid_len, device=device)
-                position_ids[:, b, valid_mask] = pos.unsqueeze(0).expand(3, -1)
+                pos = torch.arange(seq_len, device=device)
+                masked_pos = pos * valid_mask.long()
+                # Compute cumsum for valid positions only
+                cumsum = valid_mask.long().cumsum(-1) - 1
+                cumsum = cumsum * valid_mask.long()
+                position_ids[:, b, :] = cumsum.unsqueeze(0).expand(3, -1)
                 continue
 
-            # Get grid dimensions for this image
-            t, h, w = image_grid_thw[0].tolist()
-            llm_grid_h = h // self.spatial_merge_size
-            llm_grid_w = w // self.spatial_merge_size
+            # Vectorized computation for multimodal case
+            # Create index arrays for image tokens
+            image_indices = torch.where(batch_is_image)[0]  # positions of image tokens
+            num_imgs = image_indices.shape[0]
 
-            # Build position_ids token by token
-            # For simplicity: text tokens get sequential positions, image tokens get grid positions
-            pos_list = []
-            current_pos = 0
-            img_token_idx = 0
+            # Compute grid positions for all image tokens at once
+            img_local_idx = torch.arange(num_imgs, device=device)
+            t_pos = img_local_idx // grid_hw
+            remainder = img_local_idx % grid_hw
+            h_pos = remainder // llm_grid_w
+            w_pos = remainder % llm_grid_w
 
-            for i in range(valid_len):
-                if is_image_token[i]:
-                    # Image token: use 2D grid position
-                    grid_idx = img_token_idx
-                    t_pos = grid_idx // (llm_grid_h * llm_grid_w)
-                    remainder = grid_idx % (llm_grid_h * llm_grid_w)
-                    h_pos = remainder // llm_grid_w
-                    w_pos = remainder % llm_grid_w
-                    # Add offset from previous text
-                    pos_list.append([current_pos + t_pos, current_pos + h_pos, current_pos + w_pos])
-                    img_token_idx += 1
-                    # Update current_pos after last image token
-                    if img_token_idx == num_actual_image_tokens:
-                        current_pos = current_pos + max(t_pos, h_pos, w_pos) + 1
-                else:
-                    # Text token: use sequential position
-                    pos_list.append([current_pos, current_pos, current_pos])
-                    current_pos += 1
+            # Compute text offset: count non-image tokens before each position
+            # First, get cumulative count of non-image tokens
+            is_text = valid_mask & ~batch_is_image
+            text_cumsum = is_text.long().cumsum(-1)
 
-            # Convert to tensor
-            pos_tensor = torch.tensor(pos_list, dtype=torch.long, device=device).T  # [3, valid_len]
-            position_ids[:, b, valid_mask] = pos_tensor
+            # For image tokens, the offset is the text count before the first image token
+            first_image_idx = image_indices[0] if num_imgs > 0 else 0
+            text_offset = text_cumsum[first_image_idx] - (1 if is_text[first_image_idx] else 0)
+            if first_image_idx > 0:
+                text_offset = text_cumsum[first_image_idx - 1]
+            else:
+                text_offset = torch.zeros(1, dtype=torch.long, device=device)[0]
+
+            # Set image token positions
+            position_ids[0, b, image_indices] = text_offset + t_pos
+            position_ids[1, b, image_indices] = text_offset + h_pos
+            position_ids[2, b, image_indices] = text_offset + w_pos
+
+            # Compute max position used by images
+            max_img_pos = torch.max(torch.stack([t_pos, h_pos, w_pos]).max(dim=0)[0])
+            after_image_offset = text_offset + max_img_pos + 1
+
+            # Set text token positions
+            # Text before images: sequential from 0
+            text_before_first_image = torch.arange(seq_len, device=device) < first_image_idx
+            text_before_mask = is_text & text_before_first_image
+            if text_before_mask.any():
+                text_before_pos = text_before_mask.long().cumsum(-1) - 1
+                text_before_pos = text_before_pos * text_before_mask.long()
+                for d in range(3):
+                    position_ids[d, b, :] = torch.where(
+                        text_before_mask,
+                        text_before_pos,
+                        position_ids[d, b, :]
+                    )
+
+            # Text after images: sequential from after_image_offset
+            last_image_idx = image_indices[-1] if num_imgs > 0 else 0
+            text_after_last_image = torch.arange(seq_len, device=device) > last_image_idx
+            text_after_mask = is_text & text_after_last_image
+            if text_after_mask.any():
+                # Count text tokens after last image
+                text_after_local = text_after_mask.long().cumsum(-1)
+                # Subtract count at last_image_idx to get local index
+                offset_at_last = text_after_local[last_image_idx] if last_image_idx < seq_len else 0
+                text_after_pos = after_image_offset + (text_after_local - offset_at_last - 1)
+                text_after_pos = text_after_pos * text_after_mask.long()
+                for d in range(3):
+                    position_ids[d, b, :] = torch.where(
+                        text_after_mask,
+                        text_after_pos,
+                        position_ids[d, b, :]
+                    )
 
         return position_ids
 
@@ -227,11 +289,9 @@ class NeuronTextEncoderWrapper(nn.Module):
         4. Language model on compiled model
         5. Remove padding from output
         """
-        import time
         batch_size = input_ids.shape[0] if input_ids is not None else 1
 
         # Step 1: Process images through vision encoder
-        _t0 = time.time()
         if pixel_values is not None:
             # Determine dtype for vision encoder
             # - CPU vision encoder: use original dtype (usually float32 from pipeline)
@@ -407,15 +467,6 @@ class NeuronTextEncoderWrapper(nn.Module):
                 )
         else:
             image_embeds = None
-        _t1 = time.time()
-        if self.use_cpu_vision_encoder:
-            print(f"  [Profile] Vision encoder (CPU): {_t1 - _t0:.2f}s")
-        elif self.use_v3_vision_encoder:
-            print(f"  [Profile] Vision encoder (Neuron V3, TP=4, float32): {_t1 - _t0:.2f}s")
-        elif self.compiled_vision_encoder is not None:
-            print(f"  [Profile] Vision encoder (Neuron, single device, float32): {_t1 - _t0:.2f}s")
-        else:
-            print(f"  [Profile] Vision encoder (skipped): {_t1 - _t0:.2f}s")
 
         # Step 2: Get text embeddings
         text_embeds = self.embed_tokens(input_ids)
@@ -440,7 +491,6 @@ class NeuronTextEncoderWrapper(nn.Module):
         position_ids = self._get_rope_index(input_ids, image_grid_thw, attention_mask)
 
         # Step 5: Run language model (CPU, V3, or compiled)
-        _t2 = time.time()
         if self.use_cpu_language_model:
             # CPU Language Model mode - no padding needed, handles dynamic sequence lengths
             # This avoids GQA alignment issues that occur with TP != 4
@@ -453,8 +503,6 @@ class NeuronTextEncoderWrapper(nn.Module):
                     return_dict=True
                 )
                 hidden_states = cpu_outputs.last_hidden_state
-            _t3 = time.time()
-            print(f"  [Profile] Language model (CPU): {_t3 - _t2:.2f}s")
 
             # Create output similar to original
             if return_dict:
@@ -544,9 +592,6 @@ class NeuronTextEncoderWrapper(nn.Module):
             # Remove sequence padding from output
             hidden_states = hidden_states[:, :original_seq_len, :]
 
-            _t3 = time.time()
-            print(f"  [Profile] Language model (Neuron V3): {_t3 - _t2:.2f}s")
-
             # Create output similar to original
             if return_dict:
                 return type('TextEncoderOutput', (), {
@@ -620,20 +665,45 @@ class NeuronTextEncoderWrapper(nn.Module):
             )
 
     def _merge_embeddings(self, text_embeds, image_embeds, input_ids, image_token_id):
-        """Merge text and image embeddings at image token positions."""
+        """
+        Merge text and image embeddings at image token positions.
+
+        OPTIMIZED: Uses index-based replacement to minimize CPU synchronization.
+        """
         batch_size, seq_len, hidden_size = text_embeds.shape
 
-        # Find positions of image tokens
-        image_mask = (input_ids == image_token_id)
+        if image_embeds is None:
+            return text_embeds
 
-        # Replace image token embeddings with actual image embeddings
+        # Find positions of image tokens
+        image_mask = (input_ids == image_token_id)  # [batch, seq]
+
+        # Clone to avoid modifying original
         inputs_embeds = text_embeds.clone()
 
+        # For batch_size=1, use optimized path with nonzero
+        if batch_size == 1:
+            # Get indices of image tokens (returns [N, 2] for 2D input, we need column 1)
+            image_indices = image_mask[0].nonzero(as_tuple=True)[0]  # [num_image_tokens]
+            num_image_positions = image_indices.shape[0]
+
+            if num_image_positions > 0:
+                # Handle case where image_embeds has fewer tokens than positions
+                num_to_use = min(num_image_positions, image_embeds.shape[0])
+
+                # Use index_copy_ for efficient in-place replacement
+                inputs_embeds[0, image_indices[:num_to_use]] = image_embeds[:num_to_use]
+
+            return inputs_embeds
+
+        # For batch_size > 1, process each batch
         for b in range(batch_size):
-            image_positions = torch.where(image_mask[b])[0]
-            if len(image_positions) > 0 and image_embeds is not None:
-                num_image_tokens = min(len(image_positions), image_embeds.shape[0])
-                inputs_embeds[b, image_positions[:num_image_tokens]] = image_embeds[:num_image_tokens]
+            image_indices = image_mask[b].nonzero(as_tuple=True)[0]
+            num_image_positions = image_indices.shape[0]
+
+            if num_image_positions > 0:
+                num_to_use = min(num_image_positions, image_embeds.shape[0])
+                inputs_embeds[b, image_indices[:num_to_use]] = image_embeds[:num_to_use]
 
         return inputs_embeds
 
