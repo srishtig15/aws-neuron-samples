@@ -320,8 +320,11 @@ class NeuronTextEncoderWrapper(nn.Module):
                     all_embeds = []
                     patch_idx = 0
                     for img_idx in range(num_images):
-                        t, h, w = image_grid_thw[img_idx].tolist()
-                        img_patches = t * h * w
+                        # Use tensor indexing to avoid .tolist() CPU sync
+                        t = image_grid_thw[img_idx, 0]
+                        h = image_grid_thw[img_idx, 1]
+                        w = image_grid_thw[img_idx, 2]
+                        img_patches = (t * h * w).item()  # Need scalar for slicing
 
                         img_pixel_values = pixel_values[patch_idx:patch_idx + img_patches]
                         patch_idx += img_patches
@@ -351,7 +354,7 @@ class NeuronTextEncoderWrapper(nn.Module):
                         # Calculate actual output tokens (after spatial merge)
                         merged_h = h // self.spatial_merge_size
                         merged_w = w // self.spatial_merge_size
-                        actual_output_tokens = t * merged_h * merged_w
+                        actual_output_tokens = (t * merged_h * merged_w).item()
 
                         # Truncate to actual output size (remove padding)
                         img_embeds = img_embeds[:actual_output_tokens]
@@ -396,9 +399,11 @@ class NeuronTextEncoderWrapper(nn.Module):
                     all_embeds = []
                     patch_idx = 0
                     for img_idx in range(num_images):
-                        # Get grid dimensions for this image
-                        t, h, w = image_grid_thw[img_idx].tolist()
-                        img_patches = t * h * w  # patches for this image
+                        # Use tensor indexing to avoid .tolist() CPU sync
+                        t = image_grid_thw[img_idx, 0]
+                        h = image_grid_thw[img_idx, 1]
+                        w = image_grid_thw[img_idx, 2]
+                        img_patches = (t * h * w).item()  # Need scalar for slicing
 
                         # Extract patches for this image
                         img_pixel_values = pixel_values[patch_idx:patch_idx + img_patches]
@@ -424,11 +429,9 @@ class NeuronTextEncoderWrapper(nn.Module):
                         img_embeds = self.compiled_vision_encoder(img_pixel_values, single_grid_thw)
 
                         # Calculate actual output tokens (after spatial merge)
-                        # merged_h = h // spatial_merge_size, merged_w = w // spatial_merge_size
-                        # But we need to use the original grid dimensions, not padded
                         merged_h = h // self.spatial_merge_size
                         merged_w = w // self.spatial_merge_size
-                        actual_output_tokens = t * merged_h * merged_w
+                        actual_output_tokens = (t * merged_h * merged_w).item()
 
                         # Truncate to actual output size (remove padding)
                         img_embeds = img_embeds[:actual_output_tokens]
