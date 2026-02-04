@@ -7,7 +7,7 @@
 # Components:
 # - text_encoder: TP=8, world_size=8
 # - transformer: TP=8, world_size=8, NKI Flash Attention
-# - decoder/post_quant_conv: No TP sharding (weights duplicated), world_size=8
+# - decoder/post_quant_conv: world_size=8, -O1 optimization
 #
 # Usage:
 #   ./compile_v3_flash.sh                    # Use default directories
@@ -44,8 +44,8 @@ echo "=============================================="
 echo "Output: ${COMPILED_MODELS_DIR}"
 echo "Compiler workdir: ${COMPILER_WORKDIR}"
 echo "Resolution: ${HEIGHT}x${WIDTH}, Frames: ${NUM_FRAMES}"
-echo "TP degree: ${TP_DEGREE}, World size: ${WORLD_SIZE}"
-echo "NKI Flash Attention: Enabled"
+echo "Transformer: TP=${TP_DEGREE}, world_size=${WORLD_SIZE}, NKI Flash Attention"
+echo "Decoder: world_size=${WORLD_SIZE}, -O1 optimization"
 echo "=============================================="
 
 # Create directories
@@ -74,12 +74,13 @@ python neuron_wan2_2_ti2v/compile_transformer_v3_flash.py \
     --max_sequence_length ${MAX_SEQUENCE_LENGTH} \
     --tp_degree ${TP_DEGREE}
 
-# Step 3: Compile Decoder and post_quant_conv (V2, no TP sharding, world_size=8)
-# Note: decoder doesn't actually use TP sharding (weights are duplicated),
-# but tp_degree must match NxDParallelState context at inference time
+# Step 3: Compile Decoder and post_quant_conv (V2 Optimized)
+# Optimizations:
+# - -O1 compiler optimization
+# - NKI Flash Attention disabled (causes OOM due to spill buffers)
 echo ""
-echo "[Step 3/3] Compiling Decoder and post_quant_conv (V2, TP=${TP_DEGREE}, world_size=${WORLD_SIZE})..."
-python neuron_wan2_2_ti2v/compile_decoder_v2.py \
+echo "[Step 3/3] Compiling Decoder and post_quant_conv (V2 Optimized, -O1)..."
+python neuron_wan2_2_ti2v/compile_decoder_v2_optimized.py \
     --compiled_models_dir "${COMPILED_MODELS_DIR}" \
     --height ${HEIGHT} \
     --width ${WIDTH} \

@@ -96,6 +96,22 @@ def load_duplicated_weights(model_path, world_size):
     return sharded_weights
 
 
+def load_single_weights(model_path):
+    """
+    Load single checkpoint for world_size=1 model.
+
+    Args:
+        model_path: Path to the compiled model directory
+
+    Returns:
+        List with single checkpoint dict
+    """
+    weights_path = os.path.join(model_path, "weights")
+    ckpt_path = os.path.join(weights_path, "tp0_sharded_checkpoint.safetensors")
+    ckpt = load_file(ckpt_path)
+    return [ckpt]
+
+
 class InferenceTransformerWrapperV3Flash(torch.nn.Module):
     """
     Wrapper for transformer with NKI Flash Attention (V3 Flash).
@@ -256,8 +272,15 @@ def main(args):
         decoder_config = load_model_config(decoder_v2_path)
         decoder_world_size = decoder_config.get("world_size", 8)
 
-        # Decoder uses single checkpoint duplicated for all ranks (no actual TP sharding)
-        decoder_weights = load_duplicated_weights(decoder_v2_path, decoder_world_size)
+        # Load weights based on world_size
+        if decoder_world_size == 1:
+            # Optimized V2: single core, no duplication needed
+            decoder_weights = load_single_weights(decoder_v2_path)
+            print(f"  Using optimized single-core decoder (world_size=1)")
+        else:
+            # Legacy V2: multi-core with duplicated weights
+            decoder_weights = load_duplicated_weights(decoder_v2_path, decoder_world_size)
+            print(f"  Using multi-core decoder (world_size={decoder_world_size})")
         decoder_nxd.set_weights(decoder_weights)
         decoder_nxd.to_neuron()
 
@@ -281,8 +304,13 @@ def main(args):
         pqc_config = load_model_config(pqc_v2_path)
         pqc_world_size = pqc_config.get("world_size", 8)
 
-        # post_quant_conv uses single checkpoint duplicated for all ranks
-        pqc_weights = load_duplicated_weights(pqc_v2_path, pqc_world_size)
+        # Load weights based on world_size
+        if pqc_world_size == 1:
+            pqc_weights = load_single_weights(pqc_v2_path)
+            print(f"  Using optimized single-core post_quant_conv (world_size=1)")
+        else:
+            pqc_weights = load_duplicated_weights(pqc_v2_path, pqc_world_size)
+            print(f"  Using multi-core post_quant_conv (world_size={pqc_world_size})")
         pqc_nxd.set_weights(pqc_weights)
         pqc_nxd.to_neuron()
 
