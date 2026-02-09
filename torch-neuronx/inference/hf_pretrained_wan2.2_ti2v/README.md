@@ -1,0 +1,249 @@
+# Wan2.2 Text/Image-to-Video Inference on AWS Trainium2
+
+This project implements [Wan2.2-TI2V-5B](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B-Diffusers) video generation on AWS Trainium2 (trn2.48xlarge) using the AWS Neuron SDK. It generates 512x512, 81-frame (3.4s @ 24fps) videos from text prompts.
+
+## Quick Start (Recommended: V3 CP)
+
+```bash
+# Activate Neuron virtual environment
+source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Compile all models (text encoder, transformer, decoder)
+./compile_v3_cp.sh
+
+# Run inference
+python run_wan2.2_ti2v_v3_cp.py \
+    --compiled_models_dir /opt/dlami/nvme/compiled_models_v3_cp \
+    --prompt "A cat walks on the grass, realistic"
+```
+
+## Architecture Overview
+
+The Wan2.2 pipeline has 4 main components, each compiled separately for Neuron:
+
+```
+Text Prompt
+    |
+    v
+[Text Encoder]  UMT5 encoder, Tensor Parallel (TP=4)
+    |
+    v
+[Transformer]   DiT-based diffusion, 50 denoising steps
+    |            TP=4, Context Parallel (CP=2), world_size=8
+    v
+[post_quant_conv]  3D convolution, float32
+    |
+    v
+[VAE Decoder]   Conv3D upsampling, bfloat16, 11 temporal chunks
+    |
+    v
+Video Output (512x512, 81 frames)
+```
+
+### Performance Breakdown (V3 CP, trn2.48xlarge)
+
+| Component | Time | Details |
+|-----------|------|---------|
+| Transformer | ~21s | 50 steps @ 0.43s/step |
+| VAE Decoder | ~8.6s | 11 calls @ 0.78s/call |
+| post_quant_conv | ~0.003s | Single call |
+| **Total** | **~30s** | |
+
+## Compilation Approaches
+
+This project evolved through multiple optimization iterations. The recommended approach is **V3 CP**.
+
+### V3 CP (Recommended)
+
+- **Script**: `compile_v3_cp.sh` / `run_wan2.2_ti2v_v3_cp.py`
+- **Transformer**: TP=4, CP=2 (Context Parallel), world_size=8
+- **Decoder**: bfloat16, `--model-type=unet-inference`
+- **Key innovations**:
+  - Context Parallel splits the sequence dimension across 2 groups, enabling each group to process half the tokens
+  - `local_rms_norm` avoids Neuron compiler all-reduce bugs while preserving normalization accuracy
+  - Decoder compiled with `--model-type=unet-inference` (not `transformer`) for Conv3D-optimized code generation
+  - bfloat16 decoder halves memory bandwidth
+
+```bash
+./compile_v3_cp.sh [output_dir] [compiler_workdir]
+# Default: /opt/dlami/nvme/compiled_models_v3_cp
+```
+
+### V3 Flash (Alternative)
+
+- **Script**: `compile_v3_flash.sh` / `run_wan2.2_ti2v_v3_flash.py`
+- **Transformer**: TP=8, NKI Flash Attention
+- **Decoder**: bfloat16, `--model-type=unet-inference`
+- Simpler parallelism (no Context Parallel), relies on NKI Flash Attention for the transformer
+
+```bash
+./compile_v3_flash.sh [output_dir] [compiler_workdir]
+# Default: /opt/dlami/nvme/compiled_models_v3_flash
+```
+
+### V2 (Legacy)
+
+- **Script**: `compile_latency_optimized_v2.sh` / `run_wan2.2_ti2v_latency_optimized_v2.py`
+- **Transformer**: TP=8, standard attention
+- **Decoder**: V1 TorchScript (single core)
+- Uses ModelBuilder API for text encoder and transformer, falls back to V1 TorchScript for decoder
+
+### V1 (Deprecated)
+
+- **Script**: `compile_latency_optimized.sh` / `run_wan2.2_ti2v_latency_optimized.py`
+- All TorchScript via deprecated `parallel_model_trace()` API
+
+## Key Optimizations
+
+### 1. Context Parallel (V3 CP Transformer)
+
+The transformer sequence length is 5376 tokens (21 latent frames x 256 spatial). Context Parallel splits this across 2 groups:
+
+- **TP=4**: Each tensor parallel rank handles 1/4 of attention heads
+- **CP=2**: Each CP rank handles 1/2 of the sequence
+- Self-attention uses scatter/gather collectives for cross-sequence communication
+- Cross-attention (text conditioning) doesn't need CP since the text sequence is shared
+
+Implementation: `neuron_wan2_2_ti2v/compile_transformer_v3_cp.py`
+
+### 2. local_rms_norm (Compiler Bug Workaround)
+
+The Neuron compiler generates incorrect all-reduce replica groups `[[0,1,2,3]]` for `DistributedRMSNorm`, which causes assertion errors at runtime with world_size=8 (expecting `[[0,1,2,3],[4,5,6,7]]`).
+
+Solution: `local_rms_norm` computes RMSNorm locally on each rank's shard without any all-reduce:
+
+```python
+def local_rms_norm(x, weight, eps=1e-6):
+    x_float = x.float()
+    variance = x_float.pow(2).mean(-1, keepdim=True)
+    x_normed = x_float * torch.rsqrt(variance + eps)
+    return (weight * x_normed).to(x.dtype)
+```
+
+Applied to Q/K normalization in both self-attention and cross-attention. The difference from global norm is negligible for QK normalization since each rank's local hidden dimension (~1024) is large enough for stable statistics.
+
+### 3. VAE Decoder in bfloat16
+
+The VAE decoder is dominated by Conv3D operations. Converting from float32 to bfloat16:
+- Halves memory bandwidth (the bottleneck for Conv3D)
+- Decoder time reduced from ~20s (V1 float32) to ~8.6s (V3 bfloat16)
+
+The `DecoderWrapperV3` handles dtype conversion at the boundary:
+- Receives float32 input from the pipeline
+- Converts to bfloat16 for the compiled decoder
+- Converts output back to float32
+
+### 4. Correct Compiler Model Type
+
+ModelBuilder defaults to `--model-type=transformer` which optimizes for attention patterns. The VAE decoder is Conv3D-heavy, so we explicitly pass `--model-type=unet-inference`:
+
+```python
+traced_decoder = decoder_builder.compile(
+    compiler_args="--model-type=unet-inference -O1 --auto-cast=none",
+)
+```
+
+### 5. Temporal Chunked Decoding
+
+The VAE decoder processes latent frames in chunks of 2 (CACHE_T=2) with causal temporal caching (`feat_cache`). For 81 frames (21 latent frames):
+- Call 1: First frame (with `first_chunk=True`)
+- Calls 2-11: Two frames per call
+
+This is implemented in the custom `autoencoder_kl_wan.py` which replaces the diffusers default.
+
+## File Structure
+
+### Core Compilation Scripts (`neuron_wan2_2_ti2v/`)
+
+| File | Description |
+|------|-------------|
+| `compile_transformer_v3_cp.py` | V3 CP transformer (TP=4, CP=2, local_rms_norm) |
+| `compile_transformer_v3_flash.py` | V3 Flash transformer (TP=8, NKI Flash Attention) |
+| `compile_text_encoder_v2.py` | Text encoder (ModelBuilder API) |
+| `compile_decoder_v3.py` | VAE decoder (bfloat16, `--model-type=unet-inference`) |
+| `cache_hf_model.py` | Download and cache HuggingFace model |
+
+### Runtime
+
+| File | Description |
+|------|-------------|
+| `run_wan2.2_ti2v_v3_cp.py` | V3 CP inference script |
+| `run_wan2.2_ti2v_v3_flash.py` | V3 Flash inference script |
+| `autoencoder_kl_wan.py` | Custom VAE with temporal chunked decoding |
+
+### Wrappers and Utilities (`neuron_wan2_2_ti2v/`)
+
+| File | Description |
+|------|-------------|
+| `neuron_commons.py` | Runtime wrappers: `DecoderWrapper` (V1), `DecoderWrapperV2`, `DecoderWrapperV3`, attention utilities |
+| `neuron_commons_v2.py` | `InferenceTextEncoderWrapperV2` for NxDModel text encoder |
+| `neuron_parallel_utils.py` | Tensor parallel utilities for UMT5 sharding |
+| `distributed_rmsnorm.py` | Distributed RMSNorm (reference, not used in V3 due to compiler bug) |
+
+### Shell Scripts
+
+| File | Description |
+|------|-------------|
+| `compile_v3_cp.sh` | **Recommended**: Full V3 CP compilation pipeline |
+| `compile_v3_flash.sh` | V3 Flash compilation pipeline |
+| `compile_latency_optimized_v2.sh` | V2 compilation pipeline (legacy) |
+
+## Inference Options
+
+```bash
+python run_wan2.2_ti2v_v3_cp.py \
+    --compiled_models_dir /opt/dlami/nvme/compiled_models_v3_cp \
+    --prompt "A cat walks on the grass, realistic" \
+    --negative_prompt "blurred, low quality, static" \
+    --height 512 \
+    --width 512 \
+    --num_frames 81 \
+    --num_inference_steps 50 \
+    --max_sequence_length 512 \
+    --output output.mp4
+```
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--compiled_models_dir` | `/opt/dlami/nvme/compiled_models_v3_cp` | Compiled model directory |
+| `--height` | 512 | Video height |
+| `--width` | 512 | Video width |
+| `--num_frames` | 81 | Number of frames (81 = 3.4s @ 24fps) |
+| `--num_inference_steps` | 50 | Denoising steps (lower = faster but less quality) |
+| `--max_sequence_length` | 512 | Max text token length |
+| `--output` | `output_v3_cp.mp4` | Output video path |
+| `--force_v1_decoder` | false | Force V1 TorchScript decoder |
+
+## Environment
+
+- **Instance**: trn2.48xlarge (8 Neuron cores)
+- **Neuron SDK**: PyTorch 2.9 + NxD Inference
+- **Virtual env**: `/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference`
+- **Storage**: NVMe at `/opt/dlami/nvme` (recommended for compiled models)
+
+### Required Environment Variables (set automatically by run scripts)
+
+```bash
+NEURON_RT_NUM_CORES=8
+LOCAL_WORLD_SIZE=8
+NEURON_RT_VIRTUAL_CORE_SIZE=2
+NEURON_LOGICAL_NC_CONFIG=2
+```
+
+## Troubleshooting
+
+### "nearest-exact" interpolation error
+The custom `autoencoder_kl_wan.py` patches `F.interpolate` to replace `nearest-exact` with `nearest` for Trainium2 compatibility. The compile scripts automatically copy this file to the diffusers package.
+
+### Replica groups assertion error
+If you see errors about replica groups `[[0,1,2,3]]` vs expected `[[0,1,2,3],[4,5,6,7]]`, this is the Neuron compiler bug with `DistributedRMSNorm`. The V3 CP transformer uses `local_rms_norm` to avoid this. Ensure you're using the latest `compile_transformer_v3_cp.py`.
+
+### Out of memory
+- Compiled models should be stored on NVMe (`/opt/dlami/nvme/`), not the root EBS volume
+- The decoder uses bfloat16 to reduce memory. If OOM persists, try `--force_v1_decoder`
+
+### Decoder fallback
+The run scripts support automatic fallback: V3 (bfloat16) -> V2 -> V1 (TorchScript). If the V3 decoder wasn't compiled, it will automatically use whatever version is available.
