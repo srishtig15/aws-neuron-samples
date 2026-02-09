@@ -39,7 +39,7 @@ from neuronx_distributed import NxDModel, NxDParallelState
 from safetensors.torch import load_file
 
 from neuron_wan2_2_ti2v.neuron_commons_v2 import InferenceTextEncoderWrapperV2
-from neuron_wan2_2_ti2v.neuron_commons import SimpleWrapper, DecoderWrapper, DecoderWrapperV2, PostQuantConvWrapperV2
+from neuron_wan2_2_ti2v.neuron_commons import SimpleWrapper, DecoderWrapper, DecoderWrapperV2, DecoderWrapperV3, PostQuantConvWrapperV2
 
 
 def set_seed(seed: int):
@@ -259,13 +259,26 @@ def main(args):
     print("\nLoading transformer (V3 Flash with NKI)...")
     transformer_wrapper = load_transformer_v3_flash(compiled_models_dir, pipe)
 
-    # Load Decoder - check for V2 first, fall back to V1
-    # Use --force_v1_decoder to always use V1 decoder (faster)
+    # Load Decoder - check for V3 first, then V2, then V1
+    # Use --force_v1_decoder to always use V1 decoder
+    decoder_v3_path = f"{compiled_models_dir}/decoder_v3"
     decoder_v2_path = f"{compiled_models_dir}/decoder_v2"
     decoder_v1_path = f"{compiled_models_dir}/decoder/model.pt"
-    use_v2_decoder = os.path.exists(decoder_v2_path) and not args.force_v1_decoder
 
-    if use_v2_decoder:
+    if os.path.exists(decoder_v3_path) and not args.force_v1_decoder:
+        print("\nLoading decoder (V3 - bfloat16)...")
+        vae_decoder_wrapper = DecoderWrapperV3(pipe.vae.decoder)
+        decoder_nxd = NxDModel.load(os.path.join(decoder_v3_path, "nxd_model.pt"))
+        decoder_config = load_model_config(decoder_v3_path)
+        decoder_world_size = decoder_config.get("world_size", 8)
+
+        decoder_weights = load_duplicated_weights(decoder_v3_path, decoder_world_size)
+        decoder_nxd.set_weights(decoder_weights)
+        decoder_nxd.to_neuron()
+
+        vae_decoder_wrapper.nxd_model = decoder_nxd
+        print("Decoder (V3) loaded.")
+    elif os.path.exists(decoder_v2_path) and not args.force_v1_decoder:
         print("\nLoading decoder (V2)...")
         vae_decoder_wrapper = DecoderWrapperV2(pipe.vae.decoder)
         decoder_nxd = NxDModel.load(os.path.join(decoder_v2_path, "nxd_model.pt"))
@@ -274,11 +287,9 @@ def main(args):
 
         # Load weights based on world_size
         if decoder_world_size == 1:
-            # Optimized V2: single core, no duplication needed
             decoder_weights = load_single_weights(decoder_v2_path)
             print(f"  Using optimized single-core decoder (world_size=1)")
         else:
-            # Legacy V2: multi-core with duplicated weights
             decoder_weights = load_duplicated_weights(decoder_v2_path, decoder_world_size)
             print(f"  Using multi-core decoder (world_size={decoder_world_size})")
         decoder_nxd.set_weights(decoder_weights)
@@ -292,19 +303,31 @@ def main(args):
         vae_decoder_wrapper.model = torch.jit.load(decoder_v1_path)
         print("Decoder (V1) loaded.")
 
-    # Load post_quant_conv - check for V2 first, fall back to V1
+    # Load post_quant_conv - check for V3 first, then V2, then V1
+    pqc_v3_path = f"{compiled_models_dir}/post_quant_conv_v3"
     pqc_v2_path = f"{compiled_models_dir}/post_quant_conv_v2"
     pqc_v1_path = f"{compiled_models_dir}/post_quant_conv/model.pt"
-    use_v2_pqc = os.path.exists(pqc_v2_path) and not args.force_v1_decoder
 
-    if use_v2_pqc:
+    if os.path.exists(pqc_v3_path) and not args.force_v1_decoder:
+        print("\nLoading post_quant_conv (V3)...")
+        vae_post_quant_conv_wrapper = PostQuantConvWrapperV2(pipe.vae.post_quant_conv)
+        pqc_nxd = NxDModel.load(os.path.join(pqc_v3_path, "nxd_model.pt"))
+        pqc_config = load_model_config(pqc_v3_path)
+        pqc_world_size = pqc_config.get("world_size", 8)
+
+        pqc_weights = load_duplicated_weights(pqc_v3_path, pqc_world_size)
+        pqc_nxd.set_weights(pqc_weights)
+        pqc_nxd.to_neuron()
+
+        vae_post_quant_conv_wrapper.nxd_model = pqc_nxd
+        print("post_quant_conv (V3) loaded.")
+    elif os.path.exists(pqc_v2_path) and not args.force_v1_decoder:
         print("\nLoading post_quant_conv (V2)...")
         vae_post_quant_conv_wrapper = PostQuantConvWrapperV2(pipe.vae.post_quant_conv)
         pqc_nxd = NxDModel.load(os.path.join(pqc_v2_path, "nxd_model.pt"))
         pqc_config = load_model_config(pqc_v2_path)
         pqc_world_size = pqc_config.get("world_size", 8)
 
-        # Load weights based on world_size
         if pqc_world_size == 1:
             pqc_weights = load_single_weights(pqc_v2_path)
             print(f"  Using optimized single-core post_quant_conv (world_size=1)")

@@ -1196,6 +1196,7 @@ class AutoencoderKLWan(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         return AutoencoderKLOutput(latent_dist=posterior)
 
     def _decode(self, z: torch.Tensor, return_dict: bool = True):
+        import time as _time
         _, _, num_frame, height, width = z.shape
         tile_latent_min_height = self.tile_sample_min_height // self.spatial_compression_ratio
         tile_latent_min_width = self.tile_sample_min_width // self.spatial_compression_ratio
@@ -1204,14 +1205,20 @@ class AutoencoderKLWan(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             return self.tiled_decode(z, return_dict=return_dict)
 
         self.clear_cache()
+        _t0 = _time.time()
         x = self.post_quant_conv(z)
+        _t1 = _time.time()
+        print(f"  [_decode] post_quant_conv: {_t1-_t0:.3f}s")
 
         # Optimized decoding: process 2 frames at a time to reduce Neuron kernel launch overhead
         # First frame uses first_chunk=True, subsequent frames process in pairs
         out = None
         i = 0
+        _call_idx = 0
+        _decode_start = _time.time()
         while i < num_frame:
             self._conv_idx = [0]
+            _tc0 = _time.time()
             if i == 0:
                 # First frame: process single frame with first_chunk=True
                 # DecoderWrapper will pad to 2 frames if needed
@@ -1226,6 +1233,11 @@ class AutoencoderKLWan(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                 out_ = self.decoder(x[:, :, i : end_idx, :, :], feat_cache=self._feat_map, feat_idx=self._conv_idx)
                 out = torch.cat([out, out_], 2)
                 i = end_idx
+            _tc1 = _time.time()
+            print(f"  [_decode] decoder call {_call_idx}: {_tc1-_tc0:.3f}s (frames up to {i}/{num_frame})")
+            _call_idx += 1
+        _decode_end = _time.time()
+        print(f"  [_decode] all decoder calls: {_decode_end-_decode_start:.3f}s ({_call_idx} calls)")
 
         if self.config.patch_size is not None:
             out = unpatchify(out, patch_size=self.config.patch_size)
@@ -1233,6 +1245,8 @@ class AutoencoderKLWan(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         out = torch.clamp(out, min=-1.0, max=1.0)
 
         self.clear_cache()
+        _t2 = _time.time()
+        print(f"  [_decode] total: {_t2-_t0:.3f}s")
         if not return_dict:
             return (out,)
 

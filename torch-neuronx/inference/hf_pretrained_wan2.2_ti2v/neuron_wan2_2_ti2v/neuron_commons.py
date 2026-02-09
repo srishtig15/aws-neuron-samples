@@ -538,3 +538,125 @@ class PostQuantConvWrapperV2(nn.Module):
 
     def clear_cache(self):
         pass
+
+
+class DecoderWrapperV3(nn.Module):
+    """
+    Wrapper for V3 compiled VAE decoder (bfloat16) using NxDModel.
+
+    The V3 decoder is compiled in bfloat16 for 2x memory bandwidth reduction.
+    This wrapper handles dtype conversion: float32 input -> bfloat16 -> decoder -> float32 output.
+    """
+    NUM_FEAT_CACHE = 34
+
+    def __init__(self, original_decoder):
+        super().__init__()
+        self.original_decoder = original_decoder
+        self.nxd_model = None
+        self.feat_cache_shapes = None
+
+    def _init_feat_cache_shapes(self, x):
+        """Initialize feat_cache shapes based on input x (after padding to 2 frames)."""
+        batch_size = x.shape[0]
+        latent_height = x.shape[3]
+        latent_width = x.shape[4]
+
+        self.feat_cache_shapes = [
+            (batch_size, 48, 2, latent_height, latent_width),
+            (batch_size, 1024, 2, latent_height, latent_width),
+            (batch_size, 1024, 2, latent_height, latent_width),
+            (batch_size, 1024, 2, latent_height, latent_width),
+            (batch_size, 1024, 2, latent_height, latent_width),
+            (batch_size, 1024, 2, latent_height, latent_width),
+            (batch_size, 1024, 2, latent_height, latent_width),
+            (batch_size, 1024, 2, latent_height, latent_width),
+            (batch_size, 1024, 2, latent_height, latent_width),
+            (batch_size, 1024, 2, latent_height, latent_width),
+            (batch_size, 1024, 2, latent_height, latent_width),
+            (batch_size, 1024, 2, latent_height, latent_width),
+            (batch_size, 1024, 2, latent_height*2, latent_width*2),
+            (batch_size, 1024, 2, latent_height*2, latent_width*2),
+            (batch_size, 1024, 2, latent_height*2, latent_width*2),
+            (batch_size, 1024, 2, latent_height*2, latent_width*2),
+            (batch_size, 1024, 2, latent_height*2, latent_width*2),
+            (batch_size, 1024, 2, latent_height*2, latent_width*2),
+            (batch_size, 1024, 2, latent_height*2, latent_width*2),
+            (batch_size, 1024, 2, latent_height*4, latent_width*4),
+            (batch_size, 512, 2, latent_height*4, latent_width*4),
+            (batch_size, 512, 2, latent_height*4, latent_width*4),
+            (batch_size, 512, 2, latent_height*4, latent_width*4),
+            (batch_size, 512, 2, latent_height*4, latent_width*4),
+            (batch_size, 512, 2, latent_height*4, latent_width*4),
+            (batch_size, 512, 2, latent_height*8, latent_width*8),
+            (batch_size, 256, 2, latent_height*8, latent_width*8),
+            (batch_size, 256, 2, latent_height*8, latent_width*8),
+            (batch_size, 256, 2, latent_height*8, latent_width*8),
+            (batch_size, 256, 2, latent_height*8, latent_width*8),
+            (batch_size, 256, 2, latent_height*8, latent_width*8),
+            (batch_size, 256, 2, latent_height*8, latent_width*8),
+            (batch_size, 256, 2, latent_height*8, latent_width*8),
+            (batch_size, 12, 2, latent_height*8, latent_width*8),
+        ]
+
+    def forward(self, x, **kwargs):
+        if 'feat_cache' not in kwargs:
+            return self.original_decoder(x)
+
+        feat_cache = kwargs['feat_cache']
+
+        # Compiled model expects 2 frames (CACHE_T=2)
+        original_frame_count = x.shape[2]
+        if original_frame_count == 1:
+            x = torch.cat([x, x], dim=2)
+
+        if self.feat_cache_shapes is None:
+            self._init_feat_cache_shapes(x)
+
+        # Convert input to bfloat16 (decoder compiled in bfloat16)
+        x_bf16 = x.to(torch.bfloat16)
+
+        # Prepare feat_cache tensors in bfloat16
+        feat_cache_tensors = []
+        for i in range(self.NUM_FEAT_CACHE):
+            if i < len(feat_cache) and feat_cache[i] is not None:
+                feat_cache_tensors.append(feat_cache[i].to(torch.bfloat16))
+            else:
+                feat_cache_tensors.append(
+                    torch.zeros(self.feat_cache_shapes[i], dtype=torch.bfloat16)
+                )
+
+        # Call NxDModel
+        output = self.nxd_model(
+            x_bf16,
+            feat_cache_tensors[0], feat_cache_tensors[1], feat_cache_tensors[2],
+            feat_cache_tensors[3], feat_cache_tensors[4], feat_cache_tensors[5],
+            feat_cache_tensors[6], feat_cache_tensors[7], feat_cache_tensors[8],
+            feat_cache_tensors[9], feat_cache_tensors[10], feat_cache_tensors[11],
+            feat_cache_tensors[12], feat_cache_tensors[13], feat_cache_tensors[14],
+            feat_cache_tensors[15], feat_cache_tensors[16], feat_cache_tensors[17],
+            feat_cache_tensors[18], feat_cache_tensors[19], feat_cache_tensors[20],
+            feat_cache_tensors[21], feat_cache_tensors[22], feat_cache_tensors[23],
+            feat_cache_tensors[24], feat_cache_tensors[25], feat_cache_tensors[26],
+            feat_cache_tensors[27], feat_cache_tensors[28], feat_cache_tensors[29],
+            feat_cache_tensors[30], feat_cache_tensors[31], feat_cache_tensors[32],
+            feat_cache_tensors[33],
+        )
+
+        if isinstance(output, (tuple, list)):
+            output = output[0]
+
+        # Convert output back to float32
+        output = output.to(torch.float32)
+
+        # Propagate bfloat16 cache back (keep as bfloat16 for next iteration)
+        for i in range(min(len(feat_cache), self.NUM_FEAT_CACHE)):
+            feat_cache[i] = feat_cache_tensors[i]
+
+        # If original input was 1 frame, take last 4 frames
+        if original_frame_count == 1:
+            output = output[:, :, -4:, :, :]
+
+        return output
+
+    def clear_cache(self):
+        pass
