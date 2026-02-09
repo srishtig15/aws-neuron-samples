@@ -78,14 +78,19 @@ python neuron_wan2_2_ti2v/compile_transformer_v3_cp.py \
 # Decoder doesn't use actual TP sharding (weights duplicated), but must match world_size
 echo ""
 echo "[Step 4/4] Compiling Decoder and post_quant_conv (V2, TP=${TP_DEGREE}, world_size=${WORLD_SIZE})..."
+# python neuron_wan2_2_ti2v/compile_decoder_v2_optimized.py \
+#     --compiled_models_dir "${COMPILED_MODELS_DIR}" \
+#     --height ${HEIGHT} \
+#     --width ${WIDTH} \
+#     --num_frames ${NUM_FRAMES} \
+#     --tp_degree ${TP_DEGREE} \
+#     --world_size ${WORLD_SIZE}
 
-python neuron_wan2_2_ti2v/compile_decoder_v2.py \
+python neuron_wan2_2_ti2v/compile_decoder.py \
     --compiled_models_dir "${COMPILED_MODELS_DIR}" \
     --height ${HEIGHT} \
     --width ${WIDTH} \
-    --num_frames ${NUM_FRAMES} \
-    --tp_degree ${TP_DEGREE} \
-    --world_size ${WORLD_SIZE}
+    --num_frames ${NUM_FRAMES}
 
 echo ""
 echo "=============================================="
@@ -96,5 +101,6 @@ echo ""
 echo "To run inference:"
 echo "  NEURON_RT_NUM_CORES=8 python run_wan2.2_ti2v_v3_cp.py \\"
 echo "    --compiled_models_dir ${COMPILED_MODELS_DIR} \\"
-echo "    --prompt 'A cat walks on the grass, realistic'"
+echo "    --prompt 'A cat walks on the grass, realistic' \\"
+echo "    --force_v1_decoder"
 echo "=============================================="

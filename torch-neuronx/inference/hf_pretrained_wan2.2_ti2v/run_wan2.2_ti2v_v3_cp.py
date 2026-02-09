@@ -18,16 +18,13 @@ Usage:
 """
 # IMPORTANT: Set environment variables BEFORE any imports
 import os
-os.environ["NEURON_RT_NUM_CORES"] = "8"  # Match world_size
-os.environ["LOCAL_WORLD_SIZE"] = "8"  # Required for NxD parallel state initialization
-os.environ["WORLD_SIZE"] = "8"  # Total world size for distributed
-os.environ["RANK"] = "0"  # Current rank (local process)
+os.environ["NEURON_RT_NUM_CORES"] = "8"
+os.environ["LOCAL_WORLD_SIZE"] = "8"
 os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "2"
 os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2"
 
-# Diffusers imports moved inside NxDParallelState context to avoid NxD conflicts
-# from diffusers import AutoencoderKLWan, WanPipeline
-# from diffusers.utils import export_to_video
+from diffusers import AutoencoderKLWan, WanPipeline
+from diffusers.utils import export_to_video
 
 import argparse
 import json
@@ -37,12 +34,11 @@ import time
 import torch
 import torch_neuronx
 
-from neuronx_distributed import NxDModel, NxDParallelState
+from neuronx_distributed import NxDModel
 from safetensors.torch import load_file
 
-# Neuron commons imports moved inside NxD context to avoid conflicts
-# from neuron_wan2_2_ti2v.neuron_commons_v2 import InferenceTextEncoderWrapperV2
-# from neuron_wan2_2_ti2v.neuron_commons import SimpleWrapper, DecoderWrapper, DecoderWrapperV2, PostQuantConvWrapperV2
+from neuron_wan2_2_ti2v.neuron_commons_v2 import InferenceTextEncoderWrapperV2
+from neuron_wan2_2_ti2v.neuron_commons import SimpleWrapper, DecoderWrapper, DecoderWrapperV2, PostQuantConvWrapperV2
 
 
 def set_seed(seed: int):
@@ -62,12 +58,23 @@ def load_model_config(model_path):
 
 
 def load_sharded_weights(model_path, tp_degree):
-    """Load TP sharded weights from safetensors files."""
+    """Load TP sharded weights from safetensors files.
+
+    Filters out master_weight tensors which are artifacts from shard_checkpoint()
+    and not actual model parameters. Including them causes _parallel_load to fail
+    with replica group assertion errors.
+    """
     weights_path = os.path.join(model_path, "weights")
     sharded_weights = []
     for rank in range(tp_degree):
         ckpt_path = os.path.join(weights_path, f"tp{rank}_sharded_checkpoint.safetensors")
-        ckpt = load_file(ckpt_path)
+        raw_ckpt = load_file(ckpt_path)
+        # Remove master_weight tensors (duplicates created by shard_checkpoint)
+        ckpt = {k: v for k, v in raw_ckpt.items() if 'master_weight' not in k}
+        if rank == 0:
+            removed = len(raw_ckpt) - len(ckpt)
+            if removed > 0:
+                print(f"  Filtered {removed} master_weight tensors from checkpoints ({len(ckpt)} keys remaining)")
         sharded_weights.append(ckpt)
     return sharded_weights
 
@@ -264,12 +271,6 @@ SEED = 42
 
 
 def main(args):
-    # Import diffusers and neuron_commons inside NxD context to avoid replica group conflicts
-    from diffusers import AutoencoderKLWan, WanPipeline
-    from diffusers.utils import export_to_video
-    from neuron_wan2_2_ti2v.neuron_commons_v2 import InferenceTextEncoderWrapperV2
-    from neuron_wan2_2_ti2v.neuron_commons import SimpleWrapper, DecoderWrapper, DecoderWrapperV2, PostQuantConvWrapperV2
-
     set_seed(SEED)
     generator = torch.Generator().manual_seed(SEED)
 
@@ -315,10 +316,12 @@ def main(args):
     print("Text encoder loaded.")
 
     # Load Decoder - check for V2 first, fall back to V1
+    # Use --force_v1_decoder to always use V1 decoder (faster)
     decoder_v2_path = f"{compiled_models_dir}/decoder_v2"
     decoder_v1_path = f"{compiled_models_dir}/decoder/model.pt"
+    use_v2_decoder = os.path.exists(decoder_v2_path) and not args.force_v1_decoder
 
-    if os.path.exists(decoder_v2_path):
+    if use_v2_decoder:
         print("\nLoading decoder (V2)...")
         vae_decoder_wrapper = DecoderWrapperV2(pipe.vae.decoder)
         decoder_nxd = NxDModel.load(os.path.join(decoder_v2_path, "nxd_model.pt"))
@@ -341,8 +344,9 @@ def main(args):
     # Load post_quant_conv - check for V2 first, fall back to V1
     pqc_v2_path = f"{compiled_models_dir}/post_quant_conv_v2"
     pqc_v1_path = f"{compiled_models_dir}/post_quant_conv/model.pt"
+    use_v2_pqc = os.path.exists(pqc_v2_path) and not args.force_v1_decoder
 
-    if os.path.exists(pqc_v2_path):
+    if use_v2_pqc:
         print("\nLoading post_quant_conv (V2)...")
         vae_post_quant_conv_wrapper = PostQuantConvWrapperV2(pipe.vae.post_quant_conv)
         pqc_nxd = NxDModel.load(os.path.join(pqc_v2_path, "nxd_model.pt"))
@@ -436,10 +440,7 @@ if __name__ == "__main__":
                         default="Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards",
                         help="Negative prompt")
     parser.add_argument("--output", type=str, default="output_v3_cp.mp4", help="Output video path")
+    parser.add_argument("--force_v1_decoder", action="store_true", help="Force use V1 decoder (faster)")
     args = parser.parse_args()
 
-    # Initialize parallel state with world_size=8 and TP=4 (CP=2)
-    # This must wrap the entire execution to ensure process groups are available
-    print("Initializing NxDParallelState (world_size=8, TP=4, DP/CP=2)...")
-    with NxDParallelState(world_size=8, tensor_model_parallel_size=4):
-        main(args)
+    main(args)

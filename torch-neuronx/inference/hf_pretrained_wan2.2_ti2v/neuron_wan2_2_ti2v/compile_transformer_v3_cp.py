@@ -28,7 +28,7 @@ os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "2"
 os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2"
 
 # Compiler flags with ccop-compute-overlap for CP communication
-compiler_flags = """ --target=trn2 --lnc=2 --model-type=transformer -O1 --auto-cast=none --enable-fast-loading-neuron-binaries --tensorizer-options='--enable-ccop-compute-overlap' --internal-hlo2tensorizer-options='--enable-state-buffer-mode=hybrid --remat-by-default' """
+compiler_flags = """ --target=trn2 --lnc=2 --model-type=transformer --auto-cast=none --enable-fast-loading-neuron-binaries --tensorizer-options='--enable-ccop-compute-overlap' --internal-hlo2tensorizer-options='--enable-state-buffer-mode=hybrid --remat-by-default' """
 os.environ["NEURON_CC_FLAGS"] = os.environ.get("NEURON_CC_FLAGS", "") + compiler_flags
 
 import torch
@@ -189,6 +189,36 @@ def split_along_dim(tensor, dim, rank, data_parallel_group):
     )
 
 
+def per_head_rms_norm(x, weight, eps=1e-6):
+    """
+    Apply RMSNorm per-head on tensor already reshaped to [B, S, H, D].
+
+    This normalizes over the last dim (head_dim D) ONLY, which is local
+    and does NOT require all-reduce across TP ranks.
+
+    The standard WanRMSNorm on [B, S, inner_dim/tp] normalizes across all
+    local heads jointly. When compiled with TP, the Neuron compiler inserts
+    an all-reduce to compute global statistics, but creates it with an
+    incorrect single replica group [[0,1,2,3]] instead of the full
+    [[0,1,2,3],[4,5,6,7]]. This causes a runtime assertion failure.
+
+    By normalizing per-head (over D only), each head is independent and
+    no cross-rank communication is needed.
+
+    Args:
+        x: [B, S, H, D] tensor
+        weight: [H * D] parameter from WanRMSNorm
+        eps: epsilon for numerical stability
+    """
+    dtype = x.dtype
+    x_float = x.float()
+    variance = x_float.pow(2).mean(-1, keepdim=True)
+    x_normed = x_float * torch.rsqrt(variance + eps)
+    # Reshape weight [H*D] -> [1, 1, H, D] for broadcasting
+    w = weight.view(1, 1, x.shape[2], x.shape[3])
+    return (w * x_normed).to(dtype)
+
+
 class CPWanSelfAttention(nn.Module):
     """
     Context Parallel + NKI Flash Attention for Wan2.2 Self-Attention (attn1).
@@ -200,11 +230,11 @@ class CPWanSelfAttention(nn.Module):
     4. RoPE is applied before K/V gathering
     """
 
-    def __init__(self, orig_attn, context_parallel_enabled=False):
+    def __init__(self, orig_attn, context_parallel_enabled=False, data_parallel_group=None):
         super().__init__()
 
         self.context_parallel_enabled = context_parallel_enabled
-        # NOTE: Get data_parallel_group dynamically in forward(), not here
+        self.data_parallel_group = data_parallel_group
         self.heads = orig_attn.heads
 
         # Copy projections (already sharded for TP)
@@ -234,17 +264,24 @@ class CPWanSelfAttention(nn.Module):
         key = self.to_k(hidden_states)  # Self-attention: K from same input
         value = self.to_v(hidden_states)
 
-        # Apply QK normalization
-        if self.norm_q is not None:
-            query = self.norm_q(query)
-        if self.norm_k is not None:
-            key = self.norm_k(key)
-
-        # Reshape to [B, H, S, D]
+        # Reshape to [B, S, H, D] BEFORE normalization
+        # This allows per-head RMSNorm (over D only) which avoids compiler-inserted
+        # all-reduce with incorrect replica groups on TP-sharded dimension
         head_dim = query.shape[-1] // self.heads
-        query = query.view(batch_size, seq_len, self.heads, head_dim).transpose(1, 2)
-        key = key.view(batch_size, seq_len, self.heads, head_dim).transpose(1, 2)
-        value = value.view(batch_size, seq_len, self.heads, head_dim).transpose(1, 2)
+        query = query.view(batch_size, seq_len, self.heads, head_dim)
+        key = key.view(batch_size, seq_len, self.heads, head_dim)
+        value = value.view(batch_size, seq_len, self.heads, head_dim)
+
+        # Apply QK normalization per-head (no TP all-reduce needed)
+        if self.norm_q is not None:
+            query = per_head_rms_norm(query, self.norm_q.weight, self.norm_q.eps)
+        if self.norm_k is not None:
+            key = per_head_rms_norm(key, self.norm_k.weight, self.norm_k.eps)
+
+        # Transpose to [B, H, S, D] for attention
+        query = query.transpose(1, 2)
+        key = key.transpose(1, 2)
+        value = value.transpose(1, 2)
 
         # Apply RoPE before gathering (each rank has its local positions)
         if rotary_emb is not None:
@@ -253,8 +290,7 @@ class CPWanSelfAttention(nn.Module):
 
         # Context Parallel: All-gather K/V across CP group
         if self.context_parallel_enabled:
-            # Get DP group dynamically at runtime (not captured during init)
-            dp_group = parallel_state.get_data_parallel_group()
+            dp_group = self.data_parallel_group
             # Stack K, V and gather together for efficiency
             kv_stacked = torch.stack([key, value], dim=0)  # [2, B, H, local_S, D]
             kv_stacked = gather_from_tensor_model_parallel_region_with_dim(
@@ -337,27 +373,36 @@ class CPWanCrossAttention(nn.Module):
         key = self.to_k(encoder_hidden_states)
         value = self.to_v(encoder_hidden_states)
 
-        # Apply QK normalization
-        if self.norm_q is not None:
-            query = self.norm_q(query)
-        if self.norm_k is not None:
-            key = self.norm_k(key)
-
-        # Reshape to [B, H, S, D]
+        # Reshape to [B, S, H, D] BEFORE normalization
         head_dim = query.shape[-1] // self.heads
-        query = query.view(batch_size, local_seq, self.heads, head_dim).transpose(1, 2)
-        key = key.view(batch_size, -1, self.heads, head_dim).transpose(1, 2)
-        value = value.view(batch_size, -1, self.heads, head_dim).transpose(1, 2)
+        query = query.view(batch_size, local_seq, self.heads, head_dim)
+        key = key.view(batch_size, -1, self.heads, head_dim)
+        value = value.view(batch_size, -1, self.heads, head_dim)
+
+        # Apply QK normalization per-head (no TP all-reduce needed)
+        if self.norm_q is not None:
+            query = per_head_rms_norm(query, self.norm_q.weight, self.norm_q.eps)
+        if self.norm_k is not None:
+            key = per_head_rms_norm(key, self.norm_k.weight, self.norm_k.eps)
+
+        # Transpose to [B, H, S, D]
+        query = query.transpose(1, 2)
+        key = key.transpose(1, 2)
+        value = value.transpose(1, 2)
 
         # Handle I2V image attention
         hidden_states_img = None
         if encoder_hidden_states_img is not None:
             key_img = self.add_k_proj(encoder_hidden_states_img)
-            key_img = self.norm_added_k(key_img)
+            # Reshape before norm for per-head normalization
+            key_img = key_img.view(batch_size, -1, self.heads, head_dim)
+            if self.norm_added_k is not None and self.norm_added_k.weight is not None:
+                key_img = per_head_rms_norm(key_img, self.norm_added_k.weight, self.norm_added_k.eps)
             value_img = self.add_v_proj(encoder_hidden_states_img)
+            value_img = value_img.view(batch_size, -1, self.heads, head_dim)
 
-            key_img = key_img.view(batch_size, -1, self.heads, head_dim).transpose(1, 2)
-            value_img = value_img.view(batch_size, -1, self.heads, head_dim).transpose(1, 2)
+            key_img = key_img.transpose(1, 2)
+            value_img = value_img.transpose(1, 2)
 
             # NKI attention for image context
             hidden_states_img = nki_flash_attention(query, key_img, value_img)
@@ -566,8 +611,9 @@ class NeuronWanTransformerV3CP(nn.Module):
         # SPMDRank for runtime rank detection (crucial for SPMD scatter/gather)
         self.global_rank = SPMDRank(world_size=world_size)
 
-        # NOTE: We do NOT capture data_parallel_group here because it can't be serialized.
-        # Instead, we get it dynamically in forward() using parallel_state.get_data_parallel_group()
+        # Capture data_parallel_group at init time (within NxDParallelState context).
+        # This ensures the correct group is baked into the compiled NEFF.
+        self.data_parallel_group = parallel_state.get_data_parallel_group()
 
         # Patch embedding
         self.patch_embedding = original_transformer.patch_embedding
@@ -603,10 +649,10 @@ class NeuronWanTransformerV3CP(nn.Module):
         """Replace attention modules with CP+NKI versions."""
         for i, block in enumerate(self.blocks):
             # Replace self-attention (attn1) with CP version
-            # NOTE: Don't pass data_parallel_group - get it dynamically in forward()
             block.attn1 = CPWanSelfAttention(
                 block.attn1,
-                self.context_parallel_enabled
+                self.context_parallel_enabled,
+                self.data_parallel_group
             )
 
             # Replace cross-attention (attn2) with CP version
@@ -680,8 +726,7 @@ class NeuronWanTransformerV3CP(nn.Module):
 
         # ========== CONTEXT PARALLEL: SPLIT DATA AT ENTRY ==========
         if self.context_parallel_enabled:
-            # Get DP group dynamically at runtime (not captured during init)
-            dp_group = parallel_state.get_data_parallel_group()
+            dp_group = self.data_parallel_group
 
             # Get DP rank at runtime using SPMDRank
             dp_rank = get_dp_rank_spmd(self.global_rank.get_rank(), self.tp_degree)
@@ -738,10 +783,8 @@ class NeuronWanTransformerV3CP(nn.Module):
 
         # ========== CONTEXT PARALLEL: GATHER OUTPUT ==========
         if self.context_parallel_enabled:
-            # Get DP group dynamically at runtime
-            dp_group = parallel_state.get_data_parallel_group()
             output = gather_from_tensor_model_parallel_region_with_dim(
-                output, gather_dim=1, process_group=dp_group
+                output, gather_dim=1, process_group=self.data_parallel_group
             )
 
         # Unpatchify
@@ -801,10 +844,10 @@ def compute_rope(transformer, latent_frames, latent_height, latent_width, in_cha
 
 
 def fix_norm_weights_per_rank(weights_path, unsharded_norm_weights, tp_degree):
-    """Fix norm_k/norm_q weights for each rank after shard_checkpoint.
+    """Fix norm_k/norm_q/norm_added_k weights for each rank after shard_checkpoint.
 
-    shard_checkpoint doesn't recognize norm_q/norm_k inside CP attention modules
-    as parallel layers, so they remain unsharded. This function manually shards them.
+    shard_checkpoint doesn't recognize norm_q/norm_k/norm_added_k inside CP attention
+    modules as parallel layers, so they remain unsharded. This function manually shards them.
     """
     print(f"Fixing norm weights for {tp_degree} ranks...")
 
@@ -917,10 +960,10 @@ def compile_transformer_v3_cp(args):
         # Save unsharded state dict before modifications
         unsharded_state = pipe.transformer.state_dict()
 
-        # Collect unsharded norm weights
+        # Collect unsharded norm weights (norm_q, norm_k, norm_added_k for I2V)
         unsharded_norm_weights = {}
         for key, value in unsharded_state.items():
-            if 'norm_k.weight' in key or 'norm_q.weight' in key:
+            if 'norm_k.weight' in key or 'norm_q.weight' in key or 'norm_added_k.weight' in key:
                 unsharded_norm_weights[f"transformer.{key}"] = value.clone()
         print(f"Collected {len(unsharded_norm_weights)} unsharded norm weights")
 
@@ -953,7 +996,7 @@ def compile_transformer_v3_cp(args):
         )
 
         print("Compiling model...")
-        compile_args = "--model-type=transformer -O1 --auto-cast=none"
+        compile_args = "--model-type=transformer -O1 --auto-cast=none --internal-hlo2tensorizer-options='--enable-native-kernel=1 --remat'"
         traced_model = builder.compile(
             compiler_args=compile_args,
             compiler_workdir=args.compiler_workdir,
@@ -994,15 +1037,27 @@ def compile_transformer_v3_cp(args):
             serialize_path=weights_path,
         )
 
-        # Add global_rank to checkpoints
-        if global_rank_state:
-            print("Adding SPMDRank state to checkpoints...")
-            for rank in range(tp_degree):
-                shard_file = os.path.join(weights_path, f"tp{rank}_sharded_checkpoint.safetensors")
-                if os.path.exists(shard_file):
-                    shard_data = dict(load_file(shard_file))
-                    shard_data.update(global_rank_state)
-                    save_file(shard_data, shard_file)
+        # Post-process sharded checkpoints: remove master_weight tensors and add global_rank
+        print("Post-processing sharded checkpoints...")
+        for rank in range(tp_degree):
+            shard_file = os.path.join(weights_path, f"tp{rank}_sharded_checkpoint.safetensors")
+            if not os.path.exists(shard_file):
+                print(f"  WARNING: {shard_file} not found")
+                continue
+
+            shard_data = dict(load_file(shard_file))
+            original_count = len(shard_data)
+
+            # Remove master_weight tensors (duplicates created by shard_checkpoint)
+            cleaned = {k: v for k, v in shard_data.items() if 'master_weight' not in k}
+
+            # Add SPMDRank state
+            if global_rank_state:
+                cleaned.update(global_rank_state)
+
+            save_file(cleaned, shard_file)
+            removed = original_count - len(cleaned) + len(global_rank_state)
+            print(f"  tp{rank}: {original_count} -> {len(cleaned)} tensors (removed {removed} master_weight)")
 
         # Fix norm weights - also convert to bfloat16
         unsharded_norm_weights_bf16 = {k: v.to(torch.bfloat16) for k, v in unsharded_norm_weights.items()}
