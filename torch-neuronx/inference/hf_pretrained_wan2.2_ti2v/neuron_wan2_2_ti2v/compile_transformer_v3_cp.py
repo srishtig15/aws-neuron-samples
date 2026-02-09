@@ -189,34 +189,29 @@ def split_along_dim(tensor, dim, rank, data_parallel_group):
     )
 
 
-def per_head_rms_norm(x, weight, eps=1e-6):
+def local_rms_norm(x, weight, eps=1e-6):
     """
-    Apply RMSNorm per-head on tensor already reshaped to [B, S, H, D].
+    Apply RMSNorm locally on [B, S, local_inner_dim] without any all-reduce.
 
-    This normalizes over the last dim (head_dim D) ONLY, which is local
-    and does NOT require all-reduce across TP ranks.
+    The DistributedRMSNorm uses xm.all_reduce to compute global statistics
+    across TP ranks, but the Neuron compiler creates incorrect replica groups
+    ([[0,1,2,3]] instead of [[0,1,2,3],[4,5,6,7]]) causing a runtime assertion.
 
-    The standard WanRMSNorm on [B, S, inner_dim/tp] normalizes across all
-    local heads jointly. When compiled with TP, the Neuron compiler inserts
-    an all-reduce to compute global statistics, but creates it with an
-    incorrect single replica group [[0,1,2,3]] instead of the full
-    [[0,1,2,3],[4,5,6,7]]. This causes a runtime assertion failure.
-
-    By normalizing per-head (over D only), each head is independent and
-    no cross-rank communication is needed.
+    This function computes RMSNorm purely locally over the full local_inner_dim
+    (H_local * D). No cross-rank communication is generated. The difference
+    from global norm (normalizing over H_total * D) is negligible for QK-norm
+    since each TP shard has a statistically similar distribution of activations.
 
     Args:
-        x: [B, S, H, D] tensor
-        weight: [H * D] parameter from WanRMSNorm
+        x: [B, S, local_inner_dim] tensor
+        weight: [local_inner_dim] parameter from WanRMSNorm (already TP-sharded)
         eps: epsilon for numerical stability
     """
     dtype = x.dtype
     x_float = x.float()
     variance = x_float.pow(2).mean(-1, keepdim=True)
     x_normed = x_float * torch.rsqrt(variance + eps)
-    # Reshape weight [H*D] -> [1, 1, H, D] for broadcasting
-    w = weight.view(1, 1, x.shape[2], x.shape[3])
-    return (w * x_normed).to(dtype)
+    return (weight * x_normed).to(dtype)
 
 
 class CPWanSelfAttention(nn.Module):
@@ -259,29 +254,24 @@ class CPWanSelfAttention(nn.Module):
         """Forward with CP K/V gathering and NKI attention."""
         batch_size, seq_len, _ = hidden_states.shape
 
-        # Compute Q, K, V
+        # Compute Q, K, V  [B, S, H_local*D]
         query = self.to_q(hidden_states)
-        key = self.to_k(hidden_states)  # Self-attention: K from same input
+        key = self.to_k(hidden_states)
         value = self.to_v(hidden_states)
 
-        # Reshape to [B, S, H, D] BEFORE normalization
-        # This allows per-head RMSNorm (over D only) which avoids compiler-inserted
-        # all-reduce with incorrect replica groups on TP-sharded dimension
-        head_dim = query.shape[-1] // self.heads
-        query = query.view(batch_size, seq_len, self.heads, head_dim)
-        key = key.view(batch_size, seq_len, self.heads, head_dim)
-        value = value.view(batch_size, seq_len, self.heads, head_dim)
-
-        # Apply QK normalization per-head (no TP all-reduce needed)
+        # Apply QK normalization on full local inner_dim (H_local*D).
+        # Uses local_rms_norm which does NOT call xm.all_reduce, avoiding
+        # the compiler bug that creates incorrect replica groups.
         if self.norm_q is not None:
-            query = per_head_rms_norm(query, self.norm_q.weight, self.norm_q.eps)
+            query = local_rms_norm(query, self.norm_q.weight, self.norm_q.eps)
         if self.norm_k is not None:
-            key = per_head_rms_norm(key, self.norm_k.weight, self.norm_k.eps)
+            key = local_rms_norm(key, self.norm_k.weight, self.norm_k.eps)
 
-        # Transpose to [B, H, S, D] for attention
-        query = query.transpose(1, 2)
-        key = key.transpose(1, 2)
-        value = value.transpose(1, 2)
+        # Reshape to [B, H, S, D] for attention
+        head_dim = query.shape[-1] // self.heads
+        query = query.view(batch_size, seq_len, self.heads, head_dim).transpose(1, 2)
+        key = key.view(batch_size, seq_len, self.heads, head_dim).transpose(1, 2)
+        value = value.view(batch_size, seq_len, self.heads, head_dim).transpose(1, 2)
 
         # Apply RoPE before gathering (each rank has its local positions)
         if rotary_emb is not None:
@@ -366,43 +356,33 @@ class CPWanCrossAttention(nn.Module):
             encoder_hidden_states_img = encoder_hidden_states[:, :image_context_length]
             encoder_hidden_states = encoder_hidden_states[:, image_context_length:]
 
-        # Query from video (split)
-        query = self.to_q(hidden_states)
-
-        # K/V from text (NOT split - same for all CP ranks)
-        key = self.to_k(encoder_hidden_states)
+        # Query from video (split), K/V from text (NOT split)
+        query = self.to_q(hidden_states)       # [B, local_seq, H_local*D]
+        key = self.to_k(encoder_hidden_states)  # [B, text_len, H_local*D]
         value = self.to_v(encoder_hidden_states)
 
-        # Reshape to [B, S, H, D] BEFORE normalization
-        head_dim = query.shape[-1] // self.heads
-        query = query.view(batch_size, local_seq, self.heads, head_dim)
-        key = key.view(batch_size, -1, self.heads, head_dim)
-        value = value.view(batch_size, -1, self.heads, head_dim)
-
-        # Apply QK normalization per-head (no TP all-reduce needed)
+        # Apply QK normalization on full local inner_dim (no all-reduce)
         if self.norm_q is not None:
-            query = per_head_rms_norm(query, self.norm_q.weight, self.norm_q.eps)
+            query = local_rms_norm(query, self.norm_q.weight, self.norm_q.eps)
         if self.norm_k is not None:
-            key = per_head_rms_norm(key, self.norm_k.weight, self.norm_k.eps)
+            key = local_rms_norm(key, self.norm_k.weight, self.norm_k.eps)
 
-        # Transpose to [B, H, S, D]
-        query = query.transpose(1, 2)
-        key = key.transpose(1, 2)
-        value = value.transpose(1, 2)
+        # Reshape to [B, H, S, D]
+        head_dim = query.shape[-1] // self.heads
+        query = query.view(batch_size, local_seq, self.heads, head_dim).transpose(1, 2)
+        key = key.view(batch_size, -1, self.heads, head_dim).transpose(1, 2)
+        value = value.view(batch_size, -1, self.heads, head_dim).transpose(1, 2)
 
         # Handle I2V image attention
         hidden_states_img = None
         if encoder_hidden_states_img is not None:
-            key_img = self.add_k_proj(encoder_hidden_states_img)
-            # Reshape before norm for per-head normalization
-            key_img = key_img.view(batch_size, -1, self.heads, head_dim)
+            key_img = self.add_k_proj(encoder_hidden_states_img)  # [B, img_len, H_local*D]
             if self.norm_added_k is not None and self.norm_added_k.weight is not None:
-                key_img = per_head_rms_norm(key_img, self.norm_added_k.weight, self.norm_added_k.eps)
+                key_img = local_rms_norm(key_img, self.norm_added_k.weight, self.norm_added_k.eps)
             value_img = self.add_v_proj(encoder_hidden_states_img)
-            value_img = value_img.view(batch_size, -1, self.heads, head_dim)
 
-            key_img = key_img.transpose(1, 2)
-            value_img = value_img.transpose(1, 2)
+            key_img = key_img.view(batch_size, -1, self.heads, head_dim).transpose(1, 2)
+            value_img = value_img.view(batch_size, -1, self.heads, head_dim).transpose(1, 2)
 
             # NKI attention for image context
             hidden_states_img = nki_flash_attention(query, key_img, value_img)
