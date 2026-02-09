@@ -62,9 +62,13 @@ if [[ "$CONFIRM" != "yes" ]]; then
     exit 1
 fi
 
+# Find root device and exclude it (EBS root volume also appears as NVMe on Nitro instances)
+ROOT_NVME=$(lsblk -n -o PKNAME,MOUNTPOINT | awk '$2=="/" {print $1; exit}')
+echo "Root device detected: /dev/$ROOT_NVME (will be excluded)"
+
 # Find all NVMe devices (excluding root device)
-NVME_DEVICES=$(lsblk -d -n -o NAME,TYPE | grep nvme | grep disk | awk '{print "/dev/"$1}' | grep -v nvme0n1 || true)
-NVME_COUNT=$(echo "$NVME_DEVICES" | grep -c nvme || echo 0)
+NVME_DEVICES=$(lsblk -d -n -o NAME,TYPE | grep nvme | grep disk | awk '{print "/dev/"$1}' | grep -v "$ROOT_NVME" || true)
+NVME_COUNT=$(echo "$NVME_DEVICES" | wc -l)
 
 echo "Found $NVME_COUNT NVMe devices:"
 echo "$NVME_DEVICES"

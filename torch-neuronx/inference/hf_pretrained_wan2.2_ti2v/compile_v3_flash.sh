@@ -52,41 +52,52 @@ echo "=============================================="
 mkdir -p "${COMPILED_MODELS_DIR}"
 mkdir -p "${COMPILER_WORKDIR}"
 
-# Step 1: Compile Text Encoder (V2, TP=8, world_size=8)
+# Step 1: Cache HuggingFace model (if not already cached)
 echo ""
-echo "[Step 1/3] Compiling Text Encoder (V2, TP=${TP_DEGREE}, world_size=${WORLD_SIZE})..."
-python neuron_wan2_2_ti2v/compile_text_encoder_v2.py \
-    --compiled_models_dir "${COMPILED_MODELS_DIR}" \
-    --max_sequence_length ${MAX_SEQUENCE_LENGTH} \
-    --tp_degree ${TP_DEGREE} \
-    --world_size ${WORLD_SIZE}
+echo "[Step 1/4] Caching HuggingFace model..."
+# python neuron_wan2_2_ti2v/cache_hf_model.py
 
-# Step 2: Compile Transformer (V3 Flash, TP=8, NKI)
+# Step 2: Compile Text Encoder (V2, TP=8, world_size=8)
 echo ""
-echo "[Step 2/3] Compiling Transformer (V3 Flash, TP=${TP_DEGREE})..."
-python neuron_wan2_2_ti2v/compile_transformer_v3_flash.py \
-    --compiled_models_dir "${COMPILED_MODELS_DIR}" \
-    --compiler_workdir "${COMPILER_WORKDIR}" \
-    --cache_dir "${CACHE_DIR}" \
-    --height ${HEIGHT} \
-    --width ${WIDTH} \
-    --num_frames ${NUM_FRAMES} \
-    --max_sequence_length ${MAX_SEQUENCE_LENGTH} \
-    --tp_degree ${TP_DEGREE}
+echo "[Step 2/4] Compiling Text Encoder (V2, TP=${TP_DEGREE}, world_size=${WORLD_SIZE})..."
+# python neuron_wan2_2_ti2v/compile_text_encoder_v2.py \
+#     --compiled_models_dir "${COMPILED_MODELS_DIR}" \
+#     --max_sequence_length ${MAX_SEQUENCE_LENGTH} \
+#     --tp_degree ${TP_DEGREE} \
+#     --world_size ${WORLD_SIZE}
 
-# Step 3: Compile Decoder and post_quant_conv (V2 Optimized)
+# Step 3: Compile Transformer (V3 Flash, TP=8, NKI)
+echo ""
+echo "[Step 3/4] Compiling Transformer (V3 Flash, TP=${TP_DEGREE})..."
+# python neuron_wan2_2_ti2v/compile_transformer_v3_flash.py \
+#     --compiled_models_dir "${COMPILED_MODELS_DIR}" \
+#     --compiler_workdir "${COMPILER_WORKDIR}" \
+#     --cache_dir "${CACHE_DIR}" \
+#     --height ${HEIGHT} \
+#     --width ${WIDTH} \
+#     --num_frames ${NUM_FRAMES} \
+#     --max_sequence_length ${MAX_SEQUENCE_LENGTH} \
+#     --tp_degree ${TP_DEGREE}
+
+# Step 4: Compile Decoder and post_quant_conv (V2 Optimized)
 # Optimizations:
 # - -O1 compiler optimization
 # - NKI Flash Attention disabled (causes OOM due to spill buffers)
 echo ""
-echo "[Step 3/3] Compiling Decoder and post_quant_conv (V2 Optimized, -O1)..."
-python neuron_wan2_2_ti2v/compile_decoder_v2_optimized.py \
+echo "[Step 4/4] Compiling Decoder and post_quant_conv (V2 Optimized, -O1)..."
+# python neuron_wan2_2_ti2v/compile_decoder_v2_optimized.py \
+#     --compiled_models_dir "${COMPILED_MODELS_DIR}" \
+#     --height ${HEIGHT} \
+#     --width ${WIDTH} \
+#     --num_frames ${NUM_FRAMES} \
+#     --tp_degree ${TP_DEGREE} \
+#     --world_size ${WORLD_SIZE}
+
+python neuron_wan2_2_ti2v/compile_decoder.py \
     --compiled_models_dir "${COMPILED_MODELS_DIR}" \
     --height ${HEIGHT} \
     --width ${WIDTH} \
-    --num_frames ${NUM_FRAMES} \
-    --tp_degree ${TP_DEGREE} \
-    --world_size ${WORLD_SIZE}
+    --num_frames ${NUM_FRAMES}
 
 echo ""
 echo "=============================================="
@@ -97,5 +108,6 @@ echo ""
 echo "To run inference:"
 echo "  NEURON_RT_NUM_CORES=8 python run_wan2.2_ti2v_v3_flash.py \\"
 echo "    --compiled_models_dir ${COMPILED_MODELS_DIR} \\"
-echo "    --prompt 'A cat walks on the grass, realistic'"
+echo "    --prompt 'A cat walks on the grass, realistic' \\"
+echo "    --force_v1_decoder"
 echo "=============================================="
