@@ -166,21 +166,25 @@ class InferenceTransformerWrapperV3Flash(torch.nn.Module):
                 self.rotary_emb_sin,
             )
 
-        # Handle tuple return
+        # Handle tuple return from NxDModel
         if isinstance(output, (tuple, list)):
             output = output[0]
 
-        return output
+        # Return as tuple (output,) to match WanTransformer3DModel convention
+        # Pipeline expects tuple and indexes [0] to extract the tensor
+        return (output,)
 
 
 def prepare_image_latents(pipe, image, num_frames, height, width, device, dtype, generator=None):
     """
     Encode input image and prepare latents for I2V generation.
-    Matches run_wan2.2_i2v_latency_optimized.py encoding approach.
 
-    Returns:
-        (latents, image_condition): latents with frame 0 = encoded image,
-        and the raw image condition for use in callback.
+    Uses proper normalization (/ latents_std) for correct round-trip with decode.
+    Returns noise latents (frame 0 NOT replaced), image_condition, and
+    noise_frame_0 for use in the noise-scheduled callback.
+
+    The callback will inject properly-noised image into frame 0 at each step,
+    simulating WanImageToVideoPipeline's first_frame_mask behavior.
     """
     if isinstance(image, str):
         image = load_image(image)
@@ -199,45 +203,56 @@ def prepare_image_latents(pipe, image, num_frames, height, width, device, dtype,
     with torch.no_grad():
         image_latents = pipe.vae.encode(image).latent_dist.sample(generator)
 
-        # Apply VAE latent normalization (amplify signal for T2V hack)
-        latents_std = torch.tensor(pipe.vae.config.latents_std).view(1, -1, 1, 1, 1).to(device, dtype)
+        # Proper normalization: (raw - mean) / std
+        # This ensures correct round-trip: decode(encode(x)) = x
+        # latents_std values are mostly < 1, so / std AMPLIFIES signal
         latents_mean = torch.tensor(pipe.vae.config.latents_mean).view(1, -1, 1, 1, 1).to(device, dtype)
-        image_latents = (image_latents - latents_mean) * latents_std
+        latents_std = torch.tensor(pipe.vae.config.latents_std).view(1, -1, 1, 1, 1).to(device, dtype)
+        image_condition = ((image_latents - latents_mean) / latents_std).to(torch.float32)
 
-    # Prepare full video latents: image for frame 0, noise for rest
+    # Generate noise for ALL frames (including frame 0)
     num_latent_frames = (num_frames - 1) // pipe.vae_scale_factor_temporal + 1
     latent_height = height // pipe.vae_scale_factor_spatial
     latent_width = width // pipe.vae_scale_factor_spatial
 
-    shape = (1, image_latents.shape[1], num_latent_frames, latent_height, latent_width)
+    shape = (1, image_condition.shape[1], num_latent_frames, latent_height, latent_width)
     latents = torch.randn(shape, generator=generator, device=device, dtype=torch.float32)
 
-    # Replace first frame with encoded image
-    image_condition = image_latents.to(torch.float32)
-    latents[:, :, 0:1, :, :] = image_condition
+    # Save frame 0 noise for callback (before any modification)
+    noise_frame_0 = latents[:, :, 0:1, :, :].clone()
 
-    return latents, image_condition
+    # Do NOT replace frame 0 here — the callback will inject properly-noised image
+    # at each denoising step, following the scheduler's noise schedule.
+
+    return latents, image_condition, noise_frame_0
 
 
-def create_i2v_callback(image_condition, total_steps):
+def create_i2v_callback(image_condition, noise_frame_0):
     """
-    Create a callback that softly blends the image latent into frame 0.
+    Create a callback that injects a properly-noised version of the image
+    into frame 0 at each denoising step.
 
-    Uses linearly decreasing alpha: strong in early steps (high noise) to
-    preserve image structure, fading to zero in later steps so the model
-    can freely refine details and maintain inter-frame coherence.
+    Simulates WanImageToVideoPipeline's first_frame_mask behavior:
+    At noise level sigma: frame_0 = (1-sigma)*image + sigma*noise
+    - At high sigma (early steps): frame 0 is mostly noise (model expects this)
+    - At low sigma (late steps): frame 0 is mostly clean image
+    - At sigma=0 (final): frame 0 is the pure image
+
+    This avoids the problems of:
+    - Hard replacement (clean frame among noisy frames → confuses model)
+    - No replacement (image destroyed through denoising)
     """
     def callback_fn(pipe, step, timestep, callback_kwargs):
         latents = callback_kwargs["latents"]
-        # Alpha: 1.0 at step 0, linearly decreasing to 0.0 at step total_steps/2
-        # Second half of denoising: no blending (free refinement)
-        progress = step / total_steps
-        alpha = max(0.0, 1.0 - 2.0 * progress)
-        if alpha > 0:
-            cond = image_condition.to(latents.dtype)
-            latents[:, :, 0:1, :, :] = (
-                alpha * cond + (1 - alpha) * latents[:, :, 0:1, :, :]
-            )
+
+        # After scheduler.step for step i, latents are at noise level sigmas[i+1]
+        # Access actual scheduler sigma for current state
+        sigma = pipe.scheduler.sigmas[step + 1].item()
+
+        # Compute frame 0 at the correct noise level
+        noised_image = (1.0 - sigma) * image_condition + sigma * noise_frame_0
+        latents[:, :, 0:1, :, :] = noised_image.to(latents.dtype)
+
         return {"latents": latents}
     return callback_fn
 
@@ -463,7 +478,7 @@ def main(args):
         print(f"\nEncoding input image: {args.image}")
         i2v_generator = torch.Generator().manual_seed(SEED)
         encode_start = time.time()
-        i2v_latents, image_condition = prepare_image_latents(
+        i2v_latents, image_condition, noise_frame_0 = prepare_image_latents(
             pipe, args.image, args.num_frames, args.height, args.width,
             torch.device('cpu'), dtype=torch.float32,
             generator=i2v_generator
@@ -471,7 +486,7 @@ def main(args):
         encode_time = time.time() - encode_start
         print(f"Encode time: {encode_time:.2f}s")
         print(f"I2V latents: {i2v_latents.shape}")
-        i2v_callback = create_i2v_callback(image_condition, args.num_inference_steps)
+        i2v_callback = create_i2v_callback(image_condition, noise_frame_0)
 
     # Warmup (without I2V latents, matching reference)
     print("\nStarting warmup inference...")
