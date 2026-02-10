@@ -540,6 +540,56 @@ class PostQuantConvWrapperV2(nn.Module):
         pass
 
 
+class EncoderWrapperV3(nn.Module):
+    """
+    Wrapper for V3 compiled VAE encoder (bfloat16, torch_neuronx.trace).
+
+    The compiled model takes post-patchify input directly: (B, 12, T, 256, 256).
+    This matches what _encode() passes to the encoder after patchify().
+
+    Handles:
+    - bfloat16 conversion (matching compiled dtype)
+    - Ignoring feat_cache/feat_idx arguments from the _encode() loop
+    """
+
+    def __init__(self, original_encoder):
+        super().__init__()
+        self.original_encoder = original_encoder
+        self.model = None  # Will be set via torch.jit.load()
+
+    def forward(self, x, feat_cache=None, feat_idx=None, **kwargs):
+        # x is patchified: (B, 12, T, 256, 256) — passed directly to compiled model
+        output = self.model(x.to(torch.bfloat16))
+
+        # Handle tuple return
+        if isinstance(output, (tuple, list)):
+            output = output[0]
+
+        # Convert back to float32 for pipeline
+        return output.to(torch.float32)
+
+    def clear_cache(self):
+        pass
+
+
+class QuantConvWrapperV3(nn.Module):
+    """Wrapper for V3 compiled quant_conv (bfloat16, torch_neuronx.trace)."""
+
+    def __init__(self, original_conv):
+        super().__init__()
+        self.original_conv = original_conv
+        self.model = None  # Will be set via torch.jit.load()
+
+    def forward(self, x, **kwargs):
+        output = self.model(x.to(torch.bfloat16))
+        if isinstance(output, (tuple, list)):
+            output = output[0]
+        return output.to(torch.float32)
+
+    def clear_cache(self):
+        pass
+
+
 class DecoderWrapperV3(nn.Module):
     """
     Wrapper for V3 compiled VAE decoder (bfloat16) using NxDModel.

@@ -24,11 +24,12 @@ os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "2"
 os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2"
 
 from diffusers import AutoencoderKLWan, WanPipeline
-from diffusers.utils import export_to_video
+from diffusers.utils import export_to_video, load_image
 
 import argparse
 import json
 import numpy as np
+from PIL import Image
 import random
 import time
 import torch
@@ -38,7 +39,10 @@ from neuronx_distributed import NxDModel
 from safetensors.torch import load_file
 
 from neuron_wan2_2_ti2v.neuron_commons_v2 import InferenceTextEncoderWrapperV2
-from neuron_wan2_2_ti2v.neuron_commons import SimpleWrapper, DecoderWrapper, DecoderWrapperV2, DecoderWrapperV3, PostQuantConvWrapperV2
+from neuron_wan2_2_ti2v.neuron_commons import (
+    SimpleWrapper, DecoderWrapper, DecoderWrapperV2, DecoderWrapperV3,
+    PostQuantConvWrapperV2, EncoderWrapperV3, QuantConvWrapperV3,
+)
 
 
 def set_seed(seed: int):
@@ -264,6 +268,75 @@ def load_transformer_v3_cp(compiled_models_dir, pipe):
     return wrapper
 
 
+def prepare_image_latents(pipe, image, num_frames, height, width, device, dtype, generator=None):
+    """
+    Encode input image and prepare latents for I2V generation.
+    Matches run_wan2.2_i2v_latency_optimized.py encoding approach.
+
+    Returns:
+        (latents, image_condition): latents with frame 0 = encoded image,
+        and the raw image condition for use in callback.
+    """
+    if isinstance(image, str):
+        image = load_image(image)
+
+    if isinstance(image, Image.Image):
+        image = image.resize((width, height), Image.LANCZOS)
+        image = np.array(image)
+
+    # Normalize to [-1, 1] and add batch + time dimensions
+    image = torch.from_numpy(image).float() / 127.5 - 1.0
+    image = image.permute(2, 0, 1).unsqueeze(0)  # [1, C, H, W]
+    image = image.unsqueeze(2)  # [1, C, 1, H, W]
+    image = image.to(device=device, dtype=dtype)
+
+    # Encode image to latent space
+    with torch.no_grad():
+        image_latents = pipe.vae.encode(image).latent_dist.sample(generator)
+
+        # Apply VAE latent normalization (amplify signal for T2V hack)
+        latents_std = torch.tensor(pipe.vae.config.latents_std).view(1, -1, 1, 1, 1).to(device, dtype)
+        latents_mean = torch.tensor(pipe.vae.config.latents_mean).view(1, -1, 1, 1, 1).to(device, dtype)
+        image_latents = (image_latents - latents_mean) * latents_std
+
+    # Prepare full video latents: image for frame 0, noise for rest
+    num_latent_frames = (num_frames - 1) // pipe.vae_scale_factor_temporal + 1
+    latent_height = height // pipe.vae_scale_factor_spatial
+    latent_width = width // pipe.vae_scale_factor_spatial
+
+    shape = (1, image_latents.shape[1], num_latent_frames, latent_height, latent_width)
+    latents = torch.randn(shape, generator=generator, device=device, dtype=torch.float32)
+
+    # Replace first frame with encoded image
+    image_condition = image_latents.to(torch.float32)
+    latents[:, :, 0:1, :, :] = image_condition
+
+    return latents, image_condition
+
+
+def create_i2v_callback(image_condition, total_steps):
+    """
+    Create a callback that softly blends the image latent into frame 0.
+
+    Uses linearly decreasing alpha: strong in early steps (high noise) to
+    preserve image structure, fading to zero in later steps so the model
+    can freely refine details and maintain inter-frame coherence.
+    """
+    def callback_fn(pipe, step, timestep, callback_kwargs):
+        latents = callback_kwargs["latents"]
+        # Alpha: 1.0 at step 0, linearly decreasing to 0.0 at step total_steps/2
+        # Second half of denoising: no blending (free refinement)
+        progress = step / total_steps
+        alpha = max(0.0, 1.0 - 2.0 * progress)
+        if alpha > 0:
+            cond = image_condition.to(latents.dtype)
+            latents[:, :, 0:1, :, :] = (
+                alpha * cond + (1 - alpha) * latents[:, :, 0:1, :, :]
+            )
+        return {"latents": latents}
+    return callback_fn
+
+
 # Defaults
 DEFAULT_COMPILED_MODELS_DIR = "/opt/dlami/nvme/compile_workdir_v3_cp"
 HUGGINGFACE_CACHE_DIR = "/opt/dlami/nvme/wan2.2_ti2v_hf_cache_dir"
@@ -392,6 +465,33 @@ def main(args):
         )
         print("post_quant_conv (V1) loaded.")
 
+    # Load Encoder and quant_conv for I2V (optional, only if --image is provided)
+    if args.image:
+        encoder_v3_path = f"{compiled_models_dir}/encoder_v3"
+        qc_v3_path = f"{compiled_models_dir}/quant_conv_v3"
+
+        if os.path.exists(encoder_v3_path):
+            print("\nLoading encoder (V3 - bfloat16, trace)...")
+            vae_encoder_wrapper = EncoderWrapperV3(pipe.vae.encoder)
+            vae_encoder_wrapper.model = torch.jit.load(
+                os.path.join(encoder_v3_path, "model.pt")
+            )
+            pipe.vae.encoder = vae_encoder_wrapper
+            print("Encoder (V3) loaded.")
+        else:
+            print("\nEncoder V3 not found, using CPU encoder for I2V.")
+
+        if os.path.exists(qc_v3_path):
+            print("\nLoading quant_conv (V3 - trace)...")
+            vae_quant_conv_wrapper = QuantConvWrapperV3(pipe.vae.quant_conv)
+            vae_quant_conv_wrapper.model = torch.jit.load(
+                os.path.join(qc_v3_path, "model.pt")
+            )
+            pipe.vae.quant_conv = vae_quant_conv_wrapper
+            print("quant_conv (V3) loaded.")
+        else:
+            print("\nquant_conv V3 not found, using CPU quant_conv for I2V.")
+
     # Replace pipeline components
     pipe.text_encoder = text_encoder_wrapper
     pipe.transformer = transformer_wrapper
@@ -401,7 +501,24 @@ def main(args):
     prompt = args.prompt
     negative_prompt = args.negative_prompt
 
-    # Warmup
+    # Prepare I2V latents if image is provided
+    i2v_latents = None
+    i2v_callback = None
+    if args.image:
+        print(f"\nEncoding input image: {args.image}")
+        i2v_generator = torch.Generator().manual_seed(SEED)
+        encode_start = time.time()
+        i2v_latents, image_condition = prepare_image_latents(
+            pipe, args.image, args.num_frames, args.height, args.width,
+            torch.device('cpu'), dtype=torch.float32,
+            generator=i2v_generator
+        )
+        encode_time = time.time() - encode_start
+        print(f"Encode time: {encode_time:.2f}s")
+        print(f"I2V latents: {i2v_latents.shape}")
+        i2v_callback = create_i2v_callback(image_condition, args.num_inference_steps)
+
+    # Warmup (without I2V latents, matching reference)
     print("\nStarting warmup inference...")
     start = time.time()
     output_warmup = pipe(
@@ -413,7 +530,7 @@ def main(args):
         guidance_scale=5.0,
         num_inference_steps=args.num_inference_steps,
         max_sequence_length=seqlen,
-        generator=torch.Generator().manual_seed(SEED + 1000)
+        generator=torch.Generator().manual_seed(SEED + 1000),
     ).frames[0]
     end = time.time()
     print(f"Warmup time: {end - start:.2f}s")
@@ -424,7 +541,7 @@ def main(args):
     # Main inference
     print("\nStarting main inference...")
     start = time.time()
-    output = pipe(
+    main_kwargs = dict(
         prompt=prompt,
         negative_prompt=negative_prompt,
         height=args.height,
@@ -433,13 +550,19 @@ def main(args):
         guidance_scale=5.0,
         num_inference_steps=args.num_inference_steps,
         max_sequence_length=seqlen,
-        generator=generator
-    ).frames[0]
+        generator=generator,
+    )
+    if i2v_latents is not None:
+        main_kwargs["latents"] = i2v_latents
+        main_kwargs["callback_on_step_end"] = i2v_callback
+        main_kwargs["callback_on_step_end_tensor_inputs"] = ["latents"]
+    output = pipe(**main_kwargs).frames[0]
     end = time.time()
 
     inference_time = end - start
     per_step_time = inference_time / args.num_inference_steps
-    print(f"\nInference time: {inference_time:.2f}s")
+    mode = "I2V" if args.image else "T2V"
+    print(f"\n{mode} inference time: {inference_time:.2f}s")
     print(f"Per step: {per_step_time:.3f}s")
     print(f"Output frames: {len(output)}")
 
@@ -463,6 +586,7 @@ if __name__ == "__main__":
     parser.add_argument("--negative_prompt", type=str,
                         default="Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards",
                         help="Negative prompt")
+    parser.add_argument("--image", type=str, default=None, help="Input image for I2V (omit for T2V)")
     parser.add_argument("--output", type=str, default="output_v3_cp.mp4", help="Output video path")
     parser.add_argument("--force_v1_decoder", action="store_true", help="Force use V1 decoder (faster)")
     args = parser.parse_args()

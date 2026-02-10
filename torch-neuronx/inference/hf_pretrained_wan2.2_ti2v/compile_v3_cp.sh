@@ -88,16 +88,26 @@ python neuron_wan2_2_ti2v/compile_decoder_v3.py \
     --tp_degree ${TP_DEGREE} \
     --world_size ${WORLD_SIZE}
 
+# Note: VAE Encoder is NOT compiled to Neuron due to a Neuron compiler bug
+# (NCC_IBIR158) in the Conv3D tensorizer at 256x256 spatial resolution.
+# Wan2.2's encoder uses WanCausalConv3d (3D convolutions), unlike Qwen's Conv2D encoder.
+# For I2V mode, the encoder runs on CPU (runs once per video, negligible overhead).
+# The run scripts automatically fall back to CPU when encoder_v3/ is not found.
+
 echo ""
 echo "=============================================="
 echo "Compilation Complete!"
 echo "=============================================="
 echo "Models saved to: ${COMPILED_MODELS_DIR}"
 echo ""
-echo "To run inference:"
-echo "  NEURON_RT_NUM_CORES=8 python run_wan2.2_ti2v_v3_cp.py \\"
+echo "To run T2V inference:"
+echo "  python run_wan2.2_ti2v_v3_cp.py \\"
 echo "    --compiled_models_dir ${COMPILED_MODELS_DIR} \\"
 echo "    --prompt 'A cat walks on the grass, realistic'"
 echo ""
-echo "  (Use --force_v1_decoder to fall back to V1 decoder if needed)"
+echo "To run I2V inference:"
+echo "  python run_wan2.2_ti2v_v3_cp.py \\"
+echo "    --compiled_models_dir ${COMPILED_MODELS_DIR} \\"
+echo "    --image input.png \\"
+echo "    --prompt 'A cat walks on the grass, realistic'"
 echo "=============================================="

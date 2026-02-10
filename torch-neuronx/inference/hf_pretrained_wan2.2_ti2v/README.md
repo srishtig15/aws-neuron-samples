@@ -1,6 +1,6 @@
 # Wan2.2 Text/Image-to-Video Inference on AWS Trainium2
 
-This project implements [Wan2.2-TI2V-5B](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B-Diffusers) video generation on AWS Trainium2 (trn2.48xlarge) using the AWS Neuron SDK. It generates 512x512, 81-frame (3.4s @ 24fps) videos from text prompts.
+This project implements [Wan2.2-TI2V-5B](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B-Diffusers) video generation on AWS Trainium2 (trn2.48xlarge) using the AWS Neuron SDK. It generates 512x512, 81-frame (3.4s @ 24fps) videos from text prompts or input images.
 
 ## Quick Start (Recommended: V3 CP)
 
@@ -11,29 +11,37 @@ source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
 # Install dependencies
 pip install -r requirements.txt
 
-# Compile all models (text encoder, transformer, decoder)
+# Compile all models (text encoder, transformer, decoder, encoder)
 ./compile_v3_cp.sh
 
-# Run inference
+# Text-to-Video (T2V)
 python run_wan2.2_ti2v_v3_cp.py \
     --compiled_models_dir /opt/dlami/nvme/compiled_models_v3_cp \
+    --prompt "A cat walks on the grass, realistic"
+
+# Image-to-Video (I2V)
+python run_wan2.2_ti2v_v3_cp.py \
+    --compiled_models_dir /opt/dlami/nvme/compiled_models_v3_cp \
+    --image input.png \
     --prompt "A cat walks on the grass, realistic"
 ```
 
 ## Architecture Overview
 
-The Wan2.2 pipeline has 4 main components, each compiled separately for Neuron:
+The Wan2.2 pipeline has 5 main components, each compiled separately for Neuron:
 
 ```
-Text Prompt
-    |
-    v
-[Text Encoder]  UMT5 encoder, Tensor Parallel (TP=4)
-    |
-    v
+Text Prompt                Input Image (I2V only)
+    |                           |
+    v                           v
+[Text Encoder]            [VAE Encoder]    bfloat16, patchify → encode
+  UMT5, TP=4                   |
+    |                     [quant_conv]     float32
+    |                           |
+    v                           v
 [Transformer]   DiT-based diffusion, 50 denoising steps
     |            TP=4, Context Parallel (CP=2), world_size=8
-    v
+    v            (I2V: frame 0 = image latent, frames 1-N = noise)
 [post_quant_conv]  3D convolution, float32
     |
     v
@@ -146,7 +154,24 @@ traced_decoder = decoder_builder.compile(
 )
 ```
 
-### 5. Temporal Chunked Decoding
+### 5. VAE Encoder V3 (Image-to-Video)
+
+For I2V mode, the input image is encoded into latent space using the VAE encoder + quant_conv:
+
+- **Encoder**: bfloat16, `--model-type=unet-inference` (Conv3D-heavy like the decoder)
+- **quant_conv**: float32 (cheap, runs once, benefits from precision)
+- Compiled WITHOUT `feat_cache` since I2V only encodes a single image
+- Input is patchified (patch_size=2): `(1, 12, 2, 256, 256)` for 512x512
+- Compiled with 2 temporal frames to avoid causal conv edge cases (1-frame input is padded)
+
+The `EncoderWrapperV3` handles:
+- Frame padding: 1 input frame → 2 frames for the compiled model
+- dtype conversion: float32 → bfloat16 → float32
+- Ignoring `feat_cache`/`feat_idx` arguments from the `_encode()` loop
+
+Implementation: `neuron_wan2_2_ti2v/compile_encoder_v3.py`
+
+### 6. Temporal Chunked Decoding
 
 The VAE decoder processes latent frames in chunks of 2 (CACHE_T=2) with causal temporal caching (`feat_cache`). For 81 frames (21 latent frames):
 - Call 1: First frame (with `first_chunk=True`)
@@ -164,6 +189,7 @@ This is implemented in the custom `autoencoder_kl_wan.py` which replaces the dif
 | `compile_transformer_v3_flash.py` | V3 Flash transformer (TP=8, NKI Flash Attention) |
 | `compile_text_encoder_v2.py` | Text encoder (ModelBuilder API) |
 | `compile_decoder_v3.py` | VAE decoder (bfloat16, `--model-type=unet-inference`) |
+| `compile_encoder_v3.py` | VAE encoder + quant_conv (for I2V) |
 | `cache_hf_model.py` | Download and cache HuggingFace model |
 
 ### Runtime
@@ -178,7 +204,7 @@ This is implemented in the custom `autoencoder_kl_wan.py` which replaces the dif
 
 | File | Description |
 |------|-------------|
-| `neuron_commons.py` | Runtime wrappers: `DecoderWrapper` (V1), `DecoderWrapperV2`, `DecoderWrapperV3`, attention utilities |
+| `neuron_commons.py` | Runtime wrappers: `DecoderWrapperV3`, `EncoderWrapperV3`, `QuantConvWrapperV3`, attention utilities |
 | `neuron_commons_v2.py` | `InferenceTextEncoderWrapperV2` for NxDModel text encoder |
 | `neuron_parallel_utils.py` | Tensor parallel utilities for UMT5 sharding |
 | `distributed_rmsnorm.py` | Distributed RMSNorm (reference, not used in V3 due to compiler bug) |
@@ -193,22 +219,32 @@ This is implemented in the custom `autoencoder_kl_wan.py` which replaces the dif
 
 ## Inference Options
 
+### Text-to-Video (T2V)
+
 ```bash
 python run_wan2.2_ti2v_v3_cp.py \
     --compiled_models_dir /opt/dlami/nvme/compiled_models_v3_cp \
     --prompt "A cat walks on the grass, realistic" \
     --negative_prompt "blurred, low quality, static" \
-    --height 512 \
-    --width 512 \
-    --num_frames 81 \
-    --num_inference_steps 50 \
-    --max_sequence_length 512 \
     --output output.mp4
 ```
+
+### Image-to-Video (I2V)
+
+```bash
+python run_wan2.2_ti2v_v3_cp.py \
+    --compiled_models_dir /opt/dlami/nvme/compiled_models_v3_cp \
+    --image input.png \
+    --prompt "A cat walks on the grass, realistic" \
+    --output output_i2v.mp4
+```
+
+The I2V pipeline encodes the input image into the first latent frame, then generates the remaining frames via diffusion. The encoder and quant_conv must be compiled (included in `compile_v3_cp.sh` Step 5). If not compiled, the encoder falls back to CPU.
 
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--compiled_models_dir` | `/opt/dlami/nvme/compiled_models_v3_cp` | Compiled model directory |
+| `--image` | None | Input image for I2V (omit for T2V) |
 | `--height` | 512 | Video height |
 | `--width` | 512 | Video width |
 | `--num_frames` | 81 | Number of frames (81 = 3.4s @ 24fps) |
