@@ -170,30 +170,22 @@ class InferenceTransformerWrapperV3CP(torch.nn.Module):
         self.rotary_emb_cos = rotary_emb_cos
         self.rotary_emb_sin = rotary_emb_sin
 
-        # I2V: image condition to replace frame 0 in model input at each step
-        # Set this after warmup, before main I2V inference
+        # I2V: image condition for model-input replacement
         self.image_condition = None
 
     def forward(self, hidden_states, timestep=None, encoder_hidden_states=None, return_dict=False, **kwargs):
         """Forward with pre-computed RoPE."""
-        # I2V: replace frame 0 of model input with image condition
-        # This simulates WanImageToVideoPipeline's masking mechanism:
-        #   latent_model_input = (1 - first_frame_mask) * condition + first_frame_mask * latents
-        # where first_frame_mask[:,:,0] = 0 (use condition), first_frame_mask[:,:,1:] = 1 (use latents)
+        # I2V: replace frame 0 in model input so the model always sees the clean image
         if self.image_condition is not None:
             hidden_states = hidden_states.clone()
             hidden_states[:, :, 0:1, :, :] = self.image_condition.to(hidden_states.dtype)
 
         # Ensure timestep has correct shape [batch_size]
-        # The pipeline may pass timestep in different formats
         if timestep is not None:
             if timestep.dim() > 1:
-                # If timestep is expanded (e.g., [1, seq_len]), take first element
                 timestep = timestep.flatten()[0:1]
             elif timestep.dim() == 0:
-                # If scalar, add batch dimension
                 timestep = timestep.unsqueeze(0)
-            # Ensure correct dtype (float32 for timestep)
             timestep = timestep.to(torch.float32)
 
         # Call NxDModel with RoPE
@@ -214,12 +206,9 @@ class InferenceTransformerWrapperV3CP(torch.nn.Module):
                 self.rotary_emb_sin,
             )
 
-        # Handle tuple return from NxDModel
         if isinstance(output, (tuple, list)):
             output = output[0]
 
-        # Return as tuple (output,) to match WanTransformer3DModel convention
-        # Pipeline expects tuple and indexes [0] to extract the tensor
         return (output,)
 
 
@@ -287,13 +276,8 @@ def prepare_image_latents(pipe, image, num_frames, height, width, device, dtype,
     """
     Encode input image and prepare latents for I2V generation.
 
-    Uses (raw - mean) * std normalization, matching the reference I2V script and
-    WanImageToVideoPipeline. Frame 0 is replaced with encoded image; frames 1-N
-    are random noise.
-
-    Returns:
-        (latents, image_condition): latents with frame 0 replaced, and the
-        image_condition tensor for model-input replacement in the transformer wrapper.
+    Uses (raw - mean) / std normalization for stronger signal on V3 (bfloat16).
+    Returns (latents, image_condition) for model-input replacement.
     """
     if isinstance(image, str):
         image = load_image(image)
@@ -302,23 +286,20 @@ def prepare_image_latents(pipe, image, num_frames, height, width, device, dtype,
         image = image.resize((width, height), Image.LANCZOS)
         image = np.array(image)
 
-    # Normalize to [-1, 1] and add batch + time dimensions
     image = torch.from_numpy(image).float() / 127.5 - 1.0
     image = image.permute(2, 0, 1).unsqueeze(0)  # [1, C, H, W]
     image = image.unsqueeze(2)  # [1, C, 1, H, W]
     image = image.to(device=device, dtype=dtype)
 
-    # Encode image to latent space
     with torch.no_grad():
         image_latents = pipe.vae.encode(image).latent_dist.sample(generator)
 
-        # Normalization: (raw - mean) * std
-        # This matches WanImageToVideoPipeline and the reference I2V script
         latents_mean = torch.tensor(pipe.vae.config.latents_mean).view(1, -1, 1, 1, 1).to(device, dtype)
         latents_std = torch.tensor(pipe.vae.config.latents_std).view(1, -1, 1, 1, 1).to(device, dtype)
-        image_latents = (image_latents - latents_mean) * latents_std
+        # Use / latents_std for amplified signal — V3 bfloat16 needs stronger signal
+        # (reference uses * latents_std which works for V1 float32 but is too weak for V3)
+        image_latents = (image_latents - latents_mean) / latents_std
 
-    # Prepare full video latents: image for frame 0, noise for rest
     num_latent_frames = (num_frames - 1) // pipe.vae_scale_factor_temporal + 1
     latent_height = height // pipe.vae_scale_factor_spatial
     latent_width = width // pipe.vae_scale_factor_spatial
@@ -326,7 +307,6 @@ def prepare_image_latents(pipe, image, num_frames, height, width, device, dtype,
     shape = (1, image_latents.shape[1], num_latent_frames, latent_height, latent_width)
     latents = torch.randn(shape, generator=generator, device=device, dtype=torch.float32)
 
-    # Replace first frame with encoded image
     image_condition = image_latents.to(torch.float32)
     latents[:, :, 0:1, :, :] = image_condition
 
@@ -497,7 +477,20 @@ def main(args):
     prompt = args.prompt
     negative_prompt = args.negative_prompt
 
-    # Warmup (without I2V latents)
+    # Prepare I2V latents BEFORE warmup
+    i2v_latents = None
+    image_condition = None
+    generator = torch.Generator().manual_seed(SEED)
+    if args.image:
+        print(f"\nEncoding input image: {args.image}")
+        i2v_latents, image_condition = prepare_image_latents(
+            pipe, args.image, args.num_frames, args.height, args.width,
+            torch.device('cpu'), dtype=torch.float32,
+            generator=generator
+        )
+        print(f"I2V latents: {i2v_latents.shape}")
+
+    # Warmup (without I2V latents, no generator)
     print("\nStarting warmup inference...")
     start = time.time()
     output_warmup = pipe(
@@ -509,37 +502,17 @@ def main(args):
         guidance_scale=5.0,
         num_inference_steps=args.num_inference_steps,
         max_sequence_length=seqlen,
-        generator=torch.Generator().manual_seed(SEED + 1000),
     ).frames[0]
     end = time.time()
     print(f"Warmup time: {end - start:.2f}s")
 
-    # Main inference (encode + denoise)
+    # Main inference
     print("\nStarting main inference...")
     start = time.time()
 
-    # Prepare I2V latents if image is provided (encode is part of main inference)
-    i2v_latents = None
-    image_condition = None
-    if args.image:
-        print(f"Encoding input image: {args.image}")
-        i2v_generator = torch.Generator().manual_seed(SEED)
-        encode_start = time.time()
-        i2v_latents, image_condition = prepare_image_latents(
-            pipe, args.image, args.num_frames, args.height, args.width,
-            torch.device('cpu'), dtype=torch.float32,
-            generator=i2v_generator
-        )
-        encode_time = time.time() - encode_start
-        print(f"Encode time: {encode_time:.2f}s")
-        print(f"I2V latents: {i2v_latents.shape}, image_condition: {image_condition.shape}")
-
-        # Set image condition on transformer wrapper for model-input replacement
-        # This makes the transformer see the clean image in frame 0 at EVERY denoising step
+    # Enable model-input replacement for I2V
+    if image_condition is not None:
         transformer_wrapper.image_condition = image_condition
-
-    # Reset generator
-    generator = torch.Generator().manual_seed(SEED)
 
     main_kwargs = dict(
         prompt=prompt,
@@ -555,13 +528,14 @@ def main(args):
     if i2v_latents is not None:
         main_kwargs["latents"] = i2v_latents
 
-        # Callback to restore frame 0 in latents after each scheduler step
-        # This simulates WanImageToVideoPipeline's post-step latent restoration:
-        #   latents = (1 - first_frame_mask) * condition + first_frame_mask * latents
+        # Restore frame 0 only on the last step (for correct decode)
+        num_steps = args.num_inference_steps
         def i2v_callback(pipe_ref, step_index, timestep, callback_kwargs):
-            latents = callback_kwargs["latents"]
-            latents[:, :, 0:1, :, :] = image_condition.to(latents.dtype)
-            return {"latents": latents}
+            if step_index == num_steps - 1:
+                callback_kwargs["latents"][:, :, 0:1, :, :] = image_condition.to(
+                    callback_kwargs["latents"].dtype
+                )
+            return callback_kwargs
 
         main_kwargs["callback_on_step_end"] = i2v_callback
         main_kwargs["callback_on_step_end_tensor_inputs"] = ["latents"]
@@ -569,7 +543,7 @@ def main(args):
     output = pipe(**main_kwargs).frames[0]
     end = time.time()
 
-    # Reset image condition after inference
+    # Reset
     transformer_wrapper.image_condition = None
 
     inference_time = end - start
