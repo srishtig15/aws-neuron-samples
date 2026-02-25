@@ -199,6 +199,7 @@ class NeuronTextEncoderWrapper(nn.Module):
         super().__init__()
         self.config = original_text_encoder.config
         self.dtype = torch.bfloat16
+        self._device = torch.device('cpu')
 
         # Copy embed_tokens weights
         orig_embed = original_text_encoder.model.language_model.embed_tokens
@@ -242,6 +243,11 @@ class NeuronTextEncoderWrapper(nn.Module):
         # Special token IDs
         self.image_token_id = getattr(self.config, 'image_token_id', 151655)
         self.vision_start_token_id = getattr(self.config, 'vision_start_token_id', 151652)
+
+    @property
+    def device(self):
+        """Return device for pipeline compatibility."""
+        return self._device
 
     def _get_rope_index(self, input_ids, image_grid_thw, attention_mask):
         """Calculate 3D position_ids for M-RoPE (Multimodal RoPE)."""

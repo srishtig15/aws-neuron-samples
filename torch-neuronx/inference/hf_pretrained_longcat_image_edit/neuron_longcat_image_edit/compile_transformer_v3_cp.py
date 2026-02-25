@@ -638,9 +638,18 @@ def compile_transformer_v3_cp(args):
         print("Sharding weights...")
         shard_checkpoint(checkpoint=checkpoint, model=model, serialize_path=weights_path)
 
-        # Post-process
+        # Post-process: clean up + fix proj_out interleaved weight sharding
+        # shard_checkpoint() uses standard contiguous column sharding for RowParallel,
+        # but proj_out in single-stream blocks needs non-contiguous interleaved columns
+        # because the per-rank input is [attn_shard, mlp_shard] not contiguous columns.
         print("\nPost-processing sharded checkpoints...")
         from safetensors.torch import load_file, save_file
+
+        # Get proj_out dimensions from original model
+        attn_dim = pipe.transformer.config.num_attention_heads * head_dim  # 24 * 128 = 3072
+        num_single_blocks = len(neuron_transformer.single_transformer_blocks)
+        mlp_dim = pipe.transformer.single_transformer_blocks[0].mlp_hidden_dim  # 12288
+
         for rank in range(tp_degree):
             shard_file = os.path.join(weights_path, f"tp{rank}_sharded_checkpoint.safetensors")
             if not os.path.exists(shard_file):
@@ -650,6 +659,25 @@ def compile_transformer_v3_cp(args):
             cleaned = {k: v for k, v in shard_data.items() if 'master_weight' not in k}
             if global_rank_state:
                 cleaned.update(global_rank_state)
+
+            # Fix proj_out weights for all single-stream blocks
+            attn_per_rank = attn_dim // tp_degree
+            mlp_per_rank = mlp_dim // tp_degree
+            for block_idx in range(num_single_blocks):
+                w_key = f"transformer.single_transformer_blocks.{block_idx}.proj_out.weight"
+                if w_key in cleaned:
+                    # Get original unsharded weight
+                    orig_key = f"single_transformer_blocks.{block_idx}.proj_out.weight"
+                    orig_w = unsharded_state[orig_key]
+                    # Extract correct non-contiguous columns for this rank
+                    attn_start = rank * attn_per_rank
+                    attn_end = (rank + 1) * attn_per_rank
+                    mlp_start = attn_dim + rank * mlp_per_rank
+                    mlp_end = attn_dim + (rank + 1) * mlp_per_rank
+                    w_attn = orig_w[:, attn_start:attn_end]
+                    w_mlp = orig_w[:, mlp_start:mlp_end]
+                    cleaned[w_key] = torch.cat([w_attn, w_mlp], dim=1).to(torch.bfloat16)
+
             save_file(cleaned, shard_file)
             print(f"  tp{rank}: {original_count} -> {len(cleaned)} tensors")
 

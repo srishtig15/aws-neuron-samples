@@ -138,6 +138,12 @@ def shard_flux_single_block(tp_degree, block):
     - proj_out: [15360 -> 3072] combined output (3072 attn + 12288 mlp = 15360)
       With TP=4: input is (768 attn + 3072 mlp = 3840) per rank
 
+    CRITICAL: proj_out weight columns must be reordered to match the per-rank
+    input layout [attn_shard, mlp_shard], NOT contiguous column slicing.
+    The original weight layout is [attn_full(3072), mlp_full(12288)] = 15360.
+    But each rank's input is [attn_shard(768), mlp_shard(3072)] = 3840.
+    Standard RowParallel takes contiguous columns which MISALIGNS with this input.
+
     LongCat: 24 heads, head_dim=128
     """
     attn = block.attn
@@ -164,9 +170,56 @@ def shard_flux_single_block(tp_degree, block):
     # proj_out takes concatenated [attn_output, mlp_output] where each is sharded
     # Input: (3072/tp + 12288/tp) = (768 + 3072) = 3840 per rank with TP=4
     if hasattr(block, 'proj_out'):
-        block.proj_out = shard_linear_row(block.proj_out)
+        block.proj_out = shard_proj_out_interleaved(block.proj_out, orig_num_heads * 128, block.mlp_hidden_dim, tp_degree)
 
     return block
+
+
+def shard_proj_out_interleaved(orig_linear, attn_dim, mlp_dim, tp_degree, dtype=torch.bfloat16):
+    """
+    Shard proj_out for single-stream blocks with correct column reordering.
+
+    The input to proj_out is [attn_output(per_rank), mlp_output(per_rank)]
+    concatenated. But attn and mlp are sharded independently, so the per-rank
+    columns are non-contiguous in the original weight.
+
+    For rank r:
+      attn_cols = [r * attn_per_rank : (r+1) * attn_per_rank]
+      mlp_cols  = [attn_dim + r * mlp_per_rank : attn_dim + (r+1) * mlp_per_rank]
+      weight_shard = orig_weight[:, attn_cols ++ mlp_cols]
+    """
+    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    tp_size = parallel_state.get_tensor_model_parallel_size()
+
+    attn_per_rank = attn_dim // tp_size
+    mlp_per_rank = mlp_dim // tp_size
+    input_per_rank = attn_per_rank + mlp_per_rank
+
+    # Create RowParallelLinear with correct input size
+    new_linear = RowParallelLinear(
+        orig_linear.in_features,
+        orig_linear.out_features,
+        bias=(orig_linear.bias is not None),
+        input_is_parallel=True,
+        dtype=dtype,
+    )
+
+    # Extract correct non-contiguous weight columns for this rank
+    attn_start = tp_rank * attn_per_rank
+    attn_end = (tp_rank + 1) * attn_per_rank
+    mlp_start = attn_dim + tp_rank * mlp_per_rank
+    mlp_end = attn_dim + (tp_rank + 1) * mlp_per_rank
+
+    w_attn = orig_linear.weight.data[:, attn_start:attn_end]  # [out, attn_per_rank]
+    w_mlp = orig_linear.weight.data[:, mlp_start:mlp_end]     # [out, mlp_per_rank]
+    w_reordered = torch.cat([w_attn, w_mlp], dim=1)           # [out, input_per_rank]
+
+    new_linear.weight.data = w_reordered.to(dtype)
+
+    if orig_linear.bias is not None:
+        new_linear.bias.data = orig_linear.bias.data.detach().to(dtype)
+
+    return new_linear
 
 
 def shard_feedforward(ff):

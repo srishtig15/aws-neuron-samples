@@ -24,7 +24,8 @@ import os
 # ============================================================================
 # CRITICAL: Set Neuron environment variables BEFORE any other imports
 # ============================================================================
-TP_DEGREE = 8  # For V3 CP: world_size=8 (TP=4, CP=2)
+# TP_DEGREE controls NxD world size. Use 4 for TP-only, 8 for TP+CP.
+TP_DEGREE = int(os.environ.get("LONGCAT_WORLD_SIZE", "4"))
 
 os.environ["LOCAL_WORLD_SIZE"] = str(TP_DEGREE)
 os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "2"
@@ -48,6 +49,16 @@ from PIL import Image
 
 from diffusers import LongCatImageEditPipeline
 from diffusers.utils import load_image
+
+# Patch xm.mark_step() to no-op: the diffusers pipeline calls it inside the
+# denoising loop, which attempts to synchronize ALL 64 NeuronCores on the
+# machine. Since we only use a subset (e.g. 4 or 8), this hangs.
+# The NxDModel handles its own synchronization internally.
+try:
+    import torch_xla.core.xla_model as xm
+    xm.mark_step = lambda *args, **kwargs: None
+except ImportError:
+    pass
 
 from neuron_longcat_image_edit.neuron_commons import NeuronTextEncoderWrapper
 
@@ -78,76 +89,142 @@ class NeuronTransformerWrapperV3CP(torch.nn.Module):
     Wrapper for V3 CP compiled LongCat FLUX transformer on Trainium2.
 
     Handles:
+    - Computing RoPE at runtime from pipeline-provided position IDs
     - Padding hidden_states to expected_img_seq
     - Padding encoder_hidden_states to expected_txt_seq
-    - Passing pre-computed RoPE (cos, sin)
     - Extracting target image patches from output
     """
     def __init__(self, original_transformer, nxd_model,
-                 img_rotary_cos, img_rotary_sin,
-                 txt_rotary_cos, txt_rotary_sin,
-                 expected_img_patches=2048, expected_txt_seq=512,
-                 target_patches=1024, batch_size=1):
+                 pos_embed, patch_h, patch_w,
+                 expected_img_patches=8192, expected_txt_seq=512,
+                 target_patches=4096, batch_size=1):
         super().__init__()
         self.config = original_transformer.config
         self.dtype = original_transformer.dtype
         self.device = original_transformer.device
         self.nxd_model = nxd_model
 
-        self.img_rotary_cos = img_rotary_cos
-        self.img_rotary_sin = img_rotary_sin
-        self.txt_rotary_cos = txt_rotary_cos
-        self.txt_rotary_sin = txt_rotary_sin
+        # Keep pos_embed for runtime RoPE computation from pipeline position IDs
+        self.pos_embed = pos_embed
+        self.patch_h = patch_h
+        self.patch_w = patch_w
 
         self.expected_img_patches = expected_img_patches
         self.expected_txt_seq = expected_txt_seq
         self.target_patches = target_patches
         self.compiled_batch_size = batch_size
 
+        # Cache RoPE keyed by (txt_len, img_len)
+        self._rope_cache = {}
+
     @contextlib.contextmanager
     def cache_context(self, name: str):
         yield
 
+    def _compute_rope_from_ids(self, txt_ids, img_ids):
+        """Compute RoPE from pipeline-provided position IDs."""
+        actual_txt = txt_ids.shape[0]
+        actual_img = img_ids.shape[0]
+        cache_key = (actual_txt, actual_img)
+
+        if cache_key in self._rope_cache:
+            return self._rope_cache[cache_key]
+
+        # Pad txt_ids to expected_txt_seq
+        if actual_txt < self.expected_txt_seq:
+            pad_len = self.expected_txt_seq - actual_txt
+            pad_ids = torch.zeros(pad_len, 3, dtype=txt_ids.dtype, device=txt_ids.device)
+            last_row = txt_ids[-1, 1].item() if actual_txt > 0 else 0
+            for i in range(pad_len):
+                pad_ids[i, 0] = 0  # modality = text
+                pad_ids[i, 1] = last_row + 1 + i
+                pad_ids[i, 2] = last_row + 1 + i
+            txt_ids_padded = torch.cat([txt_ids, pad_ids], dim=0)
+        else:
+            txt_ids_padded = txt_ids[:self.expected_txt_seq]
+
+        # Pad img_ids to expected_img_patches
+        if actual_img < self.expected_img_patches:
+            pad_n = self.expected_img_patches - actual_img
+            img_ids_padded = torch.cat(
+                [img_ids, img_ids[-1:].expand(pad_n, -1)], dim=0)
+        else:
+            img_ids_padded = img_ids[:self.expected_img_patches]
+
+        with torch.no_grad():
+            txt_cos, txt_sin = self.pos_embed(txt_ids_padded)
+            img_cos, img_sin = self.pos_embed(img_ids_padded)
+
+        rope = (
+            txt_cos.to(torch.bfloat16),
+            txt_sin.to(torch.bfloat16),
+            img_cos.to(torch.bfloat16),
+            img_sin.to(torch.bfloat16),
+        )
+        self._rope_cache[cache_key] = rope
+        return rope
+
+    def _compute_rope_fallback(self, actual_txt_len):
+        """Fallback RoPE computation when txt_ids/img_ids not provided."""
+        cache_key = ("fallback", actual_txt_len)
+        if cache_key in self._rope_cache:
+            return self._rope_cache[cache_key]
+
+        from diffusers.pipelines.longcat_image.pipeline_longcat_image_edit import prepare_pos_ids
+
+        text_ids = prepare_pos_ids(
+            modality_id=0, type="text", num_token=self.expected_txt_seq)
+        target_ids = prepare_pos_ids(
+            modality_id=1, type="image",
+            start=(actual_txt_len, actual_txt_len),
+            height=self.patch_h, width=self.patch_w)
+        source_ids = prepare_pos_ids(
+            modality_id=2, type="image",
+            start=(actual_txt_len, actual_txt_len),
+            height=self.patch_h, width=self.patch_w)
+        img_ids = torch.cat([target_ids, source_ids], dim=0)
+
+        return self._compute_rope_from_ids(text_ids, img_ids)
+
     def forward(self, hidden_states, encoder_hidden_states=None,
-                timestep=None, return_dict=False, **kwargs):
+                timestep=None, txt_ids=None, img_ids=None,
+                return_dict=False, **kwargs):
         """
         Forward pass using compiled V3 CP transformer.
 
         hidden_states: [B, img_patches, 64] -- packed latents for target+source
         encoder_hidden_states: [B, txt_seq, 3584] -- text embeddings
         timestep: [B] -- denoising timestep
+        txt_ids: [txt_seq, 3] -- text position IDs from pipeline
+        img_ids: [img_seq, 3] -- image position IDs from pipeline
         """
         batch_size = hidden_states.shape[0]
+        actual_txt_len = encoder_hidden_states.shape[1]
 
-        if not hasattr(self, '_debug_printed'):
-            print(f"DEBUG V3 CP Transformer:")
-            print(f"  hidden_states: {hidden_states.shape}")
-            print(f"  encoder_hidden_states: {encoder_hidden_states.shape}")
-            print(f"  expected: img={self.expected_img_patches}, txt={self.expected_txt_seq}")
-            print(f"  target_patches: {self.target_patches}")
-            self._debug_printed = True
+        # Compute RoPE from pipeline-provided position IDs
+        if txt_ids is not None and img_ids is not None:
+            txt_cos, txt_sin, img_cos, img_sin = self._compute_rope_from_ids(txt_ids, img_ids)
+        else:
+            txt_cos, txt_sin, img_cos, img_sin = self._compute_rope_fallback(actual_txt_len)
 
         # Pad hidden_states (image patches)
         actual_img = hidden_states.shape[1]
-        if actual_img != self.expected_img_patches:
-            if actual_img < self.expected_img_patches:
-                pad = torch.zeros(
-                    (batch_size, self.expected_img_patches - actual_img, hidden_states.shape[2]),
-                    dtype=hidden_states.dtype, device=hidden_states.device)
-                hidden_states = torch.cat([hidden_states, pad], dim=1)
-            else:
-                hidden_states = hidden_states[:, :self.expected_img_patches, :]
+        if actual_img < self.expected_img_patches:
+            pad = torch.zeros(
+                (batch_size, self.expected_img_patches - actual_img, hidden_states.shape[2]),
+                dtype=hidden_states.dtype, device=hidden_states.device)
+            hidden_states = torch.cat([hidden_states, pad], dim=1)
+        elif actual_img > self.expected_img_patches:
+            hidden_states = hidden_states[:, :self.expected_img_patches, :]
 
         # Pad encoder_hidden_states (text)
-        actual_txt = encoder_hidden_states.shape[1]
-        if actual_txt != self.expected_txt_seq:
-            if actual_txt < self.expected_txt_seq:
-                pad = torch.zeros(
-                    (batch_size, self.expected_txt_seq - actual_txt, encoder_hidden_states.shape[2]),
-                    dtype=encoder_hidden_states.dtype, device=encoder_hidden_states.device)
-                encoder_hidden_states = torch.cat([encoder_hidden_states, pad], dim=1)
-            else:
-                encoder_hidden_states = encoder_hidden_states[:, :self.expected_txt_seq, :]
+        if actual_txt_len < self.expected_txt_seq:
+            pad = torch.zeros(
+                (batch_size, self.expected_txt_seq - actual_txt_len, encoder_hidden_states.shape[2]),
+                dtype=encoder_hidden_states.dtype, device=encoder_hidden_states.device)
+            encoder_hidden_states = torch.cat([encoder_hidden_states, pad], dim=1)
+        elif actual_txt_len > self.expected_txt_seq:
+            encoder_hidden_states = encoder_hidden_states[:, :self.expected_txt_seq, :]
 
         # Batch padding
         if batch_size < self.compiled_batch_size:
@@ -174,10 +251,10 @@ class NeuronTransformerWrapperV3CP(torch.nn.Module):
             hidden_states,
             encoder_hidden_states,
             timestep,
-            self.img_rotary_cos,
-            self.img_rotary_sin,
-            self.txt_rotary_cos,
-            self.txt_rotary_sin,
+            img_cos,
+            img_sin,
+            txt_cos,
+            txt_sin,
         )
 
         if isinstance(output, tuple):
@@ -198,75 +275,94 @@ class NeuronTransformerWrapperV3CP(torch.nn.Module):
         return (output_tensor,)
 
 
-class _AttrDict(dict):
-    """Dict that also supports attribute access."""
-    def __getattr__(self, name):
-        try:
-            return self[name]
-        except KeyError:
-            raise AttributeError(name)
+class SimpleLatentDistribution:
+    """Minimal latent distribution matching DiagonalGaussianDistribution interface."""
+    def __init__(self, mean):
+        self.mean = mean
+
+    def mode(self):
+        return self.mean
+
+    def sample(self, generator=None):
+        return self.mean  # Deterministic for compiled models
+
+
+class SimpleEncoderOutput:
+    """Minimal encoder output matching AutoencoderKLOutput interface."""
+    def __init__(self, latent_dist):
+        self.latent_dist = latent_dist
 
 
 class NeuronVAEWrapper:
     """
-    Wrapper for compiled 2D AutoencoderKL.
+    Wrapper for compiled 2D AutoencoderKL matching the pipeline interface.
 
-    Handles tiled encode/decode for images larger than compiled tile size.
+    IMPORTANT: Scaling (shift_factor, scaling_factor) is handled by the PIPELINE,
+    NOT by this wrapper. The pipeline applies:
+      encode: latents = (latents - shift_factor) * scaling_factor
+      decode: latents = latents / scaling_factor + shift_factor
+
+    This wrapper provides:
+    - encode(x) -> returns object with .latent_dist.mode()/.sample()
+    - decode(z, return_dict=False) -> returns (decoded_tensor,)
+    - .config -> original VAE config (attribute-accessible)
+    - Tiled processing for images larger than compiled tile size
     """
-    def __init__(self, compiled_encoder, compiled_decoder, vae_config,
-                 scaling_factor=0.3611, shift_factor=0.1159,
-                 original_vae_config=None):
+    def __init__(self, compiled_encoder, compiled_decoder, original_vae,
+                 tile_h=512, tile_w=512):
         self.compiled_encoder = compiled_encoder
         self.compiled_decoder = compiled_decoder
-        # Use original VAE config if provided, otherwise wrap dict for attribute access
-        if original_vae_config is not None:
-            self.config = original_vae_config
-        else:
-            self.config = _AttrDict(vae_config)
-        self.scaling_factor = scaling_factor
-        self.shift_factor = shift_factor
-        self.tile_h = vae_config.get("height", 512)
-        self.tile_w = vae_config.get("width", 512)
-        self.latent_channels = vae_config.get("latent_channels", 16)
-        self.dtype = torch.bfloat16
+        # Keep original VAE config for pipeline attribute access
+        self.config = original_vae.config
+        self.dtype = original_vae.dtype
+        self.device = original_vae.device
+        self.tile_h = tile_h
+        self.tile_w = tile_w
 
-    def encode(self, x):
-        """Encode image to latent space with tiled processing."""
+    def encode(self, x, return_dict=True):
+        """
+        Encode image to latent space with tiled processing.
+
+        Returns AutoencoderKLOutput-compatible object.
+        Pipeline calls: retrieve_latents(self.vae.encode(image))
+        which calls .latent_dist.mode() or .latent_dist.sample()
+        """
         B, C, H, W = x.shape
 
         if H <= self.tile_h and W <= self.tile_w:
             moments = self.compiled_encoder(x)
-            mean, logvar = torch.chunk(moments, 2, dim=1)
-            latents = mean  # Use mean for deterministic encoding
         else:
-            latents = self._tiled_encode(x)
+            moments = self._tiled_encode(x)
 
-        # Scale latents
-        latents = (latents - self.shift_factor) * self.scaling_factor
-        # Return object compatible with retrieve_latents (only .latents, not .latent_dist)
-        return _AttrDict(latents=latents)
+        mean, logvar = torch.chunk(moments, 2, dim=1)
+        dist = SimpleLatentDistribution(mean)
 
-    def decode(self, z, return_dict=False, **kwargs):
-        """Decode latents to image with tiled processing."""
-        # Unscale latents
-        z = z / self.scaling_factor + self.shift_factor
+        if not return_dict:
+            return (dist,)
+        return SimpleEncoderOutput(dist)
 
+    def decode(self, z, return_dict=False):
+        """
+        Decode latents to image with tiled processing.
+
+        Pipeline calls: self.vae.decode(latents, return_dict=False)[0]
+        """
         latent_h = z.shape[2]
         latent_w = z.shape[3]
         tile_latent_h = self.tile_h // 8
         tile_latent_w = self.tile_w // 8
 
         if latent_h <= tile_latent_h and latent_w <= tile_latent_w:
-            result = self.compiled_decoder(z)
+            decoded = self.compiled_decoder(z)
         else:
-            result = self._tiled_decode(z)
+            decoded = self._tiled_decode(z)
 
         if return_dict:
-            return _AttrDict(sample=result)
-        return (result,)
+            return type('DecoderOutput', (), {'sample': decoded})()
+        return (decoded,)
 
     def _tiled_encode(self, x):
-        """Tiled encoding for large images (no overlap, exact grid)."""
+        """Tiled encoding for large images."""
         B, C, H, W = x.shape
         tile_h, tile_w = self.tile_h, self.tile_w
 
@@ -278,24 +374,23 @@ class NeuronVAEWrapper:
                 x_end = min(x_start + tile_w, W)
                 tile = x[:, :, y:y_end, x_start:x_end]
 
-                # Pad to tile size if needed
-                actual_h, actual_w = tile.shape[2], tile.shape[3]
-                if actual_h < tile_h or actual_w < tile_w:
+                if tile.shape[2] < tile_h or tile.shape[3] < tile_w:
                     padded = torch.zeros(B, C, tile_h, tile_w, dtype=tile.dtype, device=tile.device)
-                    padded[:, :, :actual_h, :actual_w] = tile
+                    padded[:, :, :tile.shape[2], :tile.shape[3]] = tile
                     tile = padded
 
                 moments = self.compiled_encoder(tile)
                 mean, logvar = torch.chunk(moments, 2, dim=1)
-                # Only keep the portion corresponding to actual input (not padding)
-                row_tiles.append(mean[:, :, :(actual_h // 8), :(actual_w // 8)])
+                row_tiles.append(mean[:, :, :((y_end - y) // 8), :((x_end - x_start) // 8)])
             latent_tiles.append(row_tiles)
 
         rows = [torch.cat(row, dim=3) for row in latent_tiles]
-        return torch.cat(rows, dim=2)
+        full_mean = torch.cat(rows, dim=2)
+        full_logvar = torch.zeros_like(full_mean)
+        return torch.cat([full_mean, full_logvar], dim=1)
 
     def _tiled_decode(self, z):
-        """Tiled decoding for large latents (no overlap, exact grid)."""
+        """Tiled decoding for large latents."""
         B, C, H, W = z.shape
         tile_h = self.tile_h // 8
         tile_w = self.tile_w // 8
@@ -308,15 +403,14 @@ class NeuronVAEWrapper:
                 x_end = min(x_start + tile_w, W)
                 tile = z[:, :, y:y_end, x_start:x_end]
 
-                actual_h, actual_w = tile.shape[2], tile.shape[3]
-                if actual_h < tile_h or actual_w < tile_w:
+                if tile.shape[2] < tile_h or tile.shape[3] < tile_w:
                     padded = torch.zeros(B, C, tile_h, tile_w, dtype=tile.dtype, device=tile.device)
-                    padded[:, :, :actual_h, :actual_w] = tile
+                    padded[:, :, :tile.shape[2], :tile.shape[3]] = tile
                     tile = padded
 
                 decoded = self.compiled_decoder(tile)
-                pixel_h = actual_h * 8
-                pixel_w = actual_w * 8
+                pixel_h = (y_end - y) * 8
+                pixel_w = (x_end - x_start) * 8
                 row_tiles.append(decoded[:, :, :pixel_h, :pixel_w])
             pixel_tiles.append(row_tiles)
 
@@ -329,11 +423,10 @@ def load_transformer_v3_cp(compiled_models_dir, pipe, args):
     v3_path = f"{compiled_models_dir}/transformer_v3_cp"
     nxd_model_path = f"{v3_path}/nxd_model.pt"
     weights_path = f"{v3_path}/weights"
-    rope_cache_path = f"{v3_path}/rope_cache.pt"
     config_path = f"{v3_path}/config.json"
 
     for p, name in [(nxd_model_path, "model"), (weights_path, "weights"),
-                     (rope_cache_path, "RoPE cache"), (config_path, "config")]:
+                     (config_path, "config")]:
         if not os.path.exists(p):
             raise FileNotFoundError(f"V3 CP {name} not found at {p}")
 
@@ -344,51 +437,49 @@ def load_transformer_v3_cp(compiled_models_dir, pipe, args):
     expected_txt_seq = config["text_seq_len"]
     target_patches = config["num_img_patches"] // 2  # Only target image patches
     compiled_batch_size = config.get("batch_size", 1)
+    patch_h = config["patch_h"]
+    patch_w = config["patch_w"]
 
     print(f"  V3 CP config: img_patches={expected_img_patches}, txt_seq={expected_txt_seq}")
     print(f"  Target patches: {target_patches}, batch_size={compiled_batch_size}")
-
-    # Load RoPE
-    rope_cache = torch.load(rope_cache_path)
-    img_rotary_cos = rope_cache["img_rotary_cos"].to(torch.bfloat16)
-    img_rotary_sin = rope_cache["img_rotary_sin"].to(torch.bfloat16)
-    txt_rotary_cos = rope_cache["txt_rotary_cos"].to(torch.bfloat16)
-    txt_rotary_sin = rope_cache["txt_rotary_sin"].to(torch.bfloat16)
+    print(f"  Patch grid: {patch_h}x{patch_w}")
 
     # Load NxDModel
     print(f"  Loading V3 CP model...")
     nxd_model = NxDModel.load(nxd_model_path)
 
-    # Load sharded weights - need world_size checkpoints (TP*DP replicas)
+    # Load sharded weights
+    # NxDModel expects one checkpoint per world_rank.
+    # For CP: ranks within the same TP group share weights.
     from safetensors.torch import load_file
     tp_degree = config.get("tp_degree", 4)
     world_size = config.get("world_size", 8)
+
     tp_checkpoints = []
     for rank in range(tp_degree):
         ckpt_path = f"{weights_path}/tp{rank}_sharded_checkpoint.safetensors"
         ckpt = load_file(ckpt_path)
         tp_checkpoints.append(ckpt)
+        print(f"    Loaded tp{rank}: {len(ckpt)} tensors")
 
-    # Duplicate for DP replicas: world_size=8, tp=4 means 2 DP groups
-    # Ranks [0,1,2,3] and [4,5,6,7] have identical weights
+    # Duplicate for all world ranks (CP ranks share TP weights)
     sharded_checkpoints = []
-    dp_size = world_size // tp_degree
-    for dp_rank in range(dp_size):
-        for tp_rank in range(tp_degree):
-            sharded_checkpoints.append(tp_checkpoints[tp_rank])
-    print(f"  Providing {len(sharded_checkpoints)} checkpoints for world_size={world_size}")
+    for world_rank in range(world_size):
+        tp_rank = world_rank % tp_degree
+        sharded_checkpoints.append(tp_checkpoints[tp_rank])
+    print(f"  Prepared {len(sharded_checkpoints)} weight shards for world_size={world_size}")
 
     nxd_model.set_weights(sharded_checkpoints)
+    print("  Weights set, loading to Neuron...")
     nxd_model.to_neuron()
     print("  V3 CP model initialized on Neuron!")
 
     wrapper = NeuronTransformerWrapperV3CP(
         original_transformer=pipe.transformer,
         nxd_model=nxd_model,
-        img_rotary_cos=img_rotary_cos,
-        img_rotary_sin=img_rotary_sin,
-        txt_rotary_cos=txt_rotary_cos,
-        txt_rotary_sin=txt_rotary_sin,
+        pos_embed=pipe.transformer.pos_embed,
+        patch_h=patch_h,
+        patch_w=patch_w,
         expected_img_patches=expected_img_patches,
         expected_txt_seq=expected_txt_seq,
         target_patches=target_patches,
@@ -481,8 +572,12 @@ def load_text_encoder_v3(compiled_models_dir, pipe, args):
     return wrapper
 
 
-def load_vae(compiled_models_dir, pipe):
-    """Load compiled VAE."""
+def load_vae(compiled_models_dir, pipe, use_compiled=True):
+    """Load compiled VAE or use original CPU VAE."""
+    if not use_compiled:
+        print("  Using original CPU VAE (compiled VAE skipped)")
+        return pipe.vae
+
     encoder_path = f"{compiled_models_dir}/vae_encoder/model.pt"
     decoder_path = f"{compiled_models_dir}/vae_decoder/model.pt"
     config_path = f"{compiled_models_dir}/vae_config.json"
@@ -494,17 +589,19 @@ def load_vae(compiled_models_dir, pipe):
     with open(config_path) as f:
         vae_config = json.load(f)
 
-    print(f"  Loading compiled VAE (tile: {vae_config['height']}x{vae_config['width']})")
+    tile_h = vae_config.get("height", 512)
+    tile_w = vae_config.get("width", 512)
+    print(f"  Loading compiled VAE (tile: {tile_h}x{tile_w})")
+
     compiled_encoder = torch.jit.load(encoder_path)
     compiled_decoder = torch.jit.load(decoder_path)
 
     wrapper = NeuronVAEWrapper(
         compiled_encoder=compiled_encoder,
         compiled_decoder=compiled_decoder,
-        vae_config=vae_config,
-        scaling_factor=vae_config.get("scaling_factor", 0.3611),
-        shift_factor=vae_config.get("shift_factor", 0.1159),
-        original_vae_config=pipe.vae.config,
+        original_vae=pipe.vae,
+        tile_h=tile_h,
+        tile_w=tile_w,
     )
     return wrapper
 
@@ -518,12 +615,16 @@ def main():
     parser.add_argument("--height", type=int, default=1024, help="Output height")
     parser.add_argument("--width", type=int, default=1024, help="Output width")
     parser.add_argument("--num_inference_steps", type=int, default=50, help="Denoising steps")
-    parser.add_argument("--guidance_scale", type=float, default=1.0, help="CFG scale")
-    parser.add_argument("--true_cfg_scale", type=float, default=4.0, help="True CFG scale")
+    parser.add_argument("--guidance_scale", type=float, default=4.5, help="Guidance scale")
     parser.add_argument("--seed", type=int, default=SEED, help="Random seed")
     parser.add_argument("--image_size", type=int, default=448, help="Vision encoder image size")
     parser.add_argument("--warmup", action="store_true", help="Run warmup inference")
+    parser.add_argument("--skip_compiled_vae", action="store_true", help="Use CPU VAE instead of compiled")
+    parser.add_argument("--skip_compiled_text_encoder", action="store_true",
+                        help="Use CPU text encoder instead of compiled")
     parser.add_argument("--compiled_models_dir", type=str, default=COMPILED_MODELS_DIR)
+    parser.add_argument("--transformer_dir", type=str, default=None,
+                        help="Override transformer compiled dir (default: <compiled_models_dir>)")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -541,28 +642,26 @@ def main():
     print("\n[Step 2/4] Loading compiled Neuron models...")
 
     # Transformer
-    print("Loading V3 CP transformer...")
-    neuron_transformer = load_transformer_v3_cp(args.compiled_models_dir, pipe, args)
+    transformer_dir = args.transformer_dir or args.compiled_models_dir
+    print(f"Loading V3 CP transformer from {transformer_dir}...")
+    neuron_transformer = load_transformer_v3_cp(transformer_dir, pipe, args)
 
     # Text encoder
-    print("Loading text encoder...")
-    neuron_text_encoder = load_text_encoder_v3(args.compiled_models_dir, pipe, args)
+    if args.skip_compiled_text_encoder:
+        print("Using original CPU text encoder (compiled text encoder skipped)")
+        neuron_text_encoder = pipe.text_encoder
+    else:
+        print("Loading text encoder...")
+        neuron_text_encoder = load_text_encoder_v3(args.compiled_models_dir, pipe, args)
 
     # VAE
     print("Loading VAE...")
-    neuron_vae = load_vae(args.compiled_models_dir, pipe)
+    neuron_vae = load_vae(args.compiled_models_dir, pipe, use_compiled=not args.skip_compiled_vae)
 
     # Replace pipeline components
     pipe.transformer = neuron_transformer
     pipe.text_encoder = neuron_text_encoder
-    if not isinstance(neuron_vae, NeuronVAEWrapper):
-        pass  # Keep original VAE if not compiled
-    else:
-        pipe.vae = neuron_vae
-
-    # Monkey-patch device properties to return CPU (our Neuron wrappers handle device internally)
-    type(pipe)._execution_device = property(lambda self: torch.device("cpu"))
-    type(pipe).device = property(lambda self: torch.device("cpu"))
+    pipe.vae = neuron_vae
 
     # Delete original weights to save memory
     import gc
