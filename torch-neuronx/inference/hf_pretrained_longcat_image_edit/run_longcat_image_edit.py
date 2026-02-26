@@ -62,7 +62,7 @@ except ImportError:
 
 from neuron_longcat_image_edit.neuron_commons import NeuronTextEncoderWrapper
 
-# Import NxDModel for V3 API loading
+# Import NxDModel for NxDModel API loading
 try:
     from neuronx_distributed.trace.nxd_model.nxd_model import NxDModel
     NXD_MODEL_AVAILABLE = True
@@ -84,19 +84,19 @@ def set_seed(seed: int):
     print(f"Random seed set to: {seed}")
 
 
-class NeuronTransformerWrapperV3CP(torch.nn.Module):
+class NeuronTransformerWrapper(torch.nn.Module):
     """
-    Wrapper for V3 CP compiled LongCat FLUX transformer on Trainium2.
+    Wrapper for Compiled compiled LongCat FLUX transformer on Trainium2.
 
     Handles:
-    - Computing RoPE at runtime from pipeline-provided position IDs
+    - Accepting txt_ids/img_ids from pipeline for RoPE computation
     - Padding hidden_states to expected_img_seq
     - Padding encoder_hidden_states to expected_txt_seq
     - Extracting target image patches from output
     """
     def __init__(self, original_transformer, nxd_model,
                  pos_embed, patch_h, patch_w,
-                 expected_img_patches=8192, expected_txt_seq=512,
+                 expected_img_patches=8192, expected_txt_seq=1024,
                  target_patches=4096, batch_size=1):
         super().__init__()
         self.config = original_transformer.config
@@ -104,7 +104,7 @@ class NeuronTransformerWrapperV3CP(torch.nn.Module):
         self.device = original_transformer.device
         self.nxd_model = nxd_model
 
-        # Keep pos_embed for runtime RoPE computation from pipeline position IDs
+        # Keep pos_embed for RoPE computation from pipeline-provided position IDs
         self.pos_embed = pos_embed
         self.patch_h = patch_h
         self.patch_w = patch_w
@@ -114,7 +114,7 @@ class NeuronTransformerWrapperV3CP(torch.nn.Module):
         self.target_patches = target_patches
         self.compiled_batch_size = batch_size
 
-        # Cache RoPE keyed by (txt_len, img_len)
+        # Cache RoPE keyed by (txt_len, img_len) to avoid recomputing
         self._rope_cache = {}
 
     @contextlib.contextmanager
@@ -122,7 +122,16 @@ class NeuronTransformerWrapperV3CP(torch.nn.Module):
         yield
 
     def _compute_rope_from_ids(self, txt_ids, img_ids):
-        """Compute RoPE from pipeline-provided position IDs."""
+        """
+        Compute RoPE from pipeline-provided position IDs.
+
+        Args:
+            txt_ids: [txt_seq, 3] text position IDs (modality, row, col)
+            img_ids: [img_seq, 3] image position IDs (modality, row, col)
+
+        Returns:
+            (txt_cos, txt_sin, img_cos, img_sin) padded to compiled sizes
+        """
         actual_txt = txt_ids.shape[0]
         actual_img = img_ids.shape[0]
         cache_key = (actual_txt, actual_img)
@@ -132,6 +141,7 @@ class NeuronTransformerWrapperV3CP(torch.nn.Module):
 
         # Pad txt_ids to expected_txt_seq
         if actual_txt < self.expected_txt_seq:
+            # Pad with continuing text positions (modality=0, incrementing row/col)
             pad_len = self.expected_txt_seq - actual_txt
             pad_ids = torch.zeros(pad_len, 3, dtype=txt_ids.dtype, device=txt_ids.device)
             last_row = txt_ids[-1, 1].item() if actual_txt > 0 else 0
@@ -190,18 +200,18 @@ class NeuronTransformerWrapperV3CP(torch.nn.Module):
                 timestep=None, txt_ids=None, img_ids=None,
                 return_dict=False, **kwargs):
         """
-        Forward pass using compiled V3 CP transformer.
+        Forward pass using compiled Compiled transformer.
 
         hidden_states: [B, img_patches, 64] -- packed latents for target+source
         encoder_hidden_states: [B, txt_seq, 3584] -- text embeddings
         timestep: [B] -- denoising timestep
-        txt_ids: [txt_seq, 3] -- text position IDs from pipeline
-        img_ids: [img_seq, 3] -- image position IDs from pipeline
+        txt_ids: [txt_seq, 3] -- text position IDs from pipeline (optional)
+        img_ids: [img_seq, 3] -- image position IDs from pipeline (optional)
         """
         batch_size = hidden_states.shape[0]
         actual_txt_len = encoder_hidden_states.shape[1]
 
-        # Compute RoPE from pipeline-provided position IDs
+        # Compute RoPE from pipeline-provided position IDs or fallback
         if txt_ids is not None and img_ids is not None:
             txt_cos, txt_sin, img_cos, img_sin = self._compute_rope_from_ids(txt_ids, img_ids)
         else:
@@ -246,7 +256,7 @@ class NeuronTransformerWrapperV3CP(torch.nn.Module):
 
         timestep = timestep.to(torch.float32)
 
-        # Run V3 CP model
+        # Run Compiled model
         output = self.nxd_model(
             hidden_states,
             encoder_hidden_states,
@@ -313,6 +323,7 @@ class NeuronVAEWrapper:
         self.compiled_encoder = compiled_encoder
         self.compiled_decoder = compiled_decoder
         # Keep original VAE config for pipeline attribute access
+        # (e.g., self.vae.config.scaling_factor, self.vae.config.shift_factor)
         self.config = original_vae.config
         self.dtype = original_vae.dtype
         self.device = original_vae.device
@@ -362,7 +373,7 @@ class NeuronVAEWrapper:
         return (decoded,)
 
     def _tiled_encode(self, x):
-        """Tiled encoding for large images."""
+        """Tiled encoding for large images (no overlap to ensure exact output size)."""
         B, C, H, W = x.shape
         tile_h, tile_w = self.tile_h, self.tile_w
 
@@ -374,6 +385,7 @@ class NeuronVAEWrapper:
                 x_end = min(x_start + tile_w, W)
                 tile = x[:, :, y:y_end, x_start:x_end]
 
+                # Pad to tile size if needed
                 if tile.shape[2] < tile_h or tile.shape[3] < tile_w:
                     padded = torch.zeros(B, C, tile_h, tile_w, dtype=tile.dtype, device=tile.device)
                     padded[:, :, :tile.shape[2], :tile.shape[3]] = tile
@@ -381,7 +393,10 @@ class NeuronVAEWrapper:
 
                 moments = self.compiled_encoder(tile)
                 mean, logvar = torch.chunk(moments, 2, dim=1)
-                row_tiles.append(mean[:, :, :((y_end - y) // 8), :((x_end - x_start) // 8)])
+                # Trim to actual latent size (in case of padding)
+                latent_h = (y_end - y) // 8
+                latent_w = (x_end - x_start) // 8
+                row_tiles.append(mean[:, :, :latent_h, :latent_w])
             latent_tiles.append(row_tiles)
 
         rows = [torch.cat(row, dim=3) for row in latent_tiles]
@@ -390,7 +405,7 @@ class NeuronVAEWrapper:
         return torch.cat([full_mean, full_logvar], dim=1)
 
     def _tiled_decode(self, z):
-        """Tiled decoding for large latents."""
+        """Tiled decoding for large latents (no overlap to ensure exact output size)."""
         B, C, H, W = z.shape
         tile_h = self.tile_h // 8
         tile_w = self.tile_w // 8
@@ -418,17 +433,18 @@ class NeuronVAEWrapper:
         return torch.cat(rows, dim=2)
 
 
-def load_transformer_v3_cp(compiled_models_dir, pipe, args):
-    """Load V3 CP compiled transformer model."""
-    v3_path = f"{compiled_models_dir}/transformer_v3_cp"
-    nxd_model_path = f"{v3_path}/nxd_model.pt"
-    weights_path = f"{v3_path}/weights"
-    config_path = f"{v3_path}/config.json"
+def load_transformer(compiled_models_dir, pipe, args):
+    """Load compiled transformer model."""
+    model_path = f"{compiled_models_dir}/transformer"
+    nxd_model_path = f"{model_path}/nxd_model.pt"
+    weights_path = f"{model_path}/weights"
+    rope_cache_path = f"{model_path}/rope_cache.pt"
+    config_path = f"{model_path}/config.json"
 
     for p, name in [(nxd_model_path, "model"), (weights_path, "weights"),
-                     (config_path, "config")]:
+                     (rope_cache_path, "RoPE cache"), (config_path, "config")]:
         if not os.path.exists(p):
-            raise FileNotFoundError(f"V3 CP {name} not found at {p}")
+            raise FileNotFoundError(f"Compiled {name} not found at {p}")
 
     with open(config_path, "r") as f:
         config = json.load(f)
@@ -440,21 +456,23 @@ def load_transformer_v3_cp(compiled_models_dir, pipe, args):
     patch_h = config["patch_h"]
     patch_w = config["patch_w"]
 
-    print(f"  V3 CP config: img_patches={expected_img_patches}, txt_seq={expected_txt_seq}")
+    print(f"  Compiled config: img_patches={expected_img_patches}, txt_seq={expected_txt_seq}")
     print(f"  Target patches: {target_patches}, batch_size={compiled_batch_size}")
     print(f"  Patch grid: {patch_h}x{patch_w}")
 
     # Load NxDModel
-    print(f"  Loading V3 CP model...")
+    print(f"  Loading Compiled model...")
     nxd_model = NxDModel.load(nxd_model_path)
 
     # Load sharded weights
     # NxDModel expects one checkpoint per world_rank.
     # For CP: ranks within the same TP group share weights.
+    # Layout: ranks [0..tp-1] = TP group 0 (CP=0), ranks [tp..2*tp-1] = TP group 1 (CP=1)
     from safetensors.torch import load_file
     tp_degree = config.get("tp_degree", 4)
     world_size = config.get("world_size", 8)
 
+    # Load base TP checkpoints
     tp_checkpoints = []
     for rank in range(tp_degree):
         ckpt_path = f"{weights_path}/tp{rank}_sharded_checkpoint.safetensors"
@@ -463,18 +481,27 @@ def load_transformer_v3_cp(compiled_models_dir, pipe, args):
         print(f"    Loaded tp{rank}: {len(ckpt)} tensors")
 
     # Duplicate for all world ranks (CP ranks share TP weights)
+    # CRITICAL: Each world rank must have the correct global_rank.rank value
+    # for SPMDRank to work. Without this, all ranks think they are rank 0
+    # and the CP scatter always takes the first half of the sequence.
+    import copy
     sharded_checkpoints = []
     for world_rank in range(world_size):
         tp_rank = world_rank % tp_degree
-        sharded_checkpoints.append(tp_checkpoints[tp_rank])
+        ckpt_copy = dict(tp_checkpoints[tp_rank])  # shallow copy
+        # Set the correct world rank for SPMDRank
+        rank_key = "transformer.global_rank.rank"
+        if rank_key in ckpt_copy:
+            ckpt_copy[rank_key] = torch.tensor([world_rank], dtype=torch.int32)
+        sharded_checkpoints.append(ckpt_copy)
     print(f"  Prepared {len(sharded_checkpoints)} weight shards for world_size={world_size}")
 
     nxd_model.set_weights(sharded_checkpoints)
     print("  Weights set, loading to Neuron...")
     nxd_model.to_neuron()
-    print("  V3 CP model initialized on Neuron!")
+    print("  Compiled model initialized on Neuron!")
 
-    wrapper = NeuronTransformerWrapperV3CP(
+    wrapper = NeuronTransformerWrapper(
         original_transformer=pipe.transformer,
         nxd_model=nxd_model,
         pos_embed=pipe.transformer.pos_embed,
@@ -488,41 +515,43 @@ def load_transformer_v3_cp(compiled_models_dir, pipe, args):
     return wrapper
 
 
-def load_text_encoder_v3(compiled_models_dir, pipe, args):
-    """Load V3 compiled text encoder (vision encoder + language model)."""
+def load_text_encoder(compiled_models_dir, pipe, args, use_cpu_ve=False):
+    """Load compiled text encoder (vision encoder + language model)."""
     # Load vision encoder
-    ve_path = f"{compiled_models_dir}/vision_encoder_v3"
+    ve_path = f"{compiled_models_dir}/vision_encoder"
     ve_model_path = f"{ve_path}/nxd_model.pt"
 
     compiled_ve = None
-    if os.path.exists(ve_model_path):
+    cpu_ve = None
+    if use_cpu_ve:
+        print("  Using CPU vision encoder (for accuracy)")
+        cpu_ve = pipe.text_encoder.model.visual
+    elif os.path.exists(ve_model_path):
         from safetensors.torch import load_file
         with open(f"{ve_path}/config.json") as f:
             ve_config = json.load(f)
 
-        print("  Loading V3 vision encoder...")
+        print("  Loading compiled vision encoder...")
         ve_nxd = NxDModel.load(ve_model_path)
         tp_degree = ve_config.get("tp_degree", 4)
-        world_size = ve_config.get("world_size", 8)
+        ve_world_size = ve_config.get("world_size", ve_nxd.world_size)
         ve_tp_checkpoints = []
         for rank in range(tp_degree):
             ckpt = load_file(f"{ve_path}/weights/tp{rank}_sharded_checkpoint.safetensors")
             ve_tp_checkpoints.append(ckpt)
-        # Duplicate for DP replicas
-        ve_checkpoints = []
-        dp_size = world_size // tp_degree
-        for dp_rank in range(dp_size):
-            for tp_rank in range(tp_degree):
-                ve_checkpoints.append(ve_tp_checkpoints[tp_rank])
+        # Duplicate for all world ranks (CP ranks share TP weights)
+        ve_checkpoints = [ve_tp_checkpoints[r % tp_degree] for r in range(ve_world_size)]
+        print(f"  VE: {tp_degree} TP checkpoints -> {len(ve_checkpoints)} world ranks")
         ve_nxd.set_weights(ve_checkpoints)
         ve_nxd.to_neuron()
         compiled_ve = ve_nxd
-        print("  V3 vision encoder loaded!")
+        print("  compiled vision encoder loaded!")
     else:
-        print("  WARNING: V3 vision encoder not found, will use CPU")
+        print("  WARNING: compiled vision encoder not found, using CPU vision encoder")
+        cpu_ve = pipe.text_encoder.model.visual
 
     # Load language model
-    lm_path = f"{compiled_models_dir}/language_model_v3"
+    lm_path = f"{compiled_models_dir}/language_model"
     lm_model_path = f"{lm_path}/nxd_model.pt"
 
     compiled_lm = None
@@ -533,28 +562,25 @@ def load_text_encoder_v3(compiled_models_dir, pipe, args):
         with open(f"{lm_path}/config.json") as f:
             lm_config = json.load(f)
 
-        print("  Loading V3 language model...")
+        print("  Loading compiled language model...")
         lm_nxd = NxDModel.load(lm_model_path)
         tp_degree = lm_config.get("tp_degree", 4)
-        world_size = lm_config.get("world_size", 8)
+        lm_world_size = lm_config.get("world_size", lm_nxd.world_size)
         lm_tp_checkpoints = []
         for rank in range(tp_degree):
             ckpt = load_file(f"{lm_path}/weights/tp{rank}_sharded_checkpoint.safetensors")
             lm_tp_checkpoints.append(ckpt)
-        # Duplicate for DP replicas
-        lm_checkpoints = []
-        dp_size = world_size // tp_degree
-        for dp_rank in range(dp_size):
-            for tp_rank in range(tp_degree):
-                lm_checkpoints.append(lm_tp_checkpoints[tp_rank])
+        # Duplicate for all world ranks (CP ranks share TP weights)
+        lm_checkpoints = [lm_tp_checkpoints[r % tp_degree] for r in range(lm_world_size)]
+        print(f"  LM: {tp_degree} TP checkpoints -> {len(lm_checkpoints)} world ranks")
         lm_nxd.set_weights(lm_checkpoints)
         lm_nxd.to_neuron()
         compiled_lm = lm_nxd
         max_seq_len = lm_config.get("max_sequence_length", 512)
         lm_batch_size = lm_config.get("batch_size", 1)
-        print("  V3 language model loaded!")
+        print("  compiled language model loaded!")
     else:
-        print("  V3 language model not found, using CPU fallback")
+        print("  compiled language model not found, using CPU fallback")
         cpu_lm = pipe.text_encoder.model.language_model
         max_seq_len = 512
         lm_batch_size = 1
@@ -562,9 +588,10 @@ def load_text_encoder_v3(compiled_models_dir, pipe, args):
     # Create wrapper
     wrapper = NeuronTextEncoderWrapper(
         original_text_encoder=pipe.text_encoder,
-        compiled_vision_encoder_v3=compiled_ve,
-        compiled_language_model_v3=compiled_lm,
+        compiled_vision_encoder=compiled_ve,
+        compiled_language_model=compiled_lm,
         cpu_language_model=cpu_lm,
+        cpu_vision_encoder=cpu_ve,
         image_size=args.image_size,
         max_seq_len=max_seq_len,
         language_model_batch_size=lm_batch_size,
@@ -622,6 +649,8 @@ def main():
     parser.add_argument("--skip_compiled_vae", action="store_true", help="Use CPU VAE instead of compiled")
     parser.add_argument("--skip_compiled_text_encoder", action="store_true",
                         help="Use CPU text encoder instead of compiled")
+    parser.add_argument("--cpu_vision_encoder", action="store_true",
+                        help="Use CPU vision encoder for accuracy (Neuron LM still used)")
     parser.add_argument("--compiled_models_dir", type=str, default=COMPILED_MODELS_DIR)
     parser.add_argument("--transformer_dir", type=str, default=None,
                         help="Override transformer compiled dir (default: <compiled_models_dir>)")
@@ -638,13 +667,24 @@ def main():
     pipe = LongCatImageEditPipeline.from_pretrained(MODEL_ID, **load_kwargs)
     print(f"  Pipeline loaded in {time.perf_counter() - t0:.1f}s")
 
+    # Configure image processor
+    # When using CPU VE, use default resolution (matching HuggingFace/H100 behavior)
+    # When using compiled VE, force fixed resolution to match compiled model
+    if not getattr(args, "cpu_vision_encoder", False):
+        target_pixels = args.image_size * args.image_size
+        print(f"  Configuring image processor: min_pixels=max_pixels={target_pixels} (compiled VE)")
+        pipe.image_processor_vl.min_pixels = target_pixels
+        pipe.image_processor_vl.max_pixels = target_pixels
+    else:
+        print(f"  Using default image processor resolution (CPU VE, matching HuggingFace defaults)")
+
     # Load compiled components
     print("\n[Step 2/4] Loading compiled Neuron models...")
 
     # Transformer
     transformer_dir = args.transformer_dir or args.compiled_models_dir
-    print(f"Loading V3 CP transformer from {transformer_dir}...")
-    neuron_transformer = load_transformer_v3_cp(transformer_dir, pipe, args)
+    print(f"Loading Compiled transformer from {transformer_dir}...")
+    neuron_transformer = load_transformer(transformer_dir, pipe, args)
 
     # Text encoder
     if args.skip_compiled_text_encoder:
@@ -652,7 +692,7 @@ def main():
         neuron_text_encoder = pipe.text_encoder
     else:
         print("Loading text encoder...")
-        neuron_text_encoder = load_text_encoder_v3(args.compiled_models_dir, pipe, args)
+        neuron_text_encoder = load_text_encoder(args.compiled_models_dir, pipe, args, use_cpu_ve=getattr(args, "cpu_vision_encoder", False))
 
     # VAE
     print("Loading VAE...")

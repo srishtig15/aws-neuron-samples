@@ -1,5 +1,5 @@
 """
-Vision Encoder Compilation using ModelBuilder API (V3) for TP=4 Acceleration.
+Vision Encoder Compilation using ModelBuilder API for TP=4 Acceleration.
 
 Compiles the Qwen2.5-VL Vision Encoder (shared between Qwen-Image-Edit and
 LongCat-Image-Edit) using ModelBuilder API with tp_degree=4 and world_size=8.
@@ -8,9 +8,10 @@ Key features:
 - Float32 precision for accuracy (required for vision encoder)
 - Vision encoder hidden_size=1280, QKV=3840, MLP intermediate=3420
 - TP=4 works: 3840/4=960, 3420/4=855 (both divisible)
+- Uses native F.scaled_dot_product_attention (no monkey-patch needed)
 
 Usage:
-    neuron_parallel_compile python compile_vision_encoder_v3.py --image_size 448
+    python compile_vision_encoder.py --image_size 448
 """
 
 import os
@@ -69,7 +70,7 @@ def upcast_norms_to_f32(module):
             upcast_norms_to_f32(child)
 
 
-class NeuronVisionEncoderV3(nn.Module):
+class NeuronVisionEncoder(nn.Module):
     """Neuron-optimized Qwen2.5-VL Vision Encoder with TP=4, float32."""
 
     def __init__(self, original_visual, tp_degree):
@@ -104,7 +105,7 @@ class TracingWrapper(nn.Module):
         return self.vision_encoder(pixel_values, grid_thw)
 
 
-def compile_vision_encoder_v3(args):
+def compile_vision_encoder(args):
     tp_degree = 4
     world_size = 8
     image_size = args.image_size
@@ -118,7 +119,7 @@ def compile_vision_encoder_v3(args):
     channels_per_patch = 3 * temporal_patch_size * patch_size * patch_size  # 1176
 
     print("=" * 60)
-    print("Compiling Vision Encoder V3 (TP=4, float32)")
+    print("Compiling Vision Encoder (TP=4, float32)")
     print("=" * 60)
     print(f"  Image: {image_size}x{image_size}, Patches: {num_patches}")
 
@@ -133,7 +134,7 @@ def compile_vision_encoder_v3(args):
         unsharded_state = original_visual.state_dict()
 
         print(f"\nCreating Neuron vision encoder (TP={tp_degree})...")
-        neuron_ve = NeuronVisionEncoderV3(original_visual, tp_degree)
+        neuron_ve = NeuronVisionEncoder(original_visual, tp_degree)
         neuron_ve = neuron_ve.to(torch.float32)
         neuron_ve.eval()
 
@@ -155,7 +156,7 @@ def compile_vision_encoder_v3(args):
             compiler_workdir=args.compiler_workdir,
         )
 
-        output_path = f"{args.compiled_models_dir}/vision_encoder_v3"
+        output_path = f"{args.compiled_models_dir}/vision_encoder"
         os.makedirs(output_path, exist_ok=True)
         traced_model.save(os.path.join(output_path, "nxd_model.pt"))
 
@@ -172,7 +173,7 @@ def compile_vision_encoder_v3(args):
 
         shard_checkpoint(checkpoint=checkpoint, model=model, serialize_path=weights_path)
 
-        # Post-process
+        # Post-process: add inv_freq buffers and clean up master_weight keys
         from safetensors.torch import load_file, save_file
         inv_freq_buffers = {}
         for name, buf in neuron_ve.visual.named_buffers():
@@ -203,7 +204,7 @@ def compile_vision_encoder_v3(args):
         with open(os.path.join(output_path, "config.json"), "w") as f:
             json.dump(config, f, indent=2)
 
-        print(f"\nVision Encoder V3 compiled: {output_path}")
+        print(f"\nVision Encoder compiled: {output_path}")
 
 
 if __name__ == "__main__":
@@ -218,4 +219,4 @@ if __name__ == "__main__":
         MODEL_ID = args.model_path
         CACHE_DIR = None
 
-    compile_vision_encoder_v3(args)
+    compile_vision_encoder(args)

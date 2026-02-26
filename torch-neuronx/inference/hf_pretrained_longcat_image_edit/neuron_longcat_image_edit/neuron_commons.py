@@ -190,8 +190,8 @@ class NeuronTextEncoderWrapper(nn.Module):
     text encoder, so this is largely reused from the reference.
     """
     def __init__(self, original_text_encoder,
-                 compiled_vision_encoder_v3=None,
-                 compiled_language_model_v3=None,
+                 compiled_vision_encoder=None,
+                 compiled_language_model=None,
                  cpu_language_model=None,
                  cpu_vision_encoder=None,
                  image_size=448, max_seq_len=512,
@@ -212,8 +212,11 @@ class NeuronTextEncoderWrapper(nn.Module):
         self.embed_tokens.weight.data = orig_embed.weight.data.clone().to(torch.bfloat16)
         print(f"  Copied embed_tokens: {orig_embed.num_embeddings} x {orig_embed.embedding_dim}")
 
-        # Copy visual_merger if needed (only for non-V3 or CPU vision encoder)
-        if compiled_vision_encoder_v3 is None and hasattr(original_text_encoder.model.visual, 'merger'):
+        # Use original model's get_rope_index for correct M-RoPE position IDs
+        self._original_get_rope_index = original_text_encoder.model.get_rope_index
+
+        # Copy visual_merger if needed (only for CPU vision encoder)
+        if compiled_vision_encoder is None and hasattr(original_text_encoder.model.visual, 'merger'):
             import copy
             self.visual_merger = copy.deepcopy(original_text_encoder.model.visual.merger)
             self.visual_merger = self.visual_merger.to(torch.bfloat16)
@@ -221,15 +224,15 @@ class NeuronTextEncoderWrapper(nn.Module):
             self.visual_merger = None
 
         # Compiled models
-        self.compiled_vision_encoder_v3 = compiled_vision_encoder_v3
-        self.compiled_language_model_v3 = compiled_language_model_v3
+        self.compiled_vision_encoder = compiled_vision_encoder
+        self.compiled_language_model = compiled_language_model
         self.cpu_language_model = cpu_language_model
         self.cpu_vision_encoder = cpu_vision_encoder
 
         self.use_cpu_vision_encoder = cpu_vision_encoder is not None
-        self.use_v3_vision_encoder = compiled_vision_encoder_v3 is not None
+        self.use_compiled_vision_encoder = compiled_vision_encoder is not None
         self.use_cpu_language_model = cpu_language_model is not None
-        self.use_v3_language_model = compiled_language_model_v3 is not None
+        self.use_compiled_language_model = compiled_language_model is not None
         self.language_model_batch_size = language_model_batch_size
 
         # Image processing parameters
@@ -250,18 +253,10 @@ class NeuronTextEncoderWrapper(nn.Module):
         return self._device
 
     def _get_rope_index(self, input_ids, image_grid_thw, attention_mask):
-        """Calculate 3D position_ids for M-RoPE (Multimodal RoPE)."""
-        batch_size, seq_len = input_ids.shape
-        device = input_ids.device
-
-        if image_grid_thw is None:
-            if attention_mask is not None:
-                position_ids = attention_mask.long().cumsum(-1) - 1
-                position_ids.masked_fill_(attention_mask == 0, 1)
-                position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
-            else:
-                position_ids = torch.arange(seq_len, device=device).view(1, 1, -1).expand(3, batch_size, -1)
-            return position_ids
+        """Calculate 3D position_ids for M-RoPE using original model's method."""
+        position_ids, _ = self._original_get_rope_index(
+            input_ids, image_grid_thw, None, attention_mask)
+        return position_ids
 
         t = image_grid_thw[0, 0]
         h = image_grid_thw[0, 1]
@@ -391,7 +386,7 @@ class NeuronTextEncoderWrapper(nn.Module):
             if self.use_cpu_vision_encoder:
                 with torch.no_grad():
                     image_embeds = self.cpu_vision_encoder(pixel_values, image_grid_thw)
-            elif self.use_v3_vision_encoder:
+            elif self.use_compiled_vision_encoder:
                 expected_patches = (self.image_size // self.patch_size) ** 2
                 actual_patches = pixel_values.shape[0]
                 num_images = image_grid_thw.shape[0]
@@ -421,7 +416,7 @@ class NeuronTextEncoderWrapper(nn.Module):
                         grid_size = self.image_size // self.patch_size
                         single_grid = torch.tensor([[1, grid_size, grid_size]], dtype=torch.int64)
 
-                        img_embeds = self.compiled_vision_encoder_v3(
+                        img_embeds = self.compiled_vision_encoder(
                             pixel_values=img_pv, grid_thw=single_grid)
 
                         merged_h = h // self.spatial_merge_size
@@ -443,7 +438,7 @@ class NeuronTextEncoderWrapper(nn.Module):
                         grid_size = self.image_size // self.patch_size
                         image_grid_thw = torch.tensor([[1, grid_size, grid_size]], dtype=torch.int64)
 
-                    image_embeds = self.compiled_vision_encoder_v3(
+                    image_embeds = self.compiled_vision_encoder(
                         pixel_values=pixel_values, grid_thw=image_grid_thw)
 
                 image_embeds = image_embeds.to(torch.bfloat16)
@@ -484,7 +479,7 @@ class NeuronTextEncoderWrapper(nn.Module):
                 })()
             return hidden_states
 
-        elif self.use_v3_language_model:
+        elif self.use_compiled_language_model:
             original_seq_len = inputs_embeds.shape[1]
             hidden_size = inputs_embeds.shape[2]
 
@@ -536,7 +531,7 @@ class NeuronTextEncoderWrapper(nn.Module):
                         position_ids[:, :1, :].repeat(1, pad_batch, 1)
                     ], dim=1)
 
-            hidden_states = self.compiled_language_model_v3(
+            hidden_states = self.compiled_language_model(
                 inputs_embeds.to(torch.bfloat16), attention_mask, position_ids)
 
             if actual_batch_size < self.language_model_batch_size:

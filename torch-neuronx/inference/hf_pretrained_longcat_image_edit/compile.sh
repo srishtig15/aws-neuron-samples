@@ -18,14 +18,14 @@ export PYTHONPATH=`pwd`/neuron_longcat_image_edit:$PYTHONPATH
 COMPILED_MODELS_DIR="/opt/dlami/nvme/compiled_models"
 COMPILER_WORKDIR="/opt/dlami/nvme/compiler_workdir"
 
-# Fixed VAE tile size
-VAE_TILE_SIZE=512
+# VAE compiled for full output size (no tiling needed, avoids seam artifacts)
+VAE_TILE_SIZE=1024
 
 # Parse arguments
 HEIGHT=${1:-1024}
 WIDTH=${2:-1024}
 IMAGE_SIZE=${3:-448}
-MAX_SEQ_LEN=${4:-512}
+MAX_SEQ_LEN=${4:-1024}
 BATCH_SIZE=${5:-1}
 
 echo "============================================"
@@ -60,7 +60,7 @@ echo ""
 
 # Step 3: Compile Transformer (TP=4, CP=2, ~30-60 min)
 echo "[Step 3/5] Compiling FLUX Transformer (TP=4, CP=2)..."
-neuron_parallel_compile python neuron_longcat_image_edit/compile_transformer_v3_cp.py \
+neuron_parallel_compile python neuron_longcat_image_edit/compile_transformer.py \
     --height ${HEIGHT} \
     --width ${WIDTH} \
     --tp_degree 4 \
@@ -74,7 +74,7 @@ echo ""
 
 # Step 4: Compile Vision Encoder (TP=4, ~10 min)
 echo "[Step 4/5] Compiling Vision Encoder (TP=4, float32)..."
-neuron_parallel_compile python neuron_longcat_image_edit/compile_vision_encoder_v3.py \
+python neuron_longcat_image_edit/compile_vision_encoder.py \
     --image_size ${IMAGE_SIZE} \
     --compiled_models_dir ${COMPILED_MODELS_DIR} \
     --compiler_workdir ${COMPILER_WORKDIR}
@@ -83,7 +83,7 @@ echo ""
 
 # Step 5: Compile Language Model (TP=4, ~15 min)
 echo "[Step 5/5] Compiling Language Model (TP=4)..."
-neuron_parallel_compile python neuron_longcat_image_edit/compile_language_model_v3.py \
+neuron_parallel_compile python neuron_longcat_image_edit/compile_language_model.py \
     --max_sequence_length ${MAX_SEQ_LEN} \
     --batch_size ${BATCH_SIZE} \
     --compiled_models_dir ${COMPILED_MODELS_DIR} \
@@ -98,9 +98,9 @@ echo ""
 echo "Compiled models saved to: ${COMPILED_MODELS_DIR}/"
 echo "  - vae_encoder/ (tile: ${VAE_TILE_SIZE}x${VAE_TILE_SIZE})"
 echo "  - vae_decoder/ (tile: ${VAE_TILE_SIZE}x${VAE_TILE_SIZE})"
-echo "  - transformer_v3_cp/ (TP=4, CP=2, output: ${HEIGHT}x${WIDTH})"
-echo "  - vision_encoder_v3/ (TP=4, float32)"
-echo "  - language_model_v3/ (TP=4)"
+echo "  - transformer/ (TP=4, CP=2, output: ${HEIGHT}x${WIDTH})"
+echo "  - vision_encoder/ (TP=4, float32)"
+echo "  - language_model/ (TP=4)"
 echo ""
 echo "To run inference:"
 echo "  NEURON_RT_NUM_CORES=8 python run_longcat_image_edit.py \\"

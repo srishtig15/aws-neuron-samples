@@ -1,5 +1,5 @@
 """
-LongCat FLUX-style Transformer compilation with Context Parallel (V3 CP).
+LongCat FLUX-style Transformer compilation with Context Parallel (Compiled).
 
 Key approach:
 1. Uses ModelBuilder API for compilation
@@ -336,7 +336,7 @@ def get_dp_rank_spmd(global_rank, tp_degree):
     return torch.div(global_rank, tp_degree, rounding_mode="floor").to(torch.int32)
 
 
-class NeuronLongCatTransformerV3CP(nn.Module):
+class NeuronLongCatTransformer(nn.Module):
     """
     Neuron-optimized LongCat FLUX-style Transformer with Context Parallel.
 
@@ -496,7 +496,7 @@ class TracingWrapper(nn.Module):
             img_rotary_cos, img_rotary_sin, txt_rotary_cos, txt_rotary_sin)
 
 
-def compile_transformer_v3_cp(args):
+def compile_transformer(args):
     """Compile FLUX-style transformer with Context Parallel using ModelBuilder API."""
 
     tp_degree = args.tp_degree
@@ -536,7 +536,7 @@ def compile_transformer_v3_cp(args):
         num_img_patches_padded = num_img_patches
 
     print("=" * 60)
-    print("LongCat FLUX Transformer V3 CP Compilation")
+    print("LongCat FLUX Transformer Compilation")
     print("=" * 60)
     print(f"Image: {args.height}x{args.width}")
     print(f"Image patches (target+source): {num_img_patches}")
@@ -581,7 +581,7 @@ def compile_transformer_v3_cp(args):
 
         # Create Neuron transformer
         print(f"\nCreating Neuron transformer (TP={tp_degree}, world_size={world_size})...")
-        neuron_transformer = NeuronLongCatTransformerV3CP(
+        neuron_transformer = NeuronLongCatTransformer(
             pipe.transformer, tp_degree, world_size, context_parallel_enabled)
         neuron_transformer = neuron_transformer.to(torch.bfloat16)
         neuron_transformer.eval()
@@ -613,7 +613,7 @@ def compile_transformer_v3_cp(args):
         )
 
         # Save
-        output_path = f"{args.compiled_models_dir}/transformer_v3_cp"
+        output_path = f"{args.compiled_models_dir}/transformer"
         os.makedirs(output_path, exist_ok=True)
 
         print(f"\nSaving to {output_path}...")
@@ -657,8 +657,11 @@ def compile_transformer_v3_cp(args):
             shard_data = dict(load_file(shard_file))
             original_count = len(shard_data)
             cleaned = {k: v for k, v in shard_data.items() if 'master_weight' not in k}
-            if global_rank_state:
-                cleaned.update(global_rank_state)
+            # Fix global_rank.rank: SPMDRank needs each TP rank to have its own
+            # rank value (torch.tensor([rank])). Without this, all ranks think
+            # they are rank 0, breaking CP scatter/gather operations.
+            for gk, gv in global_rank_state.items():
+                cleaned[gk] = torch.tensor([rank], dtype=torch.int32)
 
             # Fix proj_out weights for all single-stream blocks
             attn_per_rank = attn_dim // tp_degree
@@ -735,4 +738,4 @@ if __name__ == "__main__":
         MODEL_ID = args.model_path
         CACHE_DIR = None
 
-    compile_transformer_v3_cp(args)
+    compile_transformer(args)

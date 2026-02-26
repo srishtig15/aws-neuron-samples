@@ -166,9 +166,13 @@ def shard_flux_single_block(tp_degree, block):
     if hasattr(block, 'proj_mlp'):
         block.proj_mlp = shard_linear_column(block.proj_mlp)
 
-    # --- Combined output projection (RowParallel) ---
-    # proj_out takes concatenated [attn_output, mlp_output] where each is sharded
-    # Input: (3072/tp + 12288/tp) = (768 + 3072) = 3840 per rank with TP=4
+    # --- Combined output projection (custom RowParallel with reordered columns) ---
+    # proj_out input = [attn_output, mlp_output] concatenated per rank.
+    # Original weight: [out_dim, attn_dim + mlp_dim] = [3072, 15360]
+    # Per rank r, input features correspond to:
+    #   attn cols: [r*attn_per_rank : (r+1)*attn_per_rank]
+    #   mlp cols:  [attn_dim + r*mlp_per_rank : attn_dim + (r+1)*mlp_per_rank]
+    # These are NON-CONTIGUOUS in the original weight, so we must extract them.
     if hasattr(block, 'proj_out'):
         block.proj_out = shard_proj_out_interleaved(block.proj_out, orig_num_heads * 128, block.mlp_hidden_dim, tp_degree)
 
