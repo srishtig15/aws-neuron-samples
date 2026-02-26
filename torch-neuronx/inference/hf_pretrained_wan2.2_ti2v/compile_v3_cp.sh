@@ -74,18 +74,21 @@ python neuron_wan2_2_ti2v/compile_transformer_v3_cp.py \
     --tp_degree ${TP_DEGREE} \
     --world_size ${WORLD_SIZE}
 
-# Step 4: Compile Decoder and post_quant_conv (V3)
+# Step 4: Compile Decoder and post_quant_conv (V3 NoCache)
+# feat_cache internalized as zero buffers on device, eliminates ~960MB/call transfer
+# Decoder per-call: ~0.50s (vs ~0.78s with external feat_cache)
 # V3 uses --model-type=unet-inference (not transformer) and bfloat16 for decoder
 # Decoder doesn't use actual TP sharding (weights duplicated), but must match world_size
 echo ""
-echo "[Step 4/4] Compiling Decoder and post_quant_conv (V3, bfloat16, world_size=${WORLD_SIZE})..."
-python neuron_wan2_2_ti2v/compile_decoder_v3.py \
+echo "[Step 4/4] Compiling Decoder and post_quant_conv (V3 NoCache, bfloat16, world_size=${WORLD_SIZE})..."
+python neuron_wan2_2_ti2v/compile_decoder_v3_nocache.py \
     --compiled_models_dir "${COMPILED_MODELS_DIR}" \
     --compiler_workdir "${COMPILER_WORKDIR}" \
     --height ${HEIGHT} \
     --width ${WIDTH} \
     --num_frames ${NUM_FRAMES} \
-    --tp_degree ${TP_DEGREE} \
+    --decoder_frames 2 \
+    --tp_degree ${WORLD_SIZE} \
     --world_size ${WORLD_SIZE}
 
 # Note: VAE Encoder is NOT compiled to Neuron due to a Neuron compiler bug

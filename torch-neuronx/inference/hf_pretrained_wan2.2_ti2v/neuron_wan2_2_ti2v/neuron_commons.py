@@ -1,3 +1,4 @@
+import time
 from diffusers.models.transformers.transformer_wan import WanTransformer3DModel
 from transformers.models.umt5 import UMT5EncoderModel
 import torch.jit
@@ -710,3 +711,66 @@ class DecoderWrapperV3(nn.Module):
 
     def clear_cache(self):
         pass
+
+
+class DecoderWrapperV3NoCache(nn.Module):
+    """
+    Wrapper for V3 NoCache compiled decoder.
+
+    The compiled model takes only x as input (no feat_cache arguments).
+    feat_cache is internalized as registered buffers (zeros, loaded once to device).
+
+    This eliminates ~960MB per-call data transfer. Only x (~300KB) is transferred.
+    """
+
+    def __init__(self, original_decoder, decoder_frames=2):
+        super().__init__()
+        self.original_decoder = original_decoder
+        self.decoder_frames = decoder_frames
+        self.nxd_model = None
+
+    def forward(self, x, **kwargs):
+        if 'feat_cache' not in kwargs:
+            return self.original_decoder(x)
+
+        _t0 = time.time()
+
+        # Determine original frame count before padding
+        original_frame_count = x.shape[2]
+
+        # Pad temporal dimension to decoder_frames if needed
+        if x.shape[2] < self.decoder_frames:
+            pad_frames = self.decoder_frames - x.shape[2]
+            x = torch.cat([x] + [x[:, :, -1:]] * pad_frames, dim=2)
+
+        # Convert to bfloat16 for the compiled decoder
+        x_bf16 = x.to(torch.bfloat16)
+
+        _t1 = time.time()
+
+        # NoCache: only pass x as input (1 argument, ~300KB)
+        # vs V3 cache: x + 34 feat_cache tensors (35 arguments, ~960MB)
+        output = self.nxd_model(x_bf16)
+
+        _t2 = time.time()
+
+        # Convert back to float32 and trim to original frame count
+        if isinstance(output, (list, tuple)):
+            output = output[0]
+        output = output.to(torch.float32)
+
+        # Trim padded frames: output temporal = original_frame_count * 4 (due to upsampling)
+        output_frames = original_frame_count * 4
+        if output.shape[2] > output_frames:
+            output = output[:, :, :output_frames]
+
+        _t3 = time.time()
+
+        print(f"[nocache] prep={_t1-_t0:.4f}s nxd_model={_t2-_t1:.4f}s postproc={_t3-_t2:.4f}s total={_t3-_t0:.4f}s frames={original_frame_count}")
+
+        return output
+
+    def clear_cache(self):
+        pass
+
+

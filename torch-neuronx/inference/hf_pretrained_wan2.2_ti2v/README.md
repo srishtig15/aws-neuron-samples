@@ -56,9 +56,9 @@ Video Output (512x512, 81 frames)
 | Component | Time | Details |
 |-----------|------|---------|
 | Transformer | ~21s | 50 steps @ 0.43s/step |
-| VAE Decoder | ~8.6s | 11 calls @ 0.78s/call |
+| VAE Decoder | ~5.6s | 11 calls @ 0.50s/call (NoCache) |
 | post_quant_conv | ~0.003s | Single call |
-| **Total** | **~30s** | |
+| **Total** | **~27s** | |
 
 ## Compilation Approaches
 
@@ -68,12 +68,13 @@ This project evolved through multiple optimization iterations. The recommended a
 
 - **Script**: `compile_v3_cp.sh` / `run_wan2.2_ti2v_v3_cp.py`
 - **Transformer**: TP=4, CP=2 (Context Parallel), world_size=8
-- **Decoder**: bfloat16, `--model-type=unet-inference`
+- **Decoder**: bfloat16, NoCache (feat_cache as zero buffers), `--model-type=unet-inference`
 - **Key innovations**:
   - Context Parallel splits the sequence dimension across 2 groups, enabling each group to process half the tokens
   - `local_rms_norm` avoids Neuron compiler all-reduce bugs while preserving normalization accuracy
   - Decoder compiled with `--model-type=unet-inference` (not `transformer`) for Conv3D-optimized code generation
   - bfloat16 decoder halves memory bandwidth
+  - NoCache decoder internalizes feat_cache as zero buffers, eliminating ~960MB/call data transfer (0.50s vs 0.78s per call)
 
 ```bash
 ./compile_v3_cp.sh [output_dir] [compiler_workdir]
@@ -133,16 +134,18 @@ def local_rms_norm(x, weight, eps=1e-6):
 
 Applied to Q/K normalization in both self-attention and cross-attention. The difference from global norm is negligible for QK normalization since each rank's local hidden dimension (~1024) is large enough for stable statistics.
 
-### 3. VAE Decoder in bfloat16
+### 3. VAE Decoder: bfloat16 + NoCache
 
-The VAE decoder is dominated by Conv3D operations. Converting from float32 to bfloat16:
-- Halves memory bandwidth (the bottleneck for Conv3D)
-- Decoder time reduced from ~20s (V1 float32) to ~8.6s (V3 bfloat16)
+The VAE decoder is dominated by Conv3D operations. Two key optimizations:
 
-The `DecoderWrapperV3` handles dtype conversion at the boundary:
-- Receives float32 input from the pipeline
-- Converts to bfloat16 for the compiled decoder
-- Converts output back to float32
+**bfloat16**: Halves memory bandwidth (the bottleneck for Conv3D). Decoder time reduced from ~20s (V1 float32) to ~8.6s (V3 bfloat16).
+
+**NoCache**: The decoder's `feat_cache` (34 tensors, ~960MB) is always zeros between calls because NxDModel copies inputs to device without reflecting device-side mutations back to host. Instead of transferring these zeros every call, they are registered as constant buffers inside the compiled model:
+- Eliminates ~960MB CPU→Device transfer per decoder call
+- Decoder per-call: ~0.50s (vs ~0.78s with external feat_cache)
+- Total decoder time: ~5.6s (vs ~8.6s), a 35% speedup
+
+The `DecoderWrapperV3NoCache` only passes `x` (~192KB) to the NxDModel, handling dtype conversion and temporal frame padding/trimming.
 
 ### 4. Correct Compiler Model Type
 
@@ -188,7 +191,8 @@ This is implemented in the custom `autoencoder_kl_wan.py` which replaces the dif
 | `compile_transformer_v3_cp.py` | V3 CP transformer (TP=4, CP=2, local_rms_norm) |
 | `compile_transformer_v3_flash.py` | V3 Flash transformer (TP=8, NKI Flash Attention) |
 | `compile_text_encoder_v2.py` | Text encoder (ModelBuilder API) |
-| `compile_decoder_v3.py` | VAE decoder (bfloat16, `--model-type=unet-inference`) |
+| `compile_decoder_v3_nocache.py` | VAE decoder (bfloat16, NoCache, `--model-type=unet-inference`) |
+| `compile_decoder_v3.py` | VAE decoder with external feat_cache (legacy) |
 | `compile_encoder_v3.py` | VAE encoder + quant_conv (for I2V) |
 | `cache_hf_model.py` | Download and cache HuggingFace model |
 
@@ -204,7 +208,7 @@ This is implemented in the custom `autoencoder_kl_wan.py` which replaces the dif
 
 | File | Description |
 |------|-------------|
-| `neuron_commons.py` | Runtime wrappers: `DecoderWrapperV3`, `EncoderWrapperV3`, `QuantConvWrapperV3`, attention utilities |
+| `neuron_commons.py` | Runtime wrappers: `DecoderWrapperV3NoCache`, `DecoderWrapperV3`, `EncoderWrapperV3`, `QuantConvWrapperV3`, attention utilities |
 | `neuron_commons_v2.py` | `InferenceTextEncoderWrapperV2` for NxDModel text encoder |
 | `neuron_parallel_utils.py` | Tensor parallel utilities for UMT5 sharding |
 | `distributed_rmsnorm.py` | Distributed RMSNorm (reference, not used in V3 due to compiler bug) |
@@ -282,4 +286,4 @@ If you see errors about replica groups `[[0,1,2,3]]` vs expected `[[0,1,2,3],[4,
 - The decoder uses bfloat16 to reduce memory. If OOM persists, try `--force_v1_decoder`
 
 ### Decoder fallback
-The run scripts support automatic fallback: V3 (bfloat16) -> V2 -> V1 (TorchScript). If the V3 decoder wasn't compiled, it will automatically use whatever version is available.
+The run scripts support automatic fallback: V3 NoCache -> V3 -> V2 -> V1 (TorchScript). If the V3 NoCache decoder wasn't compiled, it will automatically use whatever version is available.
