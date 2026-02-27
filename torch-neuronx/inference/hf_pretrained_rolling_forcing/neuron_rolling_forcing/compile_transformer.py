@@ -61,10 +61,12 @@ sys.path.insert(0, "/tmp/RollingForcing")
 # ========================
 
 def sinusoidal_embedding_1d(dim, position):
-    """Sinusoidal embedding matching Wan's implementation."""
+    """Sinusoidal embedding matching Wan's implementation.
+    Uses float32 instead of float64 for Neuron compatibility.
+    """
     assert dim % 2 == 0
     half = dim // 2
-    position = position.type(torch.float64)
+    position = position.type(torch.float32)
     sinusoid = torch.outer(
         position, torch.pow(10000, -torch.arange(half).to(position).div(half)))
     x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
@@ -370,9 +372,12 @@ class NeuronCausalWanModel(nn.Module):
         # x_head: [B, F, frame_seqlen, out_dim * prod(patch_size)]
 
         # 6. Unpatchify: [B, F, frame_seqlen, C_out*pt*ph*pw] -> [B, C_out, F*pt, H, W]
+        # The head linear outputs 64 values per token (pt*ph*pw*C = 1*2*2*16).
+        # Original einops: rearrange('b (f h w) (p q r c) -> b c (f p) (h q) (w r)')
+        # In (p q r c), c=out_dim is LAST (fastest varying). Must match this view order.
         x_head = x_head.view(B, post_f, post_h, post_w, p_t, p_h, p_w, self.out_dim)
-        output = torch.einsum('bfhwpqrc->bcfphqwr', x_head)
-        output = output.reshape(B, self.out_dim, F, H, W)
+        output = x_head.permute(0, 7, 1, 4, 2, 5, 3, 6).contiguous()
+        output = output.reshape(B, self.out_dim, post_f * p_t, post_h * p_h, post_w * p_w)
 
         return output
 
@@ -422,13 +427,18 @@ def load_rolling_forcing_weights(ckpt_path, model_prefix="model."):
     else:
         state_dict = ckpt
 
-    # Strip model prefix
+    # Strip model prefix and/or FSDP wrapper prefix
+    fsdp_prefix = "_fsdp_wrapped_module."
     cleaned = {}
     for k, v in state_dict.items():
-        if k.startswith(model_prefix):
-            cleaned[k[len(model_prefix):]] = v
-        else:
-            cleaned[k] = v
+        key = k
+        # Strip model prefix first (e.g. "model.blocks.0..." -> "blocks.0...")
+        if key.startswith(model_prefix):
+            key = key[len(model_prefix):]
+        # Strip FSDP wrapper prefix (e.g. "_fsdp_wrapped_module.blocks.0..." -> "blocks.0...")
+        if key.startswith(fsdp_prefix):
+            key = key[len(fsdp_prefix):]
+        cleaned[key] = v
 
     print(f"  Loaded {len(cleaned)} weight tensors")
     return cleaned

@@ -55,7 +55,7 @@ HEAD_DIM = 128
 class FlowMatchScheduler:
     """Minimal flow matching scheduler for inference."""
 
-    def __init__(self, shift=8.0, sigma_min=0.003/1.002, sigma_max=1.0,
+    def __init__(self, shift=5.0, sigma_min=0.0, sigma_max=1.0,
                  num_train_timesteps=1000, extra_one_step=True):
         self.num_train_timesteps = num_train_timesteps
         self.shift = shift
@@ -97,6 +97,11 @@ class FlowMatchScheduler:
             (self.timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1)
         sigma = self.sigmas[timestep_id].reshape(-1, 1, 1, 1)
         return (xt - sigma * flow_pred).type_as(flow_pred)
+
+    def get_sigma(self, timestep_val):
+        """Get sigma for a single warped timestep value."""
+        tid = torch.argmin((self.timesteps - timestep_val).abs())
+        return self.sigmas[tid].item()
 
 
 # ========================
@@ -418,11 +423,24 @@ def run_rolling_forcing(args):
     text_input_ids = tokens.input_ids.to(torch.int64)
     attention_mask = tokens.attention_mask.to(torch.int64)
 
-    # Text encoding
+    # Text encoding (positive prompt)
     print("Running text encoder...")
     t0 = time.time()
     prompt_embeds = text_encoder(text_input_ids, attention_mask)
-    print(f"  Text encoding: {time.time()-t0:.1f}s, shape: {prompt_embeds.shape}")
+    print(f"  Positive text encoding: {time.time()-t0:.1f}s, shape: {prompt_embeds.shape}")
+
+    # Text encoding (negative prompt for CFG)
+    negative_prompt_embeds = None
+    if args.guidance_scale > 1.0:
+        print(f"  Encoding negative prompt (guidance_scale={args.guidance_scale})...")
+        neg_tokens = tokenizer(
+            args.negative_prompt, max_length=512, padding="max_length",
+            truncation=True, return_tensors="pt")
+        neg_input_ids = neg_tokens.input_ids.to(torch.int64)
+        neg_attention_mask = neg_tokens.attention_mask.to(torch.int64)
+        t0 = time.time()
+        negative_prompt_embeds = text_encoder(neg_input_ids, neg_attention_mask)
+        print(f"  Negative text encoding: {time.time()-t0:.1f}s, shape: {negative_prompt_embeds.shape}")
 
     # Setup dimensions
     num_frames = args.num_frames  # Total output frames (e.g., 81)
@@ -440,8 +458,8 @@ def run_rolling_forcing(args):
     denoising_step_list = torch.tensor(
         args.denoising_step_list, dtype=torch.float32)
 
-    # Warp timesteps using scheduler
-    scheduler = FlowMatchScheduler(shift=8.0, extra_one_step=True)
+    # Warp timesteps using scheduler (shift=5.0, sigma_min=0.0 matching reference config)
+    scheduler = FlowMatchScheduler(shift=5.0, sigma_min=0.0, extra_one_step=True)
     warped_steps = []
     timesteps_1000 = torch.cat([
         scheduler.timesteps.cpu(),
@@ -451,6 +469,12 @@ def run_rolling_forcing(args):
     denoising_step_list = torch.tensor(warped_steps, dtype=torch.float32)
     num_denoising_steps = len(denoising_step_list)
     print(f"\nDenoising steps (warped): {denoising_step_list.tolist()}")
+
+    # Pre-compute sigma values for each denoising step (for ODE stepping)
+    denoising_sigmas = torch.tensor(
+        [scheduler.get_sigma(t) for t in denoising_step_list],
+        dtype=torch.float32)
+    print(f"Denoising sigmas: {denoising_sigmas.tolist()}")
 
     # Build rolling windows
     windows = build_rolling_windows(num_blocks, num_denoising_steps)
@@ -468,8 +492,17 @@ def run_rolling_forcing(args):
     output = torch.zeros(1, latent_frames, num_channels, latent_h, latent_w)
     noisy_cache = torch.zeros_like(output)
 
+    # Clean frame buffer for anchor context
+    # Tracks finalized blocks (completed all denoising steps)
+    # These are prepended to each window with timestep=0 to provide context,
+    # replacing the KV cache function from the original pipeline.
+    clean_frames = torch.zeros(1, 0, num_channels, latent_h, latent_w)
+    # Track which block indices are finalized
+    finalized_blocks = set()
+
     # Denoising loop
-    print("\nStarting rolling forcing denoising...")
+    cfg_str = f" (CFG scale={args.guidance_scale})" if negative_prompt_embeds is not None else " (no CFG)"
+    print(f"\nStarting rolling forcing denoising...{cfg_str}")
     total_t0 = time.time()
 
     for window_idx, (start_block, end_block) in enumerate(windows):
@@ -491,7 +524,7 @@ def run_rolling_forcing(args):
             # End of video: use cached noisy
             noisy_input = noisy_cache[:, current_start:current_end]
 
-        # 2. Build per-frame timesteps
+        # 2. Build per-frame timesteps for noisy frames
         if current_num_frames == rolling_len:
             current_timestep = shared_timestep
         elif current_start == 0:
@@ -501,16 +534,66 @@ def run_rolling_forcing(args):
         else:
             raise ValueError(f"Unexpected window: start={current_start}, end={current_end}")
 
-        # 3. For Neuron: build full visible sequence (up to 21 frames)
-        # In our full-sequence approach, we pad the noisy input to MAX_FRAMES
-        visible_input = noisy_input.permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
+        # 3. Build full visible sequence with clean anchor context
+        # Anchor frames: clean finalized frames that aren't in the current window
+        # These provide context (replacing KV cache from original pipeline)
+        anchor_frames = None
+        anchor_positions = torch.tensor([], dtype=torch.long)
+        n_anchor = 0
 
-        # 4. Compute RoPE for this window
-        frame_positions = torch.arange(current_start, current_end, dtype=torch.long)
+        if clean_frames.shape[1] > 0:
+            # Select anchor frames that are NOT in the current window
+            # Use the first block (attention sink) + recent finalized blocks
+            max_anchor_frames = MAX_FRAMES - current_num_frames
+            if max_anchor_frames > 0 and max_anchor_frames >= BLOCK_SIZE:
+                # Always include first block (attention sink) if finalized
+                anchor_block_indices = []
+                if 0 in finalized_blocks and start_block > 0:
+                    anchor_block_indices.append(0)
+
+                # Add recent finalized blocks not in current window
+                for blk in sorted(finalized_blocks):
+                    if blk >= start_block:
+                        break
+                    if blk not in anchor_block_indices:
+                        total_anchor = (len(anchor_block_indices) + 1) * BLOCK_SIZE
+                        if total_anchor <= max_anchor_frames:
+                            anchor_block_indices.append(blk)
+
+                if anchor_block_indices:
+                    anchor_list = []
+                    anchor_pos_list = []
+                    for blk in sorted(anchor_block_indices):
+                        blk_start_f = blk * BLOCK_SIZE
+                        blk_end_f = blk_start_f + BLOCK_SIZE
+                        anchor_list.append(output[:, blk_start_f:blk_end_f])
+                        # Anchor RoPE positions: use original frame indices
+                        anchor_pos_list.extend(range(blk_start_f, blk_end_f))
+
+                    anchor_frames = torch.cat(anchor_list, dim=1)
+                    anchor_positions = torch.tensor(anchor_pos_list, dtype=torch.long)
+                    n_anchor = anchor_frames.shape[1]
+
+        # Build visible input: [anchor (clean, t=0) | noisy (current window)]
+        if anchor_frames is not None and n_anchor > 0:
+            # Prepend anchor frames to noisy input
+            full_input = torch.cat([anchor_frames, noisy_input], dim=1)
+            # Timestep: anchor=0, noisy=current
+            anchor_timestep = torch.zeros(1, n_anchor, dtype=torch.float32)
+            full_timestep = torch.cat([anchor_timestep, current_timestep], dim=1)
+        else:
+            full_input = noisy_input
+            full_timestep = current_timestep
+
+        total_visible = full_input.shape[1]
+        visible_input = full_input.permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
+
+        # 4. Compute RoPE for this window (with anchor positions)
+        current_positions = torch.arange(current_start, current_end, dtype=torch.long)
         rope_cos, rope_sin = compute_rope_for_rolling_window(
-            anchor_frame_positions=torch.tensor([], dtype=torch.long),  # no anchor in full-seq mode
+            anchor_frame_positions=anchor_positions,
             working_frame_positions=torch.tensor([], dtype=torch.long),
-            current_frame_positions=frame_positions,
+            current_frame_positions=current_positions,
             height=POST_H,
             width=POST_W,
             max_frames=MAX_FRAMES,
@@ -518,14 +601,26 @@ def run_rolling_forcing(args):
         )
 
         # 5. Run compiled transformer
-        flow_pred = transformer(
-            visible_input, current_timestep,
-            prompt_embeds, rope_cos, rope_sin)
+        if negative_prompt_embeds is not None:
+            # Classifier-free guidance: run twice
+            flow_pred_cond = transformer(
+                visible_input, full_timestep,
+                prompt_embeds, rope_cos, rope_sin)
+            flow_pred_uncond = transformer(
+                visible_input, full_timestep,
+                negative_prompt_embeds, rope_cos, rope_sin)
+            flow_pred = flow_pred_uncond + args.guidance_scale * (flow_pred_cond - flow_pred_uncond)
+        else:
+            flow_pred = transformer(
+                visible_input, full_timestep,
+                prompt_embeds, rope_cos, rope_sin)
 
-        # 6. Convert flow prediction to x0 for each frame
-        flow_pred_frames = flow_pred.permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
+        # 6. Convert flow prediction to x0 for CURRENT frames only (skip anchor)
+        # Extract only the current window frames from the full output
+        flow_pred_all = flow_pred.permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
+        flow_pred_current = flow_pred_all[:, n_anchor:n_anchor + current_num_frames]
         pred_x0 = scheduler.convert_flow_to_x0(
-            flow_pred_frames.flatten(0, 1),
+            flow_pred_current.flatten(0, 1),
             noisy_input.flatten(0, 1),
             current_timestep.flatten(0, 1),
         ).unflatten(0, (1, current_num_frames))
@@ -533,7 +628,7 @@ def run_rolling_forcing(args):
         # 7. Store output
         output[:, current_start:current_end] = pred_x0
 
-        # 8. Update noisy cache for next windows
+        # 8. Update noisy cache for next windows (matching original rolling forcing)
         with torch.no_grad():
             for block_idx in range(start_block, end_block + 1):
                 blk_start = (block_idx - start_block) * BLOCK_SIZE
@@ -544,34 +639,56 @@ def run_rolling_forcing(args):
                 matches = torch.abs(denoising_step_list - block_t) < 1e-4
                 step_idx = torch.nonzero(matches, as_tuple=True)[0]
                 if len(step_idx) == 0 or step_idx[0] >= len(denoising_step_list) - 1:
+                    # This block is at its final denoising step → mark as finalized
+                    finalized_blocks.add(block_idx)
                     continue
 
                 next_t = denoising_step_list[step_idx[0] + 1]
                 block_x0 = pred_x0[:, blk_start:blk_end]
-                block_noise = torch.randn_like(block_x0)
 
+                # Re-noise from x0 with fresh noise (matching original)
                 noisy_cache[:, block_idx*BLOCK_SIZE:(block_idx+1)*BLOCK_SIZE] = \
                     scheduler.add_noise(
                         block_x0.flatten(0, 1),
-                        block_noise.flatten(0, 1),
-                        next_t * torch.ones(BLOCK_SIZE, device=device),
-                    ).unflatten(0, (1, BLOCK_SIZE))
+                        torch.randn_like(block_x0.flatten(0, 1)),
+                        next_t * torch.ones(BLOCK_SIZE, dtype=torch.float32),
+                    ).unflatten(0, block_x0.shape[:2])
+
+        # Update clean_frames buffer from finalized blocks
+        if finalized_blocks:
+            clean_list = []
+            for blk in sorted(finalized_blocks):
+                blk_s = blk * BLOCK_SIZE
+                blk_e = blk_s + BLOCK_SIZE
+                clean_list.append(output[:, blk_s:blk_e])
+            clean_frames = torch.cat(clean_list, dim=1)
 
         w_time = time.time() - w_t0
+        anchor_str = f", anchor={n_anchor}f" if n_anchor > 0 else ""
         print(f"  Window {window_idx}/{len(windows)-1}: "
               f"blocks [{start_block}-{end_block}], "
-              f"frames [{current_start}-{current_end}], "
+              f"frames [{current_start}-{current_end}]{anchor_str}, "
               f"{w_time:.2f}s")
 
     total_time = time.time() - total_t0
     print(f"\nDenoising complete: {total_time:.1f}s "
           f"({total_time/len(windows):.2f}s/window)")
 
+    # Save raw latents for debugging
+    if args.save_latents:
+        latent_path = args.output_path.replace('.mp4', '_latents.pt')
+        torch.save(output, latent_path)
+        print(f"\nSaved raw latents to {latent_path}, shape: {output.shape}")
+
     # VAE decoding
-    print("\nDecoding with VAE...")
-    t0 = time.time()
-    video = vae_decoder.decode(output)
-    print(f"  VAE decoding: {time.time()-t0:.1f}s")
+    if args.decode_cpu:
+        print("\nDecoding with CPU VAE (full temporal upsampling)...")
+        video = decode_with_cpu_vae(output, args.cache_dir)
+    else:
+        print("\nDecoding with Neuron VAE...")
+        t0 = time.time()
+        video = vae_decoder.decode(output)
+        print(f"  VAE decoding: {time.time()-t0:.1f}s")
 
     # Normalize to [0, 1]
     video = (video * 0.5 + 0.5).clamp(0, 1)
@@ -580,6 +697,60 @@ def run_rolling_forcing(args):
     print(f"\nSaving video to {args.output_path}...")
     save_video(video[0], args.output_path, fps=args.fps)
     print("Done!")
+
+
+def decode_with_cpu_vae(latents, cache_dir):
+    """
+    Decode latents using the original Wan2.1 VAE on CPU.
+
+    This provides full temporal upsampling (21 latent frames → 81 pixel frames)
+    without the limitations of the Neuron NoCache decoder.
+
+    Args:
+        latents: [1, F_latent, 16, 60, 104] latent tensor
+        cache_dir: HuggingFace cache directory containing the Wan2.1 model
+    Returns:
+        video: [1, F_pixel, 3, 480, 832] in [-1, 1]
+    """
+    from diffusers import AutoencoderKLWan
+    t0 = time.time()
+
+    print("  Loading AutoencoderKLWan from cache...")
+    vae = AutoencoderKLWan.from_pretrained(
+        "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+        subfolder="vae",
+        torch_dtype=torch.float32,
+        cache_dir=cache_dir,
+    ).eval()
+
+    # VAE normalization constants (from Wan2.1)
+    mean = torch.tensor([
+        -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
+        0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921
+    ], dtype=torch.float32).view(1, 16, 1, 1, 1)
+    std = torch.tensor([
+        2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743,
+        3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160
+    ], dtype=torch.float32).view(1, 16, 1, 1, 1)
+
+    # Convert from [B, F, C, H, W] to [B, C, F, H, W]
+    z = latents.permute(0, 2, 1, 3, 4).float()
+
+    # Un-normalize
+    z = z * std + mean
+
+    print(f"  Latent shape: {z.shape}, running VAE decode on CPU...")
+    with torch.no_grad():
+        # AutoencoderKLWan.decode expects [B, C, F, H, W]
+        decoded = vae.decode(z).sample  # [B, 3, F_pixel, H, W]
+
+    decoded = decoded.clamp(-1, 1)
+    # Convert to [B, F, C, H, W]
+    video = decoded.permute(0, 2, 1, 3, 4)
+    print(f"  CPU VAE decode: {time.time()-t0:.1f}s, output shape: {video.shape}")
+
+    del vae
+    return video
 
 
 def save_video(video_tensor, output_path, fps=16):
@@ -621,8 +792,18 @@ if __name__ == "__main__":
     parser.add_argument("--cache_dir", type=str,
                        default="/opt/dlami/nvme/rolling_forcing_hf_cache")
     parser.add_argument("--denoising_step_list", type=int, nargs="+",
-                       default=[999, 875, 751, 627, 503],
+                       default=[1000, 800, 600, 400, 200],
                        help="Denoising step indices (from noisy to clean)")
+    parser.add_argument("--guidance_scale", type=float, default=3.0,
+                       help="Classifier-free guidance scale (0=uncond only, 1=cond only, >1=amplified)")
+    parser.add_argument("--negative_prompt", type=str,
+                       default="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
+                       help="Negative prompt for classifier-free guidance")
+    parser.add_argument("--decode_cpu", action="store_true",
+                       help="Decode latents on CPU using original VAE "
+                            "(full temporal upsampling, 21→81 frames)")
+    parser.add_argument("--save_latents", action="store_true",
+                       help="Save raw latent output to .pt file for debugging")
     args = parser.parse_args()
 
     run_rolling_forcing(args)
