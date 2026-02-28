@@ -162,6 +162,17 @@ def compile_decoder_nocache(args):
         cache_dir=args.cache_dir,
     )
 
+    # Patch WanUpsample2d to use 'nearest' instead of 'nearest-exact'
+    # (Neuron doesn't support _upsample_nearest_exact2d)
+    from diffusers.models.autoencoders.autoencoder_kl_wan import WanUpsample
+    _orig_upsample_forward = WanUpsample.forward
+    def _patched_upsample_forward(self, x):
+        # Replace nearest-exact with nearest for Neuron compatibility
+        return torch.nn.functional.interpolate(
+            x.float(), scale_factor=2.0, mode='nearest').type_as(x)
+    WanUpsample.forward = _patched_upsample_forward
+    print("  Patched WanUpsample: nearest-exact -> nearest")
+
     with NxDParallelState(world_size=world_size, tensor_model_parallel_size=tp_degree):
         # ========== Compile Decoder (bfloat16, 1 input arg) ==========
         print("\nPreparing decoder (bfloat16, no external feat_cache)...")
@@ -184,9 +195,11 @@ def compile_decoder_nocache(args):
 
         print("Compiling...")
         compile_args = "--model-type=unet-inference -O1 --auto-cast=none"
+        # Use absolute path to avoid doubled --logfile path in neuronx-cc
+        abs_compiler_workdir = os.path.abspath(args.compiler_workdir)
         traced = builder.compile(
             compiler_args=compile_args,
-            compiler_workdir=args.compiler_workdir,
+            compiler_workdir=abs_compiler_workdir,
         )
 
         # Save
@@ -229,7 +242,7 @@ def compile_decoder_nocache(args):
         pqc_builder.trace(kwargs={"x": pqc_input}, tag="conv")
         traced_pqc = pqc_builder.compile(
             compiler_args="--model-type=unet-inference -O1 --auto-cast=none",
-            compiler_workdir=args.compiler_workdir,
+            compiler_workdir=abs_compiler_workdir,
         )
 
         pqc_output_path = f"{compiled_models_dir}/post_quant_conv"

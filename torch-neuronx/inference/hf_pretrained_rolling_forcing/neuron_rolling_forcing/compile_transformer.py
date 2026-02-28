@@ -44,7 +44,7 @@ from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, Row
 from neuronx_distributed.parallel_layers import parallel_state
 from safetensors.torch import load_file, save_file
 
-from neuron_commons import nki_flash_attention, local_rms_norm, apply_rotary_emb
+from neuron_commons import nki_flash_attention, nki_flash_attention_causal, local_rms_norm, apply_rotary_emb
 from neuron_parallel_utils import (
     get_sharded_data,
     shard_causal_wan_self_attention,
@@ -86,8 +86,13 @@ class NeuronCausalSelfAttention(nn.Module):
 
     Replaces:
     - Complex RoPE → real-valued cos/sin (pre-computed, passed as input)
-    - flex_attention → NKI flash attention (no explicit causal mask)
+    - flex_attention → NKI flash attention with causal mask
     - Dynamic KV cache → removed (full-sequence processing)
+
+    Uses causal masking so that clean frames (anchor + working cache) at the
+    start of the sequence don't attend to noisy frames later in the sequence.
+    This preserves clean frame K/V quality, matching the original pipeline's
+    KV cache behavior where clean frames were processed in isolation.
     """
 
     def __init__(self, orig_self_attn, tp_degree=4):
@@ -135,15 +140,16 @@ class NeuronCausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, rope_cos, rope_sin)
         k = apply_rotary_emb(k, rope_cos, rope_sin)
 
-        # Pad sequence to next power of 2 for NKI flash attention
-        pad_s = _next_power_of_2(S) - S
+        # Pad sequence to multiple of 2048 for flash_fwd kernel requirement
+        target_s = ((S + 2047) // 2048) * 2048
+        pad_s = target_s - S
         if pad_s > 0:
             q = torch.nn.functional.pad(q, (0, 0, 0, pad_s))
             k = torch.nn.functional.pad(k, (0, 0, 0, pad_s))
             v = torch.nn.functional.pad(v, (0, 0, 0, pad_s))
 
-        # NKI Flash Attention
-        out = nki_flash_attention(q, k, v)
+        # NKI Flash Attention with causal mask
+        out = nki_flash_attention_causal(q, k, v)
 
         # Remove padding
         if pad_s > 0:
@@ -579,9 +585,12 @@ def compile_transformer(args):
 
         print("Compiling model...")
         compile_args = "--model-type=transformer -O1 --auto-cast=none"
+        # Use absolute path for compiler_workdir to avoid doubled --logfile path
+        # in neuronx-cc (relative path gets resolved against compiler's own workdir)
+        abs_compiler_workdir = os.path.abspath(args.compiler_workdir)
         traced_model = builder.compile(
             compiler_args=compile_args,
-            compiler_workdir=args.compiler_workdir,
+            compiler_workdir=abs_compiler_workdir,
         )
 
         # Save compiled model
@@ -685,7 +694,7 @@ if __name__ == "__main__":
     parser.add_argument("--tp_degree", type=int, default=4)
     parser.add_argument("--world_size", type=int, default=8)
     parser.add_argument("--checkpoint_path", type=str,
-                       default="/opt/dlami/nvme/rolling_forcing_hf_cache/rolling_forcing/rolling_forcing_dmd.pt")
+                       default="/opt/dlami/nvme/rolling_forcing_hf_cache/rolling_forcing/checkpoints/rolling_forcing_dmd.pt")
     parser.add_argument("--compiled_models_dir", type=str, default="compiled_models")
     parser.add_argument("--compiler_workdir", type=str, default="compiler_workdir")
     args = parser.parse_args()

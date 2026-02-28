@@ -89,11 +89,7 @@ def main():
     mem = torch.cuda.max_memory_allocated() / 1024**3
     print(f"GPU memory: {mem:.1f} GB")
 
-    # Encode text
     print(f"\nPrompt: {args.prompt}")
-    prompt_embeds = pipeline.text_encoder.encode([args.prompt])
-    if isinstance(prompt_embeds, (list, tuple)):
-        prompt_embeds = prompt_embeds[0]
 
     # Warmup + timed runs
     all_times = []
@@ -102,13 +98,19 @@ def main():
         label = f"Warmup {run+1}" if is_warmup else f"Run {run - args.num_warmup + 1}"
 
         torch.manual_seed(args.seed)
+
+        # Create noise: [B, num_latent_frames, C, H, W]
+        noise = torch.randn(
+            1, num_output_frames, 16, config.height // 8, config.width // 8,
+            device=device, dtype=torch.bfloat16)
+
         torch.cuda.synchronize()
         t_start = time.time()
 
-        # Run inference
+        # Run inference (text encoding happens inside)
         video = pipeline.inference_rolling_forcing(
-            prompt_embeds=prompt_embeds,
-            num_output_frames=num_output_frames,
+            noise=noise,
+            text_prompts=[args.prompt],
             profile=False,
         )
 

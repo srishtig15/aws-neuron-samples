@@ -15,13 +15,15 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-# NKI Flash Attention kernel
+# NKI Flash Attention kernels
 try:
     from neuronxcc.nki._private_kernels.attention import attention_isa_kernel
 except ImportError:
     from neuronxcc.nki.kernels.attention import attention_isa_kernel
 
-from neuronxcc.nki.language import nc
+from neuronxcc.nki.kernels.attention import FlashConfig
+from neuronxcc.nki.kernels import flash_fwd as _nki_flash_fwd
+import neuronxcc.nki.language as nl
 from torch_neuronx.xla_impl.ops import nki_jit
 
 _flash_fwd_call = nki_jit()(attention_isa_kernel)
@@ -29,7 +31,7 @@ _flash_fwd_call = nki_jit()(attention_isa_kernel)
 
 def nki_flash_attention(query, key, value):
     """
-    NKI Flash Attention wrapper.
+    NKI Flash Attention wrapper (no causal mask, for cross-attention).
 
     Args:
         query: [B, H, Q_len, D]
@@ -53,7 +55,7 @@ def nki_flash_attention(query, key, value):
 
     vc_size = int(os.getenv("NEURON_RT_VIRTUAL_CORE_SIZE", "1"))
     if vc_size == 2:
-        grid = (nc(2),)
+        grid = (nl.nc(2),)
         _flash_fwd_call[grid](q, k, v, scale, attn_output,
                               kernel_name="AttentionMMSoftmaxMMWithoutSwap")
     else:
@@ -61,6 +63,56 @@ def nki_flash_attention(query, key, value):
                         kernel_name="AttentionMMSoftmaxMMWithoutSwap")
 
     return attn_output.reshape((bs, n_head, q_len, d_head))
+
+
+def nki_flash_attention_causal(query, key, value):
+    """
+    NKI Flash Attention with causal mask (for self-attention).
+
+    Uses the public flash_fwd kernel which supports use_causal_mask=True.
+    Each token can only attend to tokens at the same or earlier positions.
+
+    This is critical for our full-sequence processing approach:
+    - Clean frames (anchor + working cache) come first in the sequence
+    - Noisy frames (current window) come later
+    - With causal mask, clean frames don't attend to noisy frames,
+      preserving the quality of their K/V representations.
+
+    Args:
+        query: [B, H, Q_len, D]
+        key: [B, H, KV_len, D]
+        value: [B, H, KV_len, D]
+
+    Returns:
+        attention output [B, H, Q_len, D]
+    """
+    bs, n_head, q_len, d_head = query.shape
+
+    # flash_fwd expects:
+    #   q: (bs, n_heads, d, seq_q)
+    #   k: (bs, n_heads, d, seq_k)
+    #   v: (bs, n_heads, seq_v, d)  (with should_transpose_v=False)
+    #   output: (bs, n_heads, seq_q, d)
+    q = query.permute(0, 1, 3, 2).contiguous()  # [B, H, D, S]
+    k = key.permute(0, 1, 3, 2).contiguous()    # [B, H, D, S]
+    v = value.contiguous()                        # [B, H, S, D]
+
+    scale = 1.0 / math.sqrt(d_head)
+    config = FlashConfig(training=False, seq_tile_size=2048)
+
+    # Use non-sharded grid [bs, num_heads] for compatibility with
+    # odd head counts (e.g., 3 heads per TP rank with TP=4, 12 total)
+    # seed=None for inference (no dropout), returns single tensor (not tuple)
+    attn_output = _nki_flash_fwd[bs, n_head](
+        q, k, v, None,
+        softmax_scale=scale,
+        use_causal_mask=True,
+        mixed_precision=True,
+        dropout_p=0.0,
+        config=config,
+    )
+
+    return attn_output  # [B, H, S, D]
 
 
 def local_rms_norm(x, weight, eps=1e-6):

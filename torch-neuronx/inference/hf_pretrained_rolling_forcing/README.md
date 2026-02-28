@@ -25,7 +25,7 @@ RollingForcing uses a DMD-distilled CausalWanModel (Wan2.1-T2V-1.3B) that genera
 | max_frames | 21 (latent) -> 81 (pixel via VAE temporal upsampling) |
 | Denoising steps | 5 (DMD distilled) |
 
-### Key Design Decision: Full-Sequence Processing (No KV Cache)
+### Design: Full-Sequence Processing (No KV Cache)
 
 The original RollingForcing uses per-layer KV cache with dynamic rolling/eviction and an attention sink mechanism. This is incompatible with Neuron's static tensor shape requirement. Instead, we process the **full visible sequence** (up to 21 frames = 32760 tokens) in each forward call:
 
@@ -35,7 +35,7 @@ The original RollingForcing uses per-layer KV cache with dynamic rolling/evictio
 | Total calls for 21 frames | 22 | 11 |
 | Per-call tokens (Q) | Variable (up to 23400) | Fixed (32760, padded) |
 | KV cache management | Dynamic per-layer rolling | None (host-side latents) |
-| Attention mask | Causal via KV cache | No explicit mask (NKI flash attention) |
+| Attention mask | Causal via KV cache structure | No explicit mask (NKI flash attention) |
 
 ## Project Structure
 
@@ -49,6 +49,8 @@ hf_pretrained_rolling_forcing/
 ├── diagnose.py                         # Diagnostic tests
 ├── test_single_step.py                 # Single-step transformer isolation test
 ├── test_cpu_vs_neuron.py               # CPU vs Neuron output comparison
+├── test_5step_cpu.py                   # Full 5-step CPU test
+├── test_diffusers_baseline.py          # Diffusers baseline comparison
 └── neuron_rolling_forcing/
     ├── __init__.py
     ├── cache_hf_model.py               # Download model weights
@@ -91,31 +93,19 @@ Downloads:
 bash compile.sh
 ```
 
-This compiles three components:
+Compiles three components:
 
 1. **Text Encoder** (UMT5-XXL, TP=8, ~15 min)
-   - Same architecture as Wan2.2, adapted from existing compilation code
-   - Pre-computes attention bias per TP rank
-   - Wraps LayerNorm in f32Wrapper for precision
-
 2. **VAE Decoder** (Wan 3D VAE, NoCache mode, TP=8, ~5 min)
-   - Processes 2 latent frames at a time (CACHE_T=2 requirement)
-   - 32 feat_cache buffers registered as zero buffers
-   - Frame-by-frame decoding with temporal upsampling (4x)
-
 3. **Transformer** (CausalWanModel, TP=4, world_size=8, ~30-60 min)
-   - NKI Flash Attention (kernel: `AttentionMMSoftmaxMMWithoutSwap`)
-   - Real-valued RoPE (cos/sin) replacing complex-valued `torch.polar`
-   - Per-frame timestep modulation preserved
-   - Sequence padded to power of 2 (32760 -> 32768) for NKI
 
-Output: `compiled_models/` directory with all compiled artifacts.
+Output: `compiled_models/` directory.
 
 ## Inference
 
 ```bash
 python run_rolling_forcing.py \
-    --prompt "A cat walking gracefully across a sunlit garden path" \
+    --prompt A cat walking gracefully across a sunlit garden path \
     --num_frames 81 \
     --seed 42 \
     --output_path ~/Downloads/output.mp4
@@ -125,7 +115,7 @@ python run_rolling_forcing.py \
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--prompt` | "A cat walking..." | Text prompt |
+| `--prompt` | A cat walking... | Text prompt |
 | `--num_frames` | 81 | Output video frames (81 = 21 latent frames) |
 | `--seed` | 42 | Random seed |
 | `--fps` | 16 | Output video FPS |
@@ -141,7 +131,9 @@ python run_rolling_forcing.py \
 2. **Timestep Warping**: Raw steps [1000, 800, 600, 400, 200] -> warped [1000.0, 952.4, 882.4, 769.2, 555.6]
 3. **Rolling Forcing Loop**: 11 windows, each processing up to 5 blocks (15 frames):
    - Build noisy input from cached blocks + fresh noise for new block
-   - Assign per-frame timesteps (clean blocks: low t, noisy blocks: high t)
+   - Prepend anchor frames (finalized clean blocks) for temporal context
+   - Assign per-frame timesteps (clean blocks: t=0, noisy blocks: varying t)
+   - Pad to 21 frames with noise at max_t
    - Compute RoPE for frame positions
    - Run compiled transformer -> flow prediction
    - Convert flow to x0: `x0 = xt - sigma * flow_pred`
@@ -156,11 +148,12 @@ python run_rolling_forcing.py \
 | Original Component | Neuron Replacement | Notes |
 |--------------------|--------------------|-------|
 | Complex RoPE (`torch.polar`) | Real-valued cos/sin | Pre-computed, passed as input |
-| `flash_attn` / `flex_attention` | NKI Flash Attention | `AttentionMMSoftmaxMMWithoutSwap` kernel |
+| `flash_attn` / `flex_attention` | NKI Flash Attention | kernel + causal variant via `flash_fwd` |
 | Dynamic KV cache | Eliminated | Full-sequence processing, host-side cache |
-| Block-wise causal mask | No explicit mask | NKI kernel processes full sequence |
+| Block-wise causal mask | See Quality section | Various options tested |
 | `WanRMSNorm` (global) | `local_rms_norm` | Per-TP-rank normalization, no all-reduce |
 | float64 flow->x0 | float32 | Neuron doesn't support float64 |
+| `nearest-exact` upsampling | `nearest` | Neuron compatibility patch |
 
 ### Tensor Parallelism (TP=4 for transformer)
 
@@ -176,7 +169,7 @@ python run_rolling_forcing.py \
 
 ### RoPE: 3D Positional Encoding
 
-Wan's RoPE splits head_dim=128 into three axes:
+Wan RoPE splits head_dim=128 into three axes:
 - Temporal: 44 dims
 - Spatial height: 42 dims
 - Spatial width: 42 dims
@@ -187,7 +180,7 @@ freqs = concat(freqs_t[f], freqs_h[h], freqs_w[w])
 rope_cos = cos(freqs), rope_sin = sin(freqs)
 ```
 
-The interleaved format uses `repeat_interleave(2)` to match Wan's `view_as_complex` pattern.
+Padding frames get sequential positions after real frames (not position 0) to avoid RoPE collision.
 
 ### Flow Matching Scheduler
 
@@ -195,63 +188,58 @@ The interleaved format uses `repeat_interleave(2)` to match Wan's `view_as_compl
 sigma_warped = shift * sigma / (1 + (shift - 1) * sigma)    # shift=5.0
 timestep = sigma_warped * 1000
 
-# Flow to x0 conversion:
-x0 = xt - sigma * flow_pred
-
-# Re-noising for next step:
-x_next = (1 - sigma_next) * x0 + sigma_next * fresh_noise
+x0 = xt - sigma * flow_pred                                  # flow to x0
+x_next = (1 - sigma_next) * x0 + sigma_next * fresh_noise    # re-noising
 ```
 
-## Debugging & Known Issues
+## Quality Analysis
 
-### Current Status
+### GPU Reference Experiments (H100)
 
-The pipeline runs end-to-end with correct shapes and reasonable performance (~22s for denoising), but the output video quality has issues.
+Comprehensive experiments were run on H100 to identify the root cause of the quality gap.
+The original pipeline (KV cache) serves as the quality reference (pixel_std = 70.2).
 
-### Issue: Grid Artifacts at 2x2 Patch Level
+| Method | pixel_std | cos_sim vs original | Notes |
+|--------|-----------|---------------------|-------|
+| **Original GPU (KV cache)** | **70.2** | **1.0** | Reference |
+| Neuron padded, CFG=7 | 56.8 | - | Current best Neuron output |
+| GPU bidirectional, no pad | 22.4 | 0.186 | SDPA, no mask |
+| GPU block-causal, no pad | 22.8 | 0.177 | Per-block SDPA (correct training mask) |
+| GPU token-causal, no pad | ~14 | 0.139 | Triangular causal mask |
 
-**Symptom**: Output video shows a visible 2x2 grid pattern overlaid on the content.
+### Key Findings
 
-**Root Cause Analysis**:
+1. **Padding dilution is NOT the main issue**: Removing padding makes quality WORSE (22.4 vs 56.8). The padding with noise at max_t actually helps by providing the model additional context.
 
-1. **Not a Neuron compilation issue**: CPU model produces the same pattern (verified in `test_cpu_vs_neuron.py`, cosine sim 0.995 between CPU and Neuron output)
+2. **Attention mask type does not matter**: Bidirectional (22.4), block-causal (22.8), and token-causal (~14) all produce similar poor quality. This rules out attention masking as the root cause.
 
-2. **Not a causal mask issue**: Tested both causal and non-causal attention on CPU - same pattern in both (cosine sim 0.995)
+3. **KV cache is essential for quality**: The original pipeline's two-pass approach provides:
+   - **Isolated clean representations**: Clean frames' K/V are computed in a separate cache-update pass (t≈0), never contaminated by noisy frames
+   - **Frozen context**: During the denoise pass, cached clean K/V is read-only; only noisy frames' representations are computed fresh
+   - Without this isolation, clean frames are reprocessed alongside noisy frames in every window, degrading their representations
 
-3. **Not a VAE issue**: Decoding pure noise through the VAE produces clean output (no grid). The grid only appears with model-generated latents.
+4. **The quality gap is fundamental to single-pass processing**: Any approach that processes clean + noisy frames in a single forward pass will suffer, regardless of attention masking, because the model was designed for KV-cache inference.
 
-4. **Not in latent patch boundaries**: Analysis showed no systematic difference at 2x2 patch boundaries in latent space (across/within ratios all ~1.0)
+### Next Steps: KV Cache Implementation
 
-5. **Within-patch sub-pixel bias**: The 4 sub-pixels within each 2x2 patch have systematic position-dependent offsets (up to +/-0.49). This is caused by `head_linear.bias` dominating when the model produces near-constant hidden states:
-   ```
-   Model output:  d(0,0)=-0.11, d(0,1)=-0.37, d(1,0)=+0.33, d(1,1)=+0.15
-   Random noise:  d(0,0)=-0.02, d(0,1)=+0.01, d(1,0)-0.01, d(1,1)=+0.02
-   ```
+To match original quality, we need to implement KV-cache inference on Neuron. Options under investigation:
 
-6. **Key insight**: The within-patch bias is a SYMPTOM, not the cause. A properly working model produces spatial content that overwhelms the bias. The model's predictions are too weak/uniform, allowing the constant bias term to become visible.
+- **External KV cache I/O**: Pass per-layer K/V as additional model inputs/outputs (30 layers x 2 tensors each)
+- **Custom NKI kernel**: Add `effective_kv_len` parameter to mask padded KV positions
+- **Bucketed compilation**: Compile separate models for each KV length bucket
+- **Block-causal NKI kernel**: Modify flash_fwd causal predicate for block-level granularity
 
-### Hypotheses for Weak Predictions
-
-1. **Missing KV cache context**: The original uses a second model call per window to update KV cache with clean (timestep=0) representations. Our full-sequence approach feeds re-noised blocks instead. The model was trained expecting clean KV cache context.
-
-2. **Missing anchor frames**: After block 0 exits the rolling window (window 5+), subsequent windows lack the first block's clean representation. The original maintains this as an "attention sink" in the KV cache.
-
-3. **No causal mask**: The original model uses causal attention (each frame only attends to past frames). Our NKI attention has no mask. While CPU testing showed similar results, the model may rely on causal structure during multi-step denoising.
-
-4. **Precision differences**: The original uses float64 for flow->x0 conversion. Our bf16/float32 pipeline may accumulate errors over 5 denoising steps.
-
-### Diagnostic Scripts
-
-- `diagnose.py --test unpatchify`: Verify unpatchify round-trip correctness
-- `diagnose.py --test cpu_forward`: Single forward pass on CPU with original model
-- `test_single_step.py`: Run compiled transformer at single timestep, decode with CPU VAE
-- `test_cpu_vs_neuron.py`: Compare CPU manual forward vs compiled Neuron output
+NKI flash_fwd kernel capabilities:
+- Supports different Q/KV lengths
+- `logit_bias`: [1,1,seq_q,seq_k] with batch/head broadcasting, but full Q×K matrix required (~2.4GB for 32760²)
+- `use_causal_mask`: tile-level skip for token-level causal
+- `sliding_window`: causal sliding window
 
 ## Performance
 
 | Component | Time | Notes |
 |-----------|------|-------|
-| Text encoding | ~10.7s | First call, includes warmup |
+| Text encoding | ~10.7s | First call includes warmup |
 | Denoising (11 windows) | ~22.2s | ~2.0s/window |
 | VAE decoding | ~9.9s | 21 latent -> 81 pixel frames |
 | **Total** | **~43s** | End-to-end |
@@ -260,16 +248,15 @@ The pipeline runs end-to-end with correct shapes and reasonable performance (~22
 
 | Component | Source | Reuse Level |
 |-----------|--------|-------------|
-| NKI flash attention | `compile_transformer_v3_cp.py` | Direct copy |
-| `local_rms_norm()` | `compile_transformer_v3_cp.py` | Direct copy |
-| `apply_rotary_emb()` | `compile_transformer_v3_cp.py` | Adapted (no CP split) |
-| `f32Wrapper` | `neuron_commons.py` | Direct copy |
-| UMT5 sharding | `neuron_parallel_utils.py` | Direct copy |
-| VAE NoCache decoder | `compile_decoder_v3_nocache.py` | Adapted for Wan2.1 |
-| ModelBuilder pattern | `compile_transformer_v3_cp.py` | Adapted |
+| NKI flash attention | compile_transformer_v3_cp.py | Direct copy |
+| local_rms_norm() | compile_transformer_v3_cp.py | Direct copy |
+| apply_rotary_emb() | compile_transformer_v3_cp.py | Adapted (no CP split) |
+| f32Wrapper | neuron_commons.py | Direct copy |
+| UMT5 sharding | neuron_parallel_utils.py | Direct copy |
+| VAE NoCache decoder | compile_decoder_v3_nocache.py | Adapted for Wan2.1 |
+| ModelBuilder pattern | compile_transformer_v3_cp.py | Adapted |
 
 ## References
 
-- [RollingForcing Paper](https://arxiv.org/abs/xxxx) (TencentARC)
+- [RollingForcing (TencentARC)](https://github.com/TencentARC/RollingForcing)
 - [Wan 2.1 T2V](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers) (HuggingFace)
-- Wan2.2 TI2V Neuron adaptation: `/Users/henanwan/Documents/workspace/wan2.2-ti2v-neuron/code/`

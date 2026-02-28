@@ -219,8 +219,16 @@ class NeuronTransformerWrapper:
         # Pad to MAX_FRAMES if needed
         if F < MAX_FRAMES:
             pad_f = MAX_FRAMES - F
-            hidden_states = F_module.pad(hidden_states, (0, 0, 0, 0, 0, pad_f))
-            timestep = F_module.pad(timestep, (0, pad_f), value=0.0)
+            # Pad with random noise at the max timestep instead of zeros at t=0.
+            # Zero-padding with t=0 tells the model "these are clean frames with zero
+            # content", which dilutes attention and weakens predictions for real frames
+            # (especially severe for early windows with only 3-6 real frames).
+            # Noise-padding with the same high timestep makes padded frames look like
+            # additional noisy input, so the model treats them similarly to real frames.
+            pad_noise = torch.randn(B, C, pad_f, H, W, dtype=hidden_states.dtype)
+            hidden_states = torch.cat([hidden_states, pad_noise], dim=2)
+            max_t = timestep.max().item()
+            timestep = F_module.pad(timestep, (0, pad_f), value=max_t)
 
         # Pad RoPE to MAX_SEQ_LEN if needed
         rope_seq = rope_cos.shape[1]

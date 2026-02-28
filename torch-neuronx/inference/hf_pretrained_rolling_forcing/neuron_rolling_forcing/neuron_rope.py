@@ -146,10 +146,14 @@ def compute_rope_for_rolling_window(
     assert num_real_frames <= max_frames, \
         f"Total frames {num_real_frames} exceeds max_frames {max_frames}"
 
-    # Pad frame positions if needed (padding frames get position 0, won't affect output
-    # since they are masked/ignored in the final extraction)
+    # Pad frame positions with sequential positions after the last real frame.
+    # Using position 0 would collide with real frame 0's temporal RoPE;
+    # sequential positions give padded frames distinct, natural RoPE embeddings.
     if num_real_frames < max_frames:
-        pad_positions = torch.zeros(max_frames - num_real_frames, dtype=torch.long)
+        last_pos = all_positions[-1].item() if len(all_positions) > 0 else 0
+        pad_count = max_frames - num_real_frames
+        pad_positions = torch.arange(
+            last_pos + 1, last_pos + 1 + pad_count, dtype=torch.long)
         all_positions = torch.cat([all_positions, pad_positions])
 
     return compute_wan_rope_3d(
