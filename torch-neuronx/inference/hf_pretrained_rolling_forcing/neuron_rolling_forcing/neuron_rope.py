@@ -4,10 +4,16 @@ Real-valued RoPE computation for Wan CausalWanModel on Neuron.
 The original Wan RoPE uses torch.polar (complex-valued), which is not supported
 on Neuron. This module converts to real-valued cos/sin representation.
 
-Wan's 3D RoPE splits head_dim=128 into:
-- temporal: d - 4*(d//6) = 128 - 84 = 44
-- spatial_h: 2*(d//6) = 42
-- spatial_w: 2*(d//6) = 42
+Wan's 3D RoPE uses a SHARED frequency base computed from the full head_dim=128,
+then splits the 64 complex frequencies into three groups:
+- temporal: 22 complex = 44 real dims (low frequencies, large wavelengths)
+- spatial_h: 21 complex = 42 real dims (medium frequencies)
+- spatial_w: 21 complex = 42 real dims (high frequencies)
+
+IMPORTANT: All three axes share frequencies from the same base
+  base_freqs = 1/theta^(arange(0, 128, 2) / 128)
+NOT separate bases per axis. This ensures temporal uses low frequencies
+and spatial uses progressively higher frequencies.
 
 For each token at position (f, h, w), the full frequency vector is:
   freqs = concat(freqs_t[f], freqs_h[h], freqs_w[w])
@@ -17,26 +23,6 @@ Then: cos_emb = cos(freqs), sin_emb = sin(freqs)
 import torch
 import numpy as np
 from typing import Tuple
-
-
-def _compute_freqs_1d(max_pos: int, dim: int, theta: float = 10000.0) -> torch.Tensor:
-    """Compute 1D frequency table.
-
-    Args:
-        max_pos: Maximum position index
-        dim: Dimension of frequency vector (half of the embedding dim for this axis)
-        theta: Base for exponential frequency scaling
-
-    Returns:
-        freqs: [max_pos, dim] frequency angles
-    """
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float64) / dim))
-    positions = torch.arange(max_pos, dtype=torch.float64)
-    # [max_pos, dim//2] but we want [max_pos, dim] for interleaved
-    angles = torch.outer(positions, freqs)  # [max_pos, dim//2]
-    # Interleave: for each position, produce [a0, a0, a1, a1, ...] matching Wan's format
-    angles_interleaved = angles.repeat_interleave(2, dim=-1)  # [max_pos, dim]
-    return angles_interleaved
 
 
 def compute_wan_rope_3d(
@@ -49,6 +35,11 @@ def compute_wan_rope_3d(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Compute real-valued 3D RoPE for Wan CausalWanModel.
+
+    Matches the original rope_params + rope_apply from wan/modules/model.py:
+    1. Compute 64 base frequencies from head_dim=128
+    2. Split into temporal (22), spatial_h (21), spatial_w (21) complex frequencies
+    3. For each token (f, h, w), compute angles and interleave for real-valued RoPE
 
     Args:
         num_frames: Number of frames (after patching, e.g. 21)
@@ -64,18 +55,39 @@ def compute_wan_rope_3d(
         rope_sin: [1, seq_len, 1, head_dim] sine embeddings
         where seq_len = num_frames * height * width
     """
-    d = head_dim
-    # Wan's dimension split: temporal, spatial_h, spatial_w
-    d_t = d - 4 * (d // 6)  # 128 - 84 = 44
-    d_h = 2 * (d // 6)       # 42
-    d_w = 2 * (d // 6)       # 42
-    assert d_t + d_h + d_w == d, f"Dimension split error: {d_t}+{d_h}+{d_w} != {d}"
+    d = head_dim  # 128
 
-    # Compute 1D frequency tables
-    max_pos = 1024  # Wan uses 1024 as max position
-    freqs_t = _compute_freqs_1d(max_pos, d_t, theta)  # [1024, d_t]
-    freqs_h = _compute_freqs_1d(max_pos, d_h, theta)  # [1024, d_h]
-    freqs_w = _compute_freqs_1d(max_pos, d_w, theta)  # [1024, d_w]
+    # Step 1: Compute shared base frequencies (matching rope_params)
+    # base_freqs[i] = 1/theta^(2i/128) for i=0..63
+    max_pos = 1024
+    base_freqs = 1.0 / torch.pow(
+        theta, torch.arange(0, d, 2, dtype=torch.float64) / d)  # [64]
+
+    # Step 2: Split into temporal, spatial_h, spatial_w (matching rope_apply)
+    # c = head_dim // 2 = 64
+    # split sizes: [c - 2*(c//3), c//3, c//3] = [22, 21, 21]
+    c = d // 2  # 64
+    n_t = c - 2 * (c // 3)  # 22 complex frequencies for temporal
+    n_h = c // 3              # 21 complex frequencies for spatial_h
+    n_w = c // 3              # 21 complex frequencies for spatial_w
+
+    freq_t = base_freqs[:n_t]               # [22] — low frequencies
+    freq_h = base_freqs[n_t:n_t + n_h]      # [21] — medium frequencies
+    freq_w = base_freqs[n_t + n_h:]          # [21] — high frequencies
+
+    # Step 3: Compute per-position angle tables
+    # angles[pos] = pos * freq for each 1D position
+    positions = torch.arange(max_pos, dtype=torch.float64)
+    angles_t = torch.outer(positions, freq_t)  # [1024, 22]
+    angles_h = torch.outer(positions, freq_h)  # [1024, 21]
+    angles_w = torch.outer(positions, freq_w)  # [1024, 21]
+
+    # Step 4: Interleave angles to match complex->real conversion
+    # Original: view_as_complex(x.reshape(..., 2)) applies one angle per pair
+    # Real equivalent: [θ0, θ0, θ1, θ1, ...] so each pair shares an angle
+    angles_t_interleaved = angles_t.repeat_interleave(2, dim=-1)  # [1024, 44]
+    angles_h_interleaved = angles_h.repeat_interleave(2, dim=-1)  # [1024, 42]
+    angles_w_interleaved = angles_w.repeat_interleave(2, dim=-1)  # [1024, 42]
 
     # Frame positions
     if frame_positions is None:
@@ -83,8 +95,10 @@ def compute_wan_rope_3d(
     else:
         frame_positions = frame_positions.long()
 
-    # Build per-token frequency vector: for token at (f, h, w)
-    # freq = concat(freqs_t[frame_positions[f]], freqs_h[h], freqs_w[w])
+    # Step 5: Build per-token frequency vector
+    d_t = n_t * 2  # 44 real dims
+    d_h = n_h * 2  # 42 real dims
+    d_w = n_w * 2  # 42 real dims
     seq_len = num_frames * height * width
     all_freqs = torch.zeros(seq_len, d, dtype=torch.float64)
 
@@ -93,12 +107,12 @@ def compute_wan_rope_3d(
         f_pos = frame_positions[f_idx].item()
         for h in range(height):
             for w in range(width):
-                all_freqs[idx, :d_t] = freqs_t[f_pos]
-                all_freqs[idx, d_t:d_t+d_h] = freqs_h[h]
-                all_freqs[idx, d_t+d_h:] = freqs_w[w]
+                all_freqs[idx, :d_t] = angles_t_interleaved[f_pos]
+                all_freqs[idx, d_t:d_t + d_h] = angles_h_interleaved[h]
+                all_freqs[idx, d_t + d_h:] = angles_w_interleaved[w]
                 idx += 1
 
-    # Convert to cos/sin in Wan's expected format: [1, seq_len, 1, head_dim]
+    # Convert to cos/sin: [1, seq_len, 1, head_dim]
     rope_cos = torch.cos(all_freqs).unsqueeze(0).unsqueeze(2).float()
     rope_sin = torch.sin(all_freqs).unsqueeze(0).unsqueeze(2).float()
 

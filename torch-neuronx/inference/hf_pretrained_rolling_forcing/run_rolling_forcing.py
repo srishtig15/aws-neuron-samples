@@ -500,12 +500,13 @@ def run_rolling_forcing(args):
     output = torch.zeros(1, latent_frames, num_channels, latent_h, latent_w)
     noisy_cache = torch.zeros_like(output)
 
-    # Clean frame buffer for anchor context
-    # Tracks finalized blocks (completed all denoising steps)
-    # These are prepended to each window with timestep=0 to provide context,
-    # replacing the KV cache function from the original pipeline.
-    clean_frames = torch.zeros(1, 0, num_channels, latent_h, latent_w)
-    # Track which block indices are finalized
+    # pred_x0 cache: stores each block's latest predicted x0 (clean estimate).
+    # Updated after EVERY window (not just finalization), mimicking the original
+    # pipeline's KV cache behavior where clean representations are available
+    # from the very first window.
+    # Key = block_idx, Value = [1, BLOCK_SIZE, C, H, W] tensor
+    pred_x0_cache = {}
+    # Track which block indices are finalized (completed all denoising steps)
     finalized_blocks = set()
 
     # Denoising loop
@@ -542,51 +543,58 @@ def run_rolling_forcing(args):
         else:
             raise ValueError(f"Unexpected window: start={current_start}, end={current_end}")
 
-        # 3. Build full visible sequence with clean anchor context
-        # Anchor frames: clean finalized frames that aren't in the current window
-        # These provide context (replacing KV cache from original pipeline)
+        # 3. Build full visible sequence with clean pred_x0 context
+        # Use pred_x0_cache to provide clean frame context, matching the original
+        # pipeline's KV cache mechanism. Clean frames go FIRST (causal attention
+        # ensures they only attend to other clean frames, preserving quality).
+        #
+        # Selection strategy (matching original):
+        # - Block 0 as "attention sink" (always included if cached)
+        # - Recent cached blocks as "working cache" (most relevant context)
+        # - Blocks IN the current noisy window can also be included as clean
+        #   context (original does this too: anchor block 0 appears in both
+        #   clean KV cache and noisy input simultaneously)
         anchor_frames = None
         anchor_positions = torch.tensor([], dtype=torch.long)
         n_anchor = 0
 
-        if clean_frames.shape[1] > 0:
-            # Select anchor frames that are NOT in the current window
-            # Use the first block (attention sink) + recent finalized blocks
+        if pred_x0_cache:
             max_anchor_frames = MAX_FRAMES - current_num_frames
-            if max_anchor_frames > 0 and max_anchor_frames >= BLOCK_SIZE:
-                # Always include first block (attention sink) if finalized
+            if max_anchor_frames >= BLOCK_SIZE:
                 anchor_block_indices = []
-                if 0 in finalized_blocks and start_block > 0:
+
+                # Always include block 0 (attention sink) if cached and NOT
+                # in current window. Original uses local_start_index==0 to skip
+                # cache context entirely for windows starting at block 0.
+                if 0 in pred_x0_cache and start_block > 0:
                     anchor_block_indices.append(0)
 
-                # Add recent finalized blocks not in current window
-                for blk in sorted(finalized_blocks):
+                # Add cached blocks before the current window (working cache)
+                for blk in sorted(pred_x0_cache.keys()):
+                    if blk in anchor_block_indices:
+                        continue
                     if blk >= start_block:
-                        break
-                    if blk not in anchor_block_indices:
-                        total_anchor = (len(anchor_block_indices) + 1) * BLOCK_SIZE
-                        if total_anchor <= max_anchor_frames:
-                            anchor_block_indices.append(blk)
+                        break  # Only include blocks before current window
+                    total_anchor = (len(anchor_block_indices) + 1) * BLOCK_SIZE
+                    if total_anchor <= max_anchor_frames:
+                        anchor_block_indices.append(blk)
 
                 if anchor_block_indices:
                     anchor_list = []
                     anchor_pos_list = []
                     for blk in sorted(anchor_block_indices):
+                        # Use pred_x0_cache (latest clean estimate) instead of output
+                        anchor_list.append(pred_x0_cache[blk])
                         blk_start_f = blk * BLOCK_SIZE
-                        blk_end_f = blk_start_f + BLOCK_SIZE
-                        anchor_list.append(output[:, blk_start_f:blk_end_f])
-                        # Anchor RoPE positions: use original frame indices
-                        anchor_pos_list.extend(range(blk_start_f, blk_end_f))
+                        anchor_pos_list.extend(range(blk_start_f, blk_start_f + BLOCK_SIZE))
 
                     anchor_frames = torch.cat(anchor_list, dim=1)
                     anchor_positions = torch.tensor(anchor_pos_list, dtype=torch.long)
                     n_anchor = anchor_frames.shape[1]
 
-        # Build visible input: [anchor (clean, t=0) | noisy (current window)]
+        # Build visible input: [clean pred_x0 at t=0 | noisy current window]
         if anchor_frames is not None and n_anchor > 0:
-            # Prepend anchor frames to noisy input
             full_input = torch.cat([anchor_frames, noisy_input], dim=1)
-            # Timestep: anchor=0, noisy=current
             anchor_timestep = torch.zeros(1, n_anchor, dtype=torch.float32)
             full_timestep = torch.cat([anchor_timestep, current_timestep], dim=1)
         else:
@@ -636,8 +644,13 @@ def run_rolling_forcing(args):
         # 7. Store output
         output[:, current_start:current_end] = pred_x0
 
-        # 8. Update noisy cache for next windows (matching original rolling forcing)
+        # 8. Update pred_x0_cache and noisy cache for next windows
         with torch.no_grad():
+            # Update pred_x0_cache for the FIRST block of the current window
+            # (matching original's cache update which only processes the first block)
+            first_blk_x0 = pred_x0[:, :BLOCK_SIZE].detach().clone()
+            pred_x0_cache[start_block] = first_blk_x0
+
             for block_idx in range(start_block, end_block + 1):
                 blk_start = (block_idx - start_block) * BLOCK_SIZE
                 blk_end = blk_start + BLOCK_SIZE
@@ -649,33 +662,31 @@ def run_rolling_forcing(args):
                 if len(step_idx) == 0 or step_idx[0] >= len(denoising_step_list) - 1:
                     # This block is at its final denoising step → mark as finalized
                     finalized_blocks.add(block_idx)
+                    # Also update pred_x0_cache for finalized blocks
+                    block_x0 = pred_x0[:, blk_start:blk_end].detach().clone()
+                    pred_x0_cache[block_idx] = block_x0
                     continue
 
                 next_t = denoising_step_list[step_idx[0] + 1]
-                block_x0 = pred_x0[:, blk_start:blk_end]
 
-                # Re-noise from x0 with fresh noise (matching original)
+                # Deterministic ODE step for re-noising:
+                #   x_{t-1} = xt + (sigma_{t-1} - sigma_t) * flow
+                # This avoids catastrophic cancellation in x0 = xt - sigma*flow
+                # and preserves the signal through intermediate steps.
+                sigma_current = scheduler.get_sigma(block_t)
+                sigma_next = scheduler.get_sigma(next_t)
+                flow_block = flow_pred_current[:, blk_start:blk_end].float()
+                noisy_block = noisy_input[:, blk_start:blk_end].float()
+
                 noisy_cache[:, block_idx*BLOCK_SIZE:(block_idx+1)*BLOCK_SIZE] = \
-                    scheduler.add_noise(
-                        block_x0.flatten(0, 1),
-                        torch.randn_like(block_x0.flatten(0, 1)),
-                        next_t * torch.ones(BLOCK_SIZE, dtype=torch.float32),
-                    ).unflatten(0, block_x0.shape[:2])
-
-        # Update clean_frames buffer from finalized blocks
-        if finalized_blocks:
-            clean_list = []
-            for blk in sorted(finalized_blocks):
-                blk_s = blk * BLOCK_SIZE
-                blk_e = blk_s + BLOCK_SIZE
-                clean_list.append(output[:, blk_s:blk_e])
-            clean_frames = torch.cat(clean_list, dim=1)
+                    noisy_block + (sigma_next - sigma_current) * flow_block
 
         w_time = time.time() - w_t0
-        anchor_str = f", anchor={n_anchor}f" if n_anchor > 0 else ""
+        anchor_str = f", clean={n_anchor}f" if n_anchor > 0 else ""
+        cache_str = f", cache={len(pred_x0_cache)}blk"
         print(f"  Window {window_idx}/{len(windows)-1}: "
               f"blocks [{start_block}-{end_block}], "
-              f"frames [{current_start}-{current_end}]{anchor_str}, "
+              f"frames [{current_start}-{current_end}]{anchor_str}{cache_str}, "
               f"{w_time:.2f}s")
 
     total_time = time.time() - total_t0

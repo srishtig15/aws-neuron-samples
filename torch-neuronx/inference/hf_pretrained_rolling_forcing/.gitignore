@@ -1,0 +1,13 @@
+# Compiled model artifacts (large binary files)
+compiled_models/
+compiler_workdir/
+
+# Output files
+output*.mp4
+output*.pt
+*.neff
+
+# Compiler logs
+log-neuron-cc.txt
+global_metric_store.json
+PostSPMDPassesExecutionDuration.txt
