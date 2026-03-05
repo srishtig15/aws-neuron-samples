@@ -31,73 +31,27 @@ from neuronx_distributed import ModelBuilder, NxDParallelState
 from safetensors.torch import save_file
 
 
-def compute_feat_cache_shapes(decoder, batch_size, in_channels, latent_height, latent_width, dtype=torch.bfloat16):
+def get_feat_cache_shapes(batch_size, latent_height, latent_width, dtype=torch.bfloat16):
     """
-    Compute feat_cache shapes dynamically by running a dummy forward pass.
+    Return the 34 feat_cache tensor shapes for the Wan2.2-T2V-A14B VAE decoder.
 
-    This avoids hardcoding channel widths that differ between TI2V-5B (z_dim=48)
-    and T2V-A14B (z_dim=16) VAEs.
-    """
-    decoder_cpu = decoder.cpu().eval()
+    CRITICAL: ALL 34 entries must be zero tensors (not None). The decoder's
+    WanResample.forward() checks `feat_cache[idx] is None` — if True, it skips
+    temporal upsampling entirely. Passing zero tensors ensures the temporal
+    upsample path (t → t*2) is traced and compiled correctly.
 
-    # Create dummy input
-    dummy_x = torch.zeros(batch_size, in_channels, 2, latent_height, latent_width, dtype=torch.float32)
-
-    # Initialize feat_cache with None to discover shapes
-    num_caches = 34  # Wan VAE decoder uses 34 feat_cache entries
-    feat_cache = [None] * num_caches
-
-    # Run forward pass to populate feat_cache shapes
-    with torch.no_grad():
-        try:
-            _ = decoder_cpu(dummy_x, feat_cache=feat_cache)
-        except Exception:
-            pass  # Some decoders may error but still populate feat_cache
-
-    # Extract shapes from populated feat_cache
-    shapes = []
-    for i, cache in enumerate(feat_cache):
-        if cache is not None and isinstance(cache, torch.Tensor):
-            # Use the actual shape from the forward pass, but fix batch and temporal dims
-            shape = list(cache.shape)
-            shape[0] = batch_size
-            shape[2] = 2  # CACHE_T=2
-            shapes.append(tuple(shape))
-        else:
-            # This entry wasn't used or is a non-tensor sentinel; provide a small placeholder
-            shapes.append((batch_size, 1, 2, 1, 1))
-
-    print(f"  Computed {len(shapes)} feat_cache shapes dynamically")
-    for i, s in enumerate(shapes):
-        print(f"    [{i:2d}] {s}")
-
-    return shapes
-
-
-def get_feat_cache_shapes_and_none_indices(batch_size, in_channels, latent_height, latent_width, dtype=torch.bfloat16):
-    """
-    Get feat_cache shapes and None indices for Wan2.2-T2V-A14B VAE (z_dim=16, base_dim=96).
-
-    Actual architecture (from dynamic discovery):
-    - conv_in: 16 channels (z_dim)
-    - mid_block: 384 channels (base_dim*4) — 4 entries (2 resnets × 2 convs)
-    - up_block_0: 384 channels — 6 entries (3 resnets × 2 convs)
-    - up_block_0 upsampler: None entry (first-chunk 'Rep' sentinel)
-    - up_block_1: 192/384 channels, 2x spatial — 6 entries
-    - up_block_1 upsampler: None entry (first-chunk 'Rep' sentinel)
-    - up_block_2: 192 channels, 4x spatial — 6 entries
-    - up_block_3: 96 channels, 8x spatial — 7 entries (3 resnets × 2 + conv_out)
-    - Entries 32, 33: unused (None)
-
-    Returns:
-        (shapes, none_indices): shapes list and set of indices that should be None
+    Architecture (z_dim=16, base_dim=96, dim_mult=[1,2,4,4]):
+    - conv_in: 16 channels
+    - mid_block: 384 channels, 4 entries
+    - up_block_0: 384 channels, 6 entries + upsampler cache
+    - up_block_1: 192/384 channels, 2× spatial, 6 entries + upsampler cache
+    - up_block_2: 192 channels, 4× spatial, 6 entries
+    - up_block_3: 96 channels, 8× spatial, 7 entries
+    - Entries 32-33: small placeholders (unused but must be tensors)
     """
     lh, lw = latent_height, latent_width
 
-    # Indices that should be None (upsampler 'Rep' sentinels + unused entries)
-    none_indices = {11, 18, 32, 33}
-
-    shapes = [
+    return [
         (batch_size, 16, 2, lh, lw),            # 0: conv_in
         (batch_size, 384, 2, lh, lw),            # 1: mid_block resnet_0 conv1
         (batch_size, 384, 2, lh, lw),            # 2: mid_block resnet_0 conv2
@@ -109,14 +63,14 @@ def get_feat_cache_shapes_and_none_indices(batch_size, in_channels, latent_heigh
         (batch_size, 384, 2, lh, lw),            # 8: up_block_0 resnet_1 conv2
         (batch_size, 384, 2, lh, lw),            # 9: up_block_0 resnet_2 conv1
         (batch_size, 384, 2, lh, lw),            # 10: up_block_0 resnet_2 conv2
-        None,                                     # 11: up_block_0 upsampler (Rep)
+        (batch_size, 384, 2, lh, lw),            # 11: up_block_0 upsampler (temporal upsample)
         (batch_size, 192, 2, lh*2, lw*2),        # 12: up_block_1 resnet_0 conv1
         (batch_size, 384, 2, lh*2, lw*2),        # 13: up_block_1 resnet_0 conv2
         (batch_size, 384, 2, lh*2, lw*2),        # 14: up_block_1 resnet_1 conv1
         (batch_size, 384, 2, lh*2, lw*2),        # 15: up_block_1 resnet_1 conv2
         (batch_size, 384, 2, lh*2, lw*2),        # 16: up_block_1 resnet_2 conv1
         (batch_size, 384, 2, lh*2, lw*2),        # 17: up_block_1 resnet_2 conv2
-        None,                                     # 18: up_block_1 upsampler (Rep)
+        (batch_size, 384, 2, lh*2, lw*2),        # 18: up_block_1 upsampler (temporal upsample)
         (batch_size, 192, 2, lh*4, lw*4),        # 19: up_block_2 resnet_0 conv1
         (batch_size, 192, 2, lh*4, lw*4),        # 20: up_block_2 resnet_0 conv2
         (batch_size, 192, 2, lh*4, lw*4),        # 21: up_block_2 resnet_1 conv1
@@ -130,11 +84,9 @@ def get_feat_cache_shapes_and_none_indices(batch_size, in_channels, latent_heigh
         (batch_size, 96, 2, lh*8, lw*8),         # 29: up_block_3 resnet_2 conv1
         (batch_size, 96, 2, lh*8, lw*8),         # 30: up_block_3 resnet_2 conv2
         (batch_size, 96, 2, lh*8, lw*8),         # 31: conv_out input cache
-        None,                                     # 32: unused
-        None,                                     # 33: unused
+        (batch_size, 96, 2, lh*8, lw*8),         # 32: placeholder (unused)
+        (batch_size, 12, 2, lh*8, lw*8),         # 33: placeholder (unused)
     ]
-
-    return shapes, none_indices
 
 
 class DecoderWrapperNoCache(nn.Module):
@@ -144,28 +96,25 @@ class DecoderWrapperNoCache(nn.Module):
     Eliminates ~960MB per-call data transfer by keeping feat_cache on device.
     Only x is transferred per call.
 
-    Some feat_cache entries are None (upsampler 'Rep' sentinels for first-chunk
-    behavior, and unused entries). These are NOT registered as buffers.
+    ALL 34 feat_cache entries are zero tensors — this is critical for temporal
+    upsampling. Passing None at upsampler positions causes the decoder to skip
+    the temporal upsample path entirely.
     """
+    NUM_FEAT_CACHE = 34
 
-    def __init__(self, decoder, feat_cache_shapes, none_indices=None, dtype=torch.bfloat16):
+    def __init__(self, decoder, feat_cache_shapes, dtype=torch.bfloat16):
         super().__init__()
         self.decoder = decoder
-        self.num_feat_cache = len(feat_cache_shapes)
-        self.none_indices = none_indices or set()
 
-        # Register feat_cache as persistent buffers (skip None entries)
+        # Register ALL feat_cache entries as persistent buffers
         for i, shape in enumerate(feat_cache_shapes):
-            if i not in self.none_indices and shape is not None:
-                self.register_buffer(f'feat_cache_{i}', torch.zeros(shape, dtype=dtype))
+            self.register_buffer(f'feat_cache_{i}', torch.zeros(shape, dtype=dtype))
 
     def forward(self, x):
-        feat_cache = []
-        for i in range(self.num_feat_cache):
-            if i in self.none_indices:
-                feat_cache.append(None)
-            else:
-                feat_cache.append(getattr(self, f'feat_cache_{i}'))
+        feat_cache = [
+            getattr(self, f'feat_cache_{i}')
+            for i in range(self.NUM_FEAT_CACHE)
+        ]
         return self.decoder(x, feat_cache)
 
 
@@ -218,16 +167,16 @@ def compile_decoder_nocache(args):
 
         with NxDParallelState(world_size=world_size, tensor_model_parallel_size=tp_degree):
             print("\nGetting feat_cache shapes...")
-            feat_cache_shapes, none_indices = get_feat_cache_shapes_and_none_indices(
-                batch_size, in_channels, latent_height, latent_width, dtype
+            feat_cache_shapes = get_feat_cache_shapes(
+                batch_size, latent_height, latent_width, dtype
             )
-            print(f"  {len(feat_cache_shapes)} entries, {len(none_indices)} None indices: {sorted(none_indices)}")
+            print(f"  {len(feat_cache_shapes)} entries (ALL tensors, no None)")
             for i, s in enumerate(feat_cache_shapes):
-                print(f"    [{i:2d}] {'None' if s is None else s}")
+                print(f"    [{i:2d}] {s}")
 
             print("\nPreparing decoder (bfloat16, no external feat_cache)...")
             decoder = vae.decoder.to(dtype).eval()
-            wrapper = DecoderWrapperNoCache(decoder, feat_cache_shapes, none_indices, dtype)
+            wrapper = DecoderWrapperNoCache(decoder, feat_cache_shapes, dtype)
 
             decoder_input = torch.rand(
                 (batch_size, in_channels, decoder_frames, latent_height, latent_width),
@@ -235,7 +184,7 @@ def compile_decoder_nocache(args):
             )
 
             print(f"  Input: {decoder_input.shape} ({decoder_input.nelement()*2/1024:.0f}KB)")
-            buffer_elements = sum(reduce(operator.mul, s) for s in feat_cache_shapes if s is not None)
+            buffer_elements = sum(reduce(operator.mul, s) for s in feat_cache_shapes)
             print(f"  Buffers: {buffer_elements*2/1024/1024:.0f}MB (on device)")
 
             builder = ModelBuilder(model=wrapper)

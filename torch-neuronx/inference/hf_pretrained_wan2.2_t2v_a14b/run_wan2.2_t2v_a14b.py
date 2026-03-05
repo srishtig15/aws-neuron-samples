@@ -347,19 +347,28 @@ def phase_denoising(pipe, compiled_models_dir, prompt_embeds, negative_prompt_em
 
 
 # ============================================================
-# Phase 3: VAE Decoding
+# Phase 3: VAE Decoding (Neuron)
 # ============================================================
-def phase_vae_decode(pipe, compiled_models_dir, latents):
+def phase_vae_decode(pipe, compiled_models_dir, latents, num_frames=81):
     """
-    Pure CPU VAE decode with fresh float32 VAE (avoids bfloat16 weight truncation).
+    Decode latents using compiled Neuron VAE (post_quant_conv + chunked decoder).
+
+    Pipeline:
+    1. Denormalize latents using VAE config (latents_mean/latents_std)
+    2. Run Neuron post_quant_conv on full latent volume (float32, all 21 frames)
+    3. Run Neuron decoder in chunks of decoder_frames (default 2) latent frames
+       Each chunk produces decoder_frames × 4 video frames (4× temporal upsample)
+    4. Concatenate and trim to expected frame count
+
+    NOTE: NoCache mode (feat_cache as zero buffers) causes flickering artifacts
+    because temporal context is not carried between chunks. CPU VAE decode is
+    flicker-free but ~10× slower. TODO: implement rolling feat_cache.
     """
     print("\n" + "="*60)
-    print("PHASE 3: VAE Decoding (Fresh float32 VAE)")
+    print("PHASE 3: VAE Decoding (Neuron)")
     print("="*60)
 
-    # Load a FRESH VAE in float32 to avoid bfloat16 weight truncation
-    # (pipeline.from_pretrained casts all components to bfloat16)
-    print("Loading fresh float32 VAE...")
+    # Load VAE config for denormalization constants
     model_id = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
     vae = AutoencoderKLWan.from_pretrained(
         model_id, subfolder="vae", torch_dtype=torch.float32,
@@ -377,14 +386,104 @@ def phase_vae_decode(pipe, compiled_models_dir, latents):
         1, vae.config.z_dim, 1, 1, 1
     ).to(latents.device, latents.dtype)
     latents = latents / latents_std + latents_mean
+    print(f"Denormalized latents: {latents.shape}, range=[{latents.min():.3f}, {latents.max():.3f}]")
 
-    # Decode
-    print("Decoding latents...")
+    del vae
+    gc.collect()
+
+    # ---- Step 1: Load and run Neuron post_quant_conv ----
+    pqc_path = f"{compiled_models_dir}/post_quant_conv"
+    pqc_config = load_model_config(pqc_path)
+    pqc_world_size = pqc_config["world_size"]
+
+    print(f"\nLoading post_quant_conv (world_size={pqc_world_size})...")
+    t0 = time.time()
+    pqc_nxd = NxDModel.load(
+        os.path.join(pqc_path, "nxd_model.pt"),
+        start_rank=0, local_ranks_size=pqc_world_size,
+    )
+    pqc_weights = load_duplicated_weights(pqc_path, pqc_world_size)
+    pqc_nxd.set_weights(pqc_weights)
+    pqc_nxd.to_neuron()
+    print(f"  post_quant_conv loaded in {time.time() - t0:.1f}s")
+
+    print(f"Running post_quant_conv on {latents.shape}...")
+    t0 = time.time()
+    z = pqc_nxd(latents)
+    if isinstance(z, (tuple, list)):
+        z = z[0]
+    z = z.to(torch.float32)
+    print(f"  post_quant_conv done in {time.time() - t0:.1f}s, output: {z.shape}")
+
+    del pqc_nxd, pqc_weights
+    gc.collect()
+
+    # ---- Step 2: Load and run Neuron decoder (2 frames per chunk) ----
+    # NOTE: NoCache mode (feat_cache as zero buffers) causes flickering because
+    # temporal context is lost between chunks. CPU VAE decode is flicker-free.
+    # TODO: Implement rolling feat_cache to fix Neuron VAE flickering.
+    decoder_path = f"{compiled_models_dir}/decoder_nocache"
+    decoder_config = load_model_config(decoder_path)
+    decoder_world_size = decoder_config["world_size"]
+    decoder_frames = decoder_config.get("decoder_frames", 2)
+
+    print(f"\nLoading decoder (world_size={decoder_world_size}, compiled_frames={decoder_frames})...")
+    t0 = time.time()
+    decoder_nxd = NxDModel.load(
+        os.path.join(decoder_path, "nxd_model.pt"),
+        start_rank=0, local_ranks_size=decoder_world_size,
+    )
+    decoder_weights = load_duplicated_weights(decoder_path, decoder_world_size)
+    decoder_nxd.set_weights(decoder_weights)
+    decoder_nxd.to_neuron()
+    print(f"  Decoder loaded in {time.time() - t0:.1f}s")
+
+    z_bf16 = z.to(torch.bfloat16)
+    num_latent_frames = z_bf16.shape[2]
+    decoded_frames = []
+
+    # Process decoder_frames latent frames per chunk
+    num_chunks = (num_latent_frames + decoder_frames - 1) // decoder_frames
+    print(f"Decoding {num_latent_frames} latent frames in {num_chunks} chunks of {decoder_frames}...")
     decode_start = time.time()
-    with torch.no_grad():
-        video = vae.decode(latents, return_dict=False)[0]
+
+    for chunk_idx in range(num_chunks):
+        start = chunk_idx * decoder_frames
+        end = min(start + decoder_frames, num_latent_frames)
+        chunk = z_bf16[:, :, start:end, :, :]
+
+        # Pad last chunk if needed
+        if chunk.shape[2] < decoder_frames:
+            pad_frames = decoder_frames - chunk.shape[2]
+            padding = chunk[:, :, -1:, :, :].expand(-1, -1, pad_frames, -1, -1)
+            chunk = torch.cat([chunk, padding], dim=2)
+
+        output = decoder_nxd(chunk)
+        if isinstance(output, (list, tuple)):
+            output = output[0]
+        output = output.to(torch.float32)
+
+        # Each chunk of decoder_frames latent frames -> decoder_frames * 4 video frames
+        actual_latent = end - start
+        video_frames_from_chunk = actual_latent * 4
+        output = output[:, :, :video_frames_from_chunk]
+        decoded_frames.append(output)
+
+        elapsed = time.time() - decode_start
+        print(f"  Chunk {chunk_idx+1}/{num_chunks}: latent [{start}:{end}] -> {output.shape[2]} video frames ({elapsed:.1f}s)")
+
+    video = torch.cat(decoded_frames, dim=2)  # [B, C, total_video_frames, H, W]
     decode_time = time.time() - decode_start
-    print(f"  VAE decode completed in {decode_time:.1f}s")
+
+    # Trim to expected number of video frames
+    if video.shape[2] > num_frames:
+        print(f"  Trimming {video.shape[2]} -> {num_frames} video frames")
+        video = video[:, :, :num_frames]
+
+    print(f"  Total decode time: {decode_time:.1f}s, output: {video.shape}")
+
+    del decoder_nxd, decoder_weights, z, z_bf16, decoded_frames
+    gc.collect()
 
     # Post-processing: [B, C, F, H, W] -> numpy [F, H, W, C], float [0,1]
     # NOTE: export_to_video expects float [0,1] ndarray and does *255 internally.
@@ -392,10 +491,7 @@ def phase_vae_decode(pipe, compiled_models_dir, latents):
     video = video[0]  # [C, F, H, W]
     video = video.permute(1, 2, 3, 0).float().cpu().numpy()  # [F, H, W, C]
     video = ((video + 1.0) / 2.0).clip(0, 1)
-    print(f"Decoded video: shape={video.shape}, dtype={video.dtype}")
-
-    del vae
-    gc.collect()
+    print(f"Output video: shape={video.shape}, dtype={video.dtype}")
 
     return video
 
@@ -447,7 +543,7 @@ def main(args):
     print(f"Saved debug_latents.pt: shape={latents.shape}, dtype={latents.dtype}, range=[{latents.min():.3f}, {latents.max():.3f}]")
 
     # Phase 3: VAE Decode
-    video = phase_vae_decode(pipe, compiled_models_dir, latents)
+    video = phase_vae_decode(pipe, compiled_models_dir, latents, num_frames=args.num_frames)
 
     # Save video - video is numpy float [0,1] shape [F, H, W, C]
     output_path = args.output

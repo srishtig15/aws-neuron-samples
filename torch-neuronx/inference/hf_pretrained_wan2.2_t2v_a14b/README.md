@@ -109,5 +109,5 @@ hf_pretrained_wan2.2_t2v_a14b/
 
 ## Known Limitations
 
-- VAE decode currently runs on CPU (~100s). Neuron VAE decode is WIP.
-- Total inference time ~650s (denoising ~545s + CPU VAE ~100s) at 480P 81 frames.
+- Neuron VAE decode (~10s) has flickering artifacts due to NoCache mode (feat_cache is zero buffers, no temporal context between chunks). CPU VAE decode is flicker-free but ~100s. Rolling feat_cache is WIP.
+- Total inference time ~560s (denoising ~545s + Neuron VAE ~10s) at 480P 81 frames.
