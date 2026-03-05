@@ -128,7 +128,7 @@ NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py \
     --true_cfg_scale 6.0
 ```
 
-**Note**: V3 CFG batches both negative and positive prompts into a single transformer call (batch_size=2), achieving ~5.5% speedup over V3 CP which runs them sequentially. For other versions (V1/V2/Flash), CFG runs the transformer twice sequentially per step.
+**Note**: V3 CFG batches both negative and positive prompts into a single transformer call (batch_size=2), achieving ~6% speedup over V3 CP which runs them sequentially. For other versions (V1/V2/Flash), CFG runs the transformer twice sequentially per step.
 
 ## Project Structure
 
@@ -301,7 +301,7 @@ V3 CFG achieves the fastest performance by batching negative and positive CFG pr
 | Compiled batch_size | 1 | 2 |
 | RoPE scatter | Yes (position split) | No (same positions for both items) |
 
-**Why V3 CFG is faster than V3 CP**: Both use TP=4 with 2 data-parallel ranks. V3 CP splits the sequence and requires K/V all-gather at every attention layer (40 layers x 2 calls per step = 80 all-gathers). V3 CFG splits the batch and each rank sees the full sequence, requiring **no K/V all-gather** — only scatter at entry and gather at exit. This saves ~5.5% wall-clock time.
+**Why V3 CFG is faster than V3 CP**: Both use TP=4 with 2 data-parallel ranks. V3 CP splits the sequence and requires K/V all-gather at every attention layer (40 layers x 2 calls per step = 80 all-gathers). V3 CFG splits the batch and each rank sees the full sequence, requiring **no K/V all-gather** — only scatter at entry and gather at exit. This saves ~6% wall-clock time.
 
 #### 8. Language Model V3 on Neuron
 
@@ -499,13 +499,13 @@ for rank in range(4):
 |----------|------------------|------------|
 | H100 (without Flash Attention) | ~0.75s/step | ~60s |
 | **TRN2 V3 CFG (CFG Parallel + NKI)** | **~0.75s/step** | **~60s** |
-| TRN2 V3 CP (Context Parallel + NKI) | ~0.77s/step | ~62s |
+| TRN2 V3 CP (Context Parallel + NKI) | ~0.78s/step | ~64s |
 | TRN2 V1 Flash (NKI) | ~1.2s/step | ~96s |
 | TRN2 V2 Flash (ModelBuilder + NKI) | ~1.2s/step | ~96s |
 | TRN2 V2 (ModelBuilder) | ~1.2s/step | ~96s |
 | TRN2 V1 (parallel_model_trace) | ~2.4s/step | ~190s |
 
-**V3 CFG achieves H100-matching performance!** By using CFG Parallel (DP=2) with Tensor Parallel (TP=4), negative and positive prompts are batched into a single call, avoiding the K/V all-gather overhead of Context Parallel. V3 CFG is ~5.5% faster than V3 CP (60s vs 62s).
+**V3 CFG achieves H100-matching performance!** By using CFG Parallel (DP=2) with Tensor Parallel (TP=4), negative and positive prompts are batched into a single call, avoiding the K/V all-gather overhead of Context Parallel. V3 CFG is ~6% faster than V3 CP (60s vs 64s).
 
 ### Performance Analysis
 
