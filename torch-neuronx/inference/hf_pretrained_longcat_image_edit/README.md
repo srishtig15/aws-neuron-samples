@@ -6,10 +6,11 @@ Based on the [Qwen-Image-Edit Neuron adaptation](https://github.com/whn09/aws-ne
 
 ## Performance
 
-| Machine | Config | Total Time | Quality |
-|---------|--------|------------|---------|
-| **Trn2** (trn2.48xlarge) | All Neuron (VE + LM + Transformer + VAE 1024x1024) | **20.63s** | Good |
-| **H100** (single GPU, bf16) | Full GPU | 23.61s | Reference |
+| Machine | Config | Total Time | Per Step | Quality |
+|---------|--------|------------|----------|---------|
+| **Trn2** (trn2.48xlarge) | All Neuron, **CFG Parallel** | **20.39s** | 0.41s | Good |
+| **Trn2** (trn2.48xlarge) | All Neuron, Context Parallel | 22.39s | 0.45s | Good |
+| **H100** (single GPU, bf16) | Full GPU | 23.61s | 0.47s | Reference |
 
 Test: 1024x1024 output, guidance_scale=4.5, 50 steps.
 
@@ -29,12 +30,28 @@ LongCat-Image-Edit is a FLUX-style image editing model:
 |-----------|-------|-------------------|
 | Vision Encoder | Qwen2.5-VL ViT (32 blocks) | TP=4, float32 |
 | Language Model | Qwen2.5-VL LM (28 layers) | TP=4, world_size=8 |
-| Transformer | LongCatImageTransformer2DModel (10 dual + 20 single stream) | TP=4, CP=2, world_size=8 |
+| Transformer (CP) | LongCatImageTransformer2DModel (10 dual + 20 single stream) | TP=4, CP=2, world_size=8 |
+| Transformer (CFG) | LongCatImageTransformer2DModel (10 dual + 20 single stream) | TP=4, DP=2, world_size=8, batch=2 |
 | VAE | 2D AutoencoderKL | Single device (1024x1024, no tiling) |
 
 > **Note**: All components run on Neuron by default. The Vision Encoder uses native SDPA
 > (matching the [Qwen-Image-Edit reference](https://github.com/whn09/aws-neuron-samples/tree/master/torch-neuronx/inference/hf_pretrained_qwen_image_edit)).
 > Use `--cpu_vision_encoder` to fall back to CPU VE if needed.
+
+## CFG Parallel vs Context Parallel
+
+Both modes use TP=4, world_size=8 on the same hardware. The second parallelism dimension (DP=2) is used differently:
+
+| Aspect | Context Parallel (CP) | CFG Parallel |
+|--------|----------------------|--------------|
+| Scatter dimension | dim=1 (sequence) | dim=0 (batch) |
+| Calls per step | 2 (neg + pos sequential) | 1 (neg + pos batched) |
+| K/V All-Gather | Yes (every attention layer) | No |
+| Compile batch_size | 1 | 2 |
+| RoPE scatter | Yes (split positions) | No (same positions) |
+| Best for | guidance_scale = 1 (no CFG) | guidance_scale > 1 (~9% faster) |
+
+CFG Parallel batches negative + positive prompt into a single `batch_size=2` transformer call. Each DP rank processes one batch item with full sequence length, eliminating the K/V all-gather overhead at all 30 attention layers (10 dual + 20 single stream blocks).
 
 ## Key Implementation Details
 
@@ -89,12 +106,15 @@ python neuron_longcat_image_edit/cache_hf_model.py
 ### 3. Compile All Components
 
 ```bash
-# Compile all with defaults (1024x1024 output, 448 VE, 1024 max_seq_len)
+# Compile with Context Parallel (default)
 ./compile.sh
 
-# Or with custom dimensions:
-# ./compile.sh <height> <width> <image_size> <max_seq_len>
-# ./compile.sh 1024 1024 448 1024
+# Compile with CFG Parallel (recommended when guidance_scale > 1, ~9% faster)
+./compile.sh cfg
+
+# Custom dimensions:
+# ./compile.sh [cp|cfg] <height> <width> <image_size> <max_seq_len>
+# ./compile.sh cfg 1024 1024 448 1024
 ```
 
 Compilation takes ~60-90 minutes total. Compiled models are saved to `/opt/dlami/nvme/compiled_models/`.
@@ -102,7 +122,15 @@ Compilation takes ~60-90 minutes total. Compiled models are saved to `/opt/dlami
 ### 4. Run Inference
 
 ```bash
-# All Neuron (recommended)
+# CFG Parallel (recommended, fastest)
+NEURON_RT_NUM_CORES=8 python run_longcat_image_edit.py \
+    --image assets/test.png \
+    --prompt "将猫变成狗" \
+    --seed 43 \
+    --use_cfg_parallel \
+    --output output.png
+
+# Context Parallel (default)
 NEURON_RT_NUM_CORES=8 python run_longcat_image_edit.py \
     --image assets/test.png \
     --prompt "将猫变成狗" \
@@ -114,6 +142,7 @@ NEURON_RT_NUM_CORES=8 python run_longcat_image_edit.py \
     --image assets/test.png \
     --prompt "将猫变成狗" \
     --seed 43 \
+    --use_cfg_parallel \
     --warmup \
     --output output.png
 ```
@@ -130,8 +159,9 @@ NEURON_RT_NUM_CORES=8 python run_longcat_image_edit.py \
 | `--num_inference_steps` | 50 | Denoising steps |
 | `--guidance_scale` | 4.5 | Guidance scale |
 | `--seed` | 42 | Random seed |
-| `--negative_prompt` | `""` | Negative prompt |
+| `--negative_prompt` | `" "` | Negative prompt |
 | `--image_size` | 448 | Vision encoder image size |
+| `--use_cfg_parallel` | false | Use CFG Parallel transformer (batches neg+pos, ~9% faster) |
 | `--cpu_vision_encoder` | false | Use CPU vision encoder for better accuracy |
 | `--warmup` | false | Run warmup inference first |
 | `--compiled_models_dir` | `/opt/dlami/nvme/compiled_models` | Path to compiled models |
@@ -153,6 +183,7 @@ NEURON_RT_NUM_CORES=8 python run_longcat_image_edit.py \
     ├── neuron_parallel_utils.py            # FLUX-specific TP sharding
     ├── neuron_rope.py                      # 3-axis RoPE pre-computation
     ├── compile_transformer.py              # FLUX transformer (TP=4, CP=2)
+    ├── compile_transformer_cfg.py          # FLUX transformer (TP=4, DP=2, CFG Parallel)
     ├── compile_vae.py                      # 2D AutoencoderKL (1024x1024)
     ├── compile_vision_encoder.py           # Qwen2.5-VL ViT (TP=4)
     └── compile_language_model.py           # Qwen2.5-VL LM (TP=4)
