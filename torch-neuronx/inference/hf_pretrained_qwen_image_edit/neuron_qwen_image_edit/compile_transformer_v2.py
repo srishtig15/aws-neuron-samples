@@ -288,7 +288,9 @@ def get_rope_from_original_model(
 
     # Call original pos_embed to get complex freqs
     video_fhw = (frame, height, width)
-    vid_freqs, txt_freqs = pipe.transformer.pos_embed(video_fhw, max_txt_seq_len=text_seq_len)
+    vid_freqs, txt_freqs = pipe.transformer.pos_embed(
+        video_fhw, txt_seq_lens=[text_seq_len], device=torch.device('cpu')
+    )
 
     print(f"  vid_freqs from model: {vid_freqs.shape}, dtype: {vid_freqs.dtype}")
     print(f"  txt_freqs from model: {txt_freqs.shape}, dtype: {txt_freqs.dtype}")

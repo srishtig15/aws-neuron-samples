@@ -54,20 +54,24 @@ python neuron_qwen_image_edit/cache_hf_model.py
 
 ### 2. Compile Models
 
-Five compilation APIs are available:
+Six compilation APIs are available:
 
 | API | Script | Speed | Notes |
 |-----|--------|-------|-------|
-| **V3 CP (Fastest)** | `compile_transformer_v3_cp.py` | **~0.77s/step** | Context Parallel (TP=4, CP=2) + NKI Flash Attention |
+| **V3 CFG (Fastest)** | `compile_transformer_v3_cfg.py` | **~0.75s/step** | CFG Parallel (TP=4, DP=2) + NKI Flash Attention |
+| V3 CP | `compile_transformer_v3_cp.py` | ~0.77s/step | Context Parallel (TP=4, CP=2) + NKI Flash Attention |
 | V1 Flash | `compile_transformer_v1_flash.py` | ~1.2s/step | parallel_model_trace + NKI Flash Attention |
 | V2 Flash | `compile_transformer_v2_flash.py` | ~1.2s/step | ModelBuilder + NKI Flash Attention |
 | V2 | `compile_transformer_v2.py` | ~1.2s/step | ModelBuilder API |
 | V1 | `compile_transformer.py` | ~2.4s/step | parallel_model_trace API |
 
-**Note**: V3 CP achieves H100-comparable performance (~0.77s/step vs H100's ~0.75s/step) by using Context Parallel to split sequence across 2 data parallel ranks, allowing each rank to process half the sequence while all-gathering K/V for full attention context.
+**Note**: V3 CFG achieves the best performance by using CFG Parallel to batch negative and positive prompts into a single call across 2 data parallel ranks, avoiding the K/V all-gather overhead of Context Parallel. V3 CP is also H100-comparable (~0.77s/step vs H100's ~0.75s/step).
 
 ```bash
-# Compile V3 CP (fastest, Context Parallel + NKI Flash Attention)
+# Compile V3 CFG (fastest, CFG Parallel + NKI Flash Attention, default)
+./compile.sh v3_cfg
+
+# Or compile V3 CP (Context Parallel + NKI Flash Attention)
 ./compile.sh v3_cp
 
 # Or compile V1 Flash (uses NKI Flash Attention)
@@ -94,7 +98,12 @@ Default compilation settings:
 ### 3. Run Inference
 
 ```bash
-# Two-image merging with V3 CP (fastest, Context Parallel)
+# Two-image merging with V3 CFG (fastest, CFG Parallel, default)
+NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py \
+    --images img1.png img2.png \
+    --prompt "combine these two people into a wedding photo"
+
+# Two-image merging with V3 CP (Context Parallel)
 NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py \
     --images img1.png img2.png \
     --prompt "combine these two people into a wedding photo" \
@@ -104,35 +113,22 @@ NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py \
 NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py \
     --images img1.png img2.png \
     --prompt "combine these two people into a wedding photo" \
-    --use_v1_flash
-
-# Two-image merging with V2 (ModelBuilder)
-NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py \
-    --images img1.png img2.png \
-    --prompt "combine these two people into a wedding photo" \
-    --use_v2
-
-# Two-image merging with V1
-NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py \
-    --images img1.png img2.png \
-    --prompt "combine these two people into a wedding photo"
+    --no-use_v3_cfg --use_v1_flash
 
 # Single image editing (requires patch_multiplier=2)
 NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py \
     --images input.jpg \
     --prompt "change the background to a beach" \
-    --patch_multiplier 2 \
-    --use_v1_flash
+    --patch_multiplier 2
 
 # With custom CFG scale
 NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py \
     --images input.jpg \
     --prompt "change the background to a beach" \
-    --true_cfg_scale 6.0 \
-    --use_v3_cp
+    --true_cfg_scale 6.0
 ```
 
-**Note**: CFG (Classifier-Free Guidance) runs the transformer twice sequentially per step, not with batch_size=2.
+**Note**: V3 CFG batches both negative and positive prompts into a single transformer call (batch_size=2), achieving ~5.5% speedup over V3 CP which runs them sequentially. For other versions (V1/V2/Flash), CFG runs the transformer twice sequentially per step.
 
 ## Project Structure
 
@@ -151,7 +147,8 @@ hf_pretrained_qwen_image_edit/
 │   ├── compile_transformer_v1_flash.py  # Transformer V1 Flash (NKI Flash Attention)
 │   ├── compile_transformer_v2_flash.py  # Transformer V2 Flash (ModelBuilder + NKI)
 │   ├── compile_transformer_v3_cp.py     # Transformer V3 CP (Context Parallel + NKI)
-│   ├── compile_language_model_v3.py     # Language Model V3 (TP=4, for V3 CP)
+│   ├── compile_transformer_v3_cfg.py    # Transformer V3 CFG (CFG Parallel + NKI)
+│   ├── compile_language_model_v3.py     # Language Model V3 (TP=4, for V3 CP/CFG)
 │   ├── compile_vision_encoder_v3.py     # Vision Encoder V3 (TP=4, float32)
 │   ├── compile_text_encoder.py    # Text encoder compilation
 │   ├── neuron_commons.py          # Common utilities and wrappers
@@ -167,7 +164,8 @@ hf_pretrained_qwen_image_edit/
     ├── transformer_v1_flash/      # V1 Flash: NKI Flash Attention
     ├── transformer_v2_flash/      # V2 Flash: ModelBuilder + NKI
     ├── transformer_v3_cp/         # V3 CP: Context Parallel (TP=4, CP=2) + NKI
-    ├── language_model_v3/         # Language Model V3: TP=4 (for V3 CP)
+    ├── transformer_v3_cfg/        # V3 CFG: CFG Parallel (TP=4, DP=2) + NKI
+    ├── language_model_v3/         # Language Model V3: TP=4 (for V3 CP/CFG)
     └── vision_encoder/            # Single device
 ```
 
@@ -177,15 +175,16 @@ hf_pretrained_qwen_image_edit/
 
 | Component | Total Params | Execution | Notes |
 |-----------|-------------|-----------|-------|
+| Transformer (V3 CFG) | 20.43B | **TP=4, DP=2** on Neuron | ~10.4 GB/shard, fastest (CFG Parallel) |
 | Transformer (V3 CP) | 20.43B | **TP=4, CP=2** on Neuron | ~10.4 GB/shard, H100-comparable speed |
 | Transformer (V1/V2) | 20.43B | TP=8 on Neuron | ~5.2 GB/shard |
-| Language Model (V3) | 7.07B | **TP=4** on Neuron | ~4.1 GB/shard, used with V3 CP transformer |
+| Language Model (V3) | 7.07B | **TP=4** on Neuron | ~4.1 GB/shard, used with V3 CP/CFG transformer |
 | Language Model (V1/V2) | 7.07B | CPU | GQA 28Q/4KV incompatible with TP=8 |
 | Vision Encoder (V3) | ~1.4B | **TP=4** on Neuron (float32) | 10-15x faster than CPU, used with V3 CP |
 | Vision Encoder (V1/V2) | ~1.4B | CPU by default | CPU for higher accuracy |
 | VAE | ~300M | DP=8 on Neuron | Tiled processing for large images |
 
-**Language Model on Neuron (V3)**: With V3 CP, the language model can now run on Neuron using TP=4. This is a perfect fit for GQA: 28 Q heads / 4 = 7 heads per rank, 4 KV heads / 4 = 1 head per rank. Use `--use_v3_language_model` with `--use_v3_cp`.
+**Language Model on Neuron (V3)**: With V3 CP/CFG, the language model can now run on Neuron using TP=4. This is a perfect fit for GQA: 28 Q heads / 4 = 7 heads per rank, 4 KV heads / 4 = 1 head per rank. Use `--use_v3_language_model` with `--use_v3_cfg` or `--use_v3_cp`.
 
 **Why Language Model runs on CPU (V1/V2)**: The Qwen2.5-VL language model uses Grouped Query Attention with 28 Q heads and 4 KV heads (group size = 7). With TP=8, the Q-KV mapping cannot be preserved correctly. Valid TP degrees are only 1, 2, or 4.
 
@@ -284,19 +283,42 @@ if self.context_parallel_enabled:
 - Each rank processes only 50% of the query sequence
 - Communication overhead is amortized by NKI Flash Attention efficiency
 
-#### 7. Language Model V3 on Neuron
+#### 7. V3 CFG with CFG Parallel
 
-With V3 CP transformer using TP=4, the language model can also use TP=4 to run on Neuron instead of CPU:
+V3 CFG achieves the fastest performance by batching negative and positive CFG prompts into a single transformer call:
+
+**Architecture**: TP=4, DP=2 (world_size=8)
+- **Tensor Parallel (TP=4)**: Shards model weights across 4 devices
+- **Data Parallel (DP=2)**: Each DP rank processes one batch item (negative or positive prompt)
+
+**Key differences from V3 CP**:
+
+| Aspect | V3 CP (Context Parallel) | V3 CFG (CFG Parallel) |
+|--------|--------------------------|----------------------|
+| Scatter dimension | dim=1 (sequence) | dim=0 (batch) |
+| Gather dimension | dim=1 (sequence) | dim=0 (batch) |
+| K/V all-gather in attention | Yes (each rank needs full K/V) | **No** (each rank has full sequence) |
+| Compiled batch_size | 1 | 2 |
+| RoPE scatter | Yes (position split) | No (same positions for both items) |
+
+**Why V3 CFG is faster than V3 CP**: Both use TP=4 with 2 data-parallel ranks. V3 CP splits the sequence and requires K/V all-gather at every attention layer (40 layers x 2 calls per step = 80 all-gathers). V3 CFG splits the batch and each rank sees the full sequence, requiring **no K/V all-gather** — only scatter at entry and gather at exit. This saves ~5.5% wall-clock time.
+
+#### 8. Language Model V3 on Neuron
+
+With V3 CP/CFG transformer using TP=4, the language model can also use TP=4 to run on Neuron instead of CPU:
 
 **Why TP=4 is perfect for Language Model**:
 - Q heads: 28 / 4 = 7 heads per rank (evenly divisible)
 - KV heads: 4 / 4 = 1 head per rank (evenly divisible)
 - No padding or replication needed!
 
-**Compilation**: The language model is compiled using ModelBuilder API with the same `world_size=8` as the V3 CP transformer:
+**Compilation**: The language model is compiled using ModelBuilder API with the same `world_size=8` as the V3 CP/CFG transformer:
 
 ```bash
-# Compile V3 CP (includes language model V3)
+# Compile V3 CFG (includes language model V3)
+./compile.sh v3_cfg
+
+# Or compile V3 CP (includes language model V3)
 ./compile.sh v3_cp
 ```
 
@@ -305,13 +327,12 @@ With V3 CP transformer using TP=4, the language model can also use TP=4 to run o
 NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py \
     --images img1.png img2.png \
     --prompt "combine these two people" \
-    --use_v3_cp \
     --use_v3_language_model
 ```
 
-**Note**: Language Model V3 requires V3 CP transformer (both use world_size=8). When using V1/V2/V1 Flash/V2 Flash (TP=8), the language model must run on CPU.
+**Note**: Language Model V3 requires V3 CP/CFG transformer (both use world_size=8, TP=4). When using V1/V2/V1 Flash/V2 Flash (TP=8), the language model must run on CPU.
 
-#### 8. V1 Flash with NKI Flash Attention
+#### 9. V1 Flash with NKI Flash Attention
 
 V1 Flash combines the best of both approaches:
 - Uses `parallel_model_trace` API (like V1) which supports NKI kernels
@@ -351,11 +372,12 @@ _flash_fwd_call = nki_jit()(attention_isa_kernel)
 ./compile.sh [VERSION] [HEIGHT] [WIDTH] [IMAGE_SIZE] [TP_DEGREE] [MAX_SEQ_LEN] [PATCH_MULTIPLIER] [BATCH_SIZE]
 
 # Examples:
-./compile.sh v3_cp                           # V3 CP with defaults
-./compile.sh v3_cp 1024 1024 448 8 1024 3 1  # V3 CP, batch_size=1 (default)
-./compile.sh v3_cp 1024 768 448 8 1024 3 2   # V3 CP, batch_size=2
-./compile.sh v1_flash 1024 1024 448 8 1024 2 # V1 Flash, single image editing
-./compile.sh 1024 1024 448 8 1024 3 1        # All versions, batch_size=1
+./compile.sh v3_cfg                           # V3 CFG with defaults (fastest, recommended)
+./compile.sh v3_cfg 1024 1024 448 8 1024 3 1  # V3 CFG, custom dimensions
+./compile.sh v3_cp                            # V3 CP with defaults
+./compile.sh v3_cp 1024 768 448 8 1024 3 2    # V3 CP, batch_size=2
+./compile.sh v1_flash 1024 1024 448 8 1024 2  # V1 Flash, single image editing
+./compile.sh 1024 1024 448 8 1024 3 1         # All versions, batch_size=1
 ```
 
 ## Inference Options
@@ -364,8 +386,9 @@ _flash_fwd_call = nki_jit()(attention_isa_kernel)
 |----------|---------|-------------|
 | `--images` | Required | Input image path(s), 1-3 images |
 | `--prompt` | Required | Edit instruction |
-| `--use_v3_cp` | False | Use V3 CP transformer (Context Parallel + NKI, fastest) |
-| `--use_v3_language_model` | False | Use V3 language model on Neuron (requires V3 CP) |
+| `--use_v3_cfg` | **True** | Use V3 CFG transformer (CFG Parallel + NKI, fastest). Use `--no-use_v3_cfg` to disable |
+| `--use_v3_cp` | False | Use V3 CP transformer (Context Parallel + NKI). Mutually exclusive with `--use_v3_cfg` |
+| `--use_v3_language_model` | False | Use V3 language model on Neuron (requires V3 CP/CFG) |
 | `--use_v3_vision_encoder` | False | Use V3 vision encoder on Neuron (TP=4, 10-15x faster than CPU) |
 | `--use_v1_flash` | False | Use V1 Flash transformer (NKI Flash Attention) |
 | `--use_v2_flash` | False | Use V2 Flash transformer (ModelBuilder + NKI Flash Attention) |
@@ -475,13 +498,14 @@ for rank in range(4):
 | Platform | Transformer Speed | Total Time |
 |----------|------------------|------------|
 | H100 (without Flash Attention) | ~0.75s/step | ~60s |
-| **TRN2 V3 CP (Context Parallel + NKI)** | **~0.77s/step** | **~62s** |
+| **TRN2 V3 CFG (CFG Parallel + NKI)** | **~0.75s/step** | **~60s** |
+| TRN2 V3 CP (Context Parallel + NKI) | ~0.77s/step | ~62s |
 | TRN2 V1 Flash (NKI) | ~1.2s/step | ~96s |
 | TRN2 V2 Flash (ModelBuilder + NKI) | ~1.2s/step | ~96s |
 | TRN2 V2 (ModelBuilder) | ~1.2s/step | ~96s |
 | TRN2 V1 (parallel_model_trace) | ~2.4s/step | ~190s |
 
-**V3 CP achieves H100-comparable performance!** By using Context Parallel (CP=2) with Tensor Parallel (TP=4), each rank only processes half the sequence, achieving ~1.56x speedup over V1 Flash.
+**V3 CFG achieves H100-matching performance!** By using CFG Parallel (DP=2) with Tensor Parallel (TP=4), negative and positive prompts are batched into a single call, avoiding the K/V all-gather overhead of Context Parallel. V3 CFG is ~5.5% faster than V3 CP (60s vs 62s).
 
 ### Performance Analysis
 
@@ -510,18 +534,19 @@ The key difference is **RoPE (Rotary Position Embedding) handling**:
 2. **NKI Flash Attention vs Compiler-optimized SDPA**: No significant difference - Neuron compiler already optimizes SDPA very well
 3. **Compilation API (parallel_model_trace vs ModelBuilder)**: Minimal impact on final performance
 
-### V1 vs V2 vs V1 Flash vs V2 Flash vs V3 CP Comparison
+### Version Comparison
 
-| Aspect | V1 | V2 | V1 Flash | V2 Flash | **V3 CP (Fastest)** |
-|--------|-----|-----|----------|----------|---------------------|
-| Compilation API | `parallel_model_trace` | `ModelBuilder` | `parallel_model_trace` | `ModelBuilder` | `ModelBuilder` |
-| Attention | Standard SDPA | Standard SDPA | NKI Flash | NKI Flash | **NKI Flash** |
-| RoPE Handling | Inside model | Pre-computed | Pre-computed | Pre-computed | Pre-computed |
-| Parallelism | TP=8 | TP=8 | TP=8 | TP=8 | **TP=4, CP=2** |
-| Speed | ~2.4s/step | ~1.2s/step | ~1.2s/step | ~1.2s/step | **~0.77s/step** |
-| Key Advantage | Simple | Pre-computed RoPE | NKI | Both | **Context Parallel** |
+| Aspect | V1 | V2 | V1 Flash | V2 Flash | V3 CP | **V3 CFG (Fastest)** |
+|--------|-----|-----|----------|----------|-------|----------------------|
+| Compilation API | `parallel_model_trace` | `ModelBuilder` | `parallel_model_trace` | `ModelBuilder` | `ModelBuilder` | `ModelBuilder` |
+| Attention | Standard SDPA | Standard SDPA | NKI Flash | NKI Flash | NKI Flash | **NKI Flash** |
+| RoPE Handling | Inside model | Pre-computed | Pre-computed | Pre-computed | Pre-computed | Pre-computed |
+| Parallelism | TP=8 | TP=8 | TP=8 | TP=8 | TP=4, CP=2 | **TP=4, DP=2** |
+| CFG Handling | Sequential | Sequential | Sequential | Sequential | Sequential | **Batched** |
+| Speed | ~2.4s/step | ~1.2s/step | ~1.2s/step | ~1.2s/step | ~0.77s/step | **~0.75s/step** |
+| Key Advantage | Simple | Pre-computed RoPE | NKI | Both | Context Parallel | **CFG Parallel** |
 
-**Recommendation**: Use **V3 CP** for fastest performance (H100-comparable). Use V1 Flash if you need simpler debugging or don't want Context Parallel complexity.
+**Recommendation**: Use **V3 CFG** (default) for fastest performance. Use V3 CP if you don't need CFG or prefer Context Parallel. Use V1 Flash for simpler debugging.
 
 ### Compiler Optimizations
 
@@ -538,7 +563,17 @@ The `--enable-ccop-compute-overlap` flag is particularly important for tensor pa
 
 ### Component Timing Breakdown
 
-#### V3 CP with V3 Language Model and V3 Vision Encoder (Fastest)
+#### V3 CFG with V3 Language Model and V3 Vision Encoder (Fastest)
+
+| Component | Time |
+|-----------|------|
+| **Vision Encoder (Neuron V3)** | **~1.5s** |
+| **Language Model (Neuron V3)** | **~0.5s** |
+| VAE Encode | ~0.4s |
+| **Transformer V3 CFG (40 steps, batched CFG)** | **~58s** |
+| VAE Decode | ~1.6s |
+
+#### V3 CP with V3 Language Model and V3 Vision Encoder
 
 | Component | Time |
 |-----------|------|
@@ -548,7 +583,7 @@ The `--enable-ccop-compute-overlap` flag is particularly important for tensor pa
 | **Transformer V3 CP (40 steps × 2 CFG)** | **~62s** |
 | VAE Decode | ~1.6s |
 
-#### V3 CP with CPU Vision Encoder
+#### V3 CP/CFG with CPU Vision Encoder
 
 | Component | Time |
 |-----------|------|
@@ -556,7 +591,7 @@ The `--enable-ccop-compute-overlap` flag is particularly important for tensor pa
 | Vision Encoder (CPU, cached) | ~0.7s |
 | **Language Model (Neuron V3)** | **~0.5s** |
 | VAE Encode | ~0.4s |
-| **Transformer V3 CP (40 steps × 2 CFG)** | **~62s** |
+| **Transformer V3 (40 steps)** | **~58-62s** |
 | VAE Decode | ~1.6s |
 
 #### V1 Flash / V2 with CPU Language Model
@@ -578,7 +613,7 @@ The transformer is the main bottleneck, accounting for ~80% of total inference t
 2. **Language model (V1/V2)**: Runs on CPU due to GQA architecture (28Q/4KV heads incompatible with TP=8). Use V3 CP with V3 Language Model to run on Neuron.
 3. **Sequence length**: Must match between compilation and inference.
 4. **NKI Flash Attention**: Requires `XLA_DISABLE_FUNCTIONALIZATION=1` to work with both parallel_model_trace (V1 Flash) and ModelBuilder (V2 Flash). Without this flag, NKI kernels fail with "immutable output parameter" error.
-5. **Language Model V3**: Only compatible with V3 CP transformer (both use world_size=8, TP=4).
+5. **Language Model V3**: Only compatible with V3 CP/CFG transformer (both use world_size=8, TP=4).
 6. **Batch size**: Models compiled with batch_size > 1 have slower single-sample performance due to padding overhead (see Batch Inference below).
 
 ## Batch Inference
@@ -623,8 +658,7 @@ The runtime automatically handles batch padding. No special flags needed:
 # Single sample with batch_size=2 model (automatically padded)
 NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py \
     --images input.jpg \
-    --prompt "edit instruction" \
-    --use_v3_cp
+    --prompt "edit instruction"
 
 # For true batch processing, use custom batch script
 # (see run_batch_tryon.py for example implementation)

@@ -90,7 +90,7 @@ def compile_vae(args):
         attn_scales=original_vae_config.attn_scales,
         temperal_downsample=original_vae_config.temperal_downsample,
         dropout=original_vae_config.dropout,
-        input_channels=original_vae_config.input_channels,
+        input_channels=getattr(original_vae_config, 'input_channels', 3),
         latents_mean=original_vae_config.latents_mean,
         latents_std=original_vae_config.latents_std,
     )

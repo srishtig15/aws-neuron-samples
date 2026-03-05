@@ -1,20 +1,21 @@
 """
-Transformer compilation with Context Parallel (V3 CP) using ModelBuilder API.
+Transformer compilation with CFG Parallelism (V3 CFG) using ModelBuilder API.
 
 Key approach:
-1. Uses ModelBuilder API (like V2) for compilation
-2. Configures world_size=8, tp_degree=4 (implicit CP=2)
-3. K/V are all-gathered across DP group before attention
-4. Uses NKI Flash Attention for optimal performance
+1. Uses ModelBuilder API (like V3 CP) for compilation
+2. Configures world_size=8, tp_degree=4 (implicit DP=2 for CFG)
+3. Batches positive + negative prompts (batch_size=2), each DP rank processes one
+4. No K/V all-gather needed (each rank has full sequence)
+5. Uses NKI Flash Attention for optimal performance
 
-This is inspired by Flux's context parallel implementation which achieves
-near-H100 performance on TRN2.
-
-Context Parallel works by:
+CFG Parallel works by:
 - Model parameters are sharded with TP=4
-- DP group (2 ranks) is used for sequence parallelism
-- Each DP rank processes half the sequence (queries)
-- K/V are all-gathered so each rank sees full K/V
+- DP group (2 ranks) is used for CFG parallelism
+- Input is scattered along batch dim (dim=0): rank 0 gets negative, rank 1 gets positive
+- Each DP rank processes one complete batch item (full sequence)
+- Output is gathered along batch dim (dim=0) and CFG formula is applied
+
+CFG Parallel and Context Parallel are mutually exclusive.
 """
 
 import os
@@ -109,21 +110,18 @@ def nki_flash_attention(query, key, value):
     return attn_output.reshape((bs, n_head, q_len, d_head))
 
 
-class CPNKIQwenAttention(nn.Module):
+class CFGNKIQwenAttention(nn.Module):
     """
-    Context Parallel + NKI Flash Attention for QwenImage.
+    CFG Parallel + NKI Flash Attention for QwenImage.
 
-    Key features:
-    1. K/V are all-gathered across CP group before attention
-    2. Uses NKI Flash Attention kernel
-    3. Each CP rank processes its portion of queries against full K/V
+    Key differences from CPNKIQwenAttention:
+    - No K/V all-gather (each DP rank has full sequence for its batch item)
+    - Uses NKI Flash Attention kernel
     """
 
-    def __init__(self, orig_attn, context_parallel_enabled=False, data_parallel_group=None):
+    def __init__(self, orig_attn):
         super().__init__()
 
-        self.context_parallel_enabled = context_parallel_enabled
-        self.data_parallel_group = data_parallel_group
         self.heads = orig_attn.heads
         self.to_q = orig_attn.to_q
         self.to_k = orig_attn.to_k
@@ -149,10 +147,10 @@ class CPNKIQwenAttention(nn.Module):
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward with Context Parallel K/V gathering and NKI attention.
+        Forward with NKI attention. No K/V gathering needed for CFG parallel.
         """
         if encoder_hidden_states is None:
-            raise ValueError("CPNKIQwenAttention requires encoder_hidden_states")
+            raise ValueError("CFGNKIQwenAttention requires encoder_hidden_states")
 
         batch_size = hidden_states.shape[0]
         seq_txt = encoder_hidden_states.shape[1]
@@ -197,21 +195,8 @@ class CPNKIQwenAttention(nn.Module):
             txt_query = apply_rotary_emb_precomputed(txt_query.transpose(1, 2), txt_freqs, use_real=False).transpose(1, 2)
             txt_key = apply_rotary_emb_precomputed(txt_key.transpose(1, 2), txt_freqs, use_real=False).transpose(1, 2)
 
-        # Context Parallel: All-gather K/V across DP group
-        if self.context_parallel_enabled:
-            # Gather image K/V
-            img_stacked_kv = torch.stack([img_key, img_value], dim=0)
-            img_stacked_kv = gather_from_tensor_model_parallel_region_with_dim(
-                img_stacked_kv, gather_dim=3, process_group=self.data_parallel_group
-            )
-            img_key, img_value = torch.unbind(img_stacked_kv, dim=0)
-
-            # Gather text K/V
-            txt_stacked_kv = torch.stack([txt_key, txt_value], dim=0)
-            txt_stacked_kv = gather_from_tensor_model_parallel_region_with_dim(
-                txt_stacked_kv, gather_dim=3, process_group=self.data_parallel_group
-            )
-            txt_key, txt_value = torch.unbind(txt_stacked_kv, dim=0)
+        # No K/V all-gather needed for CFG parallel
+        # Each DP rank has one complete batch item with full sequence
 
         # Concatenate for joint attention
         joint_query = torch.cat([txt_query, img_query], dim=2)
@@ -225,7 +210,7 @@ class CPNKIQwenAttention(nn.Module):
         joint_hidden_states = joint_hidden_states.transpose(1, 2).reshape(batch_size, -1, self.heads * head_dim)
         joint_hidden_states = joint_hidden_states.to(joint_query.dtype)
 
-        # Split back (use original local seq_txt for splitting)
+        # Split back
         txt_attn_output = joint_hidden_states[:, :seq_txt, :]
         img_attn_output = joint_hidden_states[:, seq_txt:, :]
 
@@ -315,32 +300,34 @@ def get_dp_rank_spmd(global_rank: torch.Tensor, tp_degree: int) -> torch.Tensor:
     return dp_rank
 
 
-class NeuronQwenTransformerV3CP(nn.Module):
+class NeuronQwenTransformerV3CFG(nn.Module):
     """
-    Neuron-optimized QwenImage Transformer with Context Parallel.
+    Neuron-optimized QwenImage Transformer with CFG Parallelism.
 
     Features:
     - TP=4 for model parameter sharding
-    - CP enabled (via DP group) for sequence parallelism
-    - Data is SPLIT at entry, K/V gathered in attention, output gathered at exit
+    - CFG enabled (via DP group) for batch parallelism
+    - Input scattered along batch dim (dim=0): [2,S,C] -> [1,S,C] per rank
+    - No K/V all-gather (each rank has full sequence)
+    - Output gathered along batch dim (dim=0)
     - NKI Flash Attention
     """
 
-    def __init__(self, original_transformer, tp_degree, world_size, context_parallel_enabled=False):
+    def __init__(self, original_transformer, tp_degree, world_size, cfg_parallel_enabled=False):
         super().__init__()
 
         self.config = original_transformer.config
         self.in_channels = original_transformer.config.in_channels
         self.out_channels = original_transformer.config.out_channels
         self.patch_size = original_transformer.config.patch_size
-        self.context_parallel_enabled = context_parallel_enabled
+        self.cfg_parallel_enabled = cfg_parallel_enabled
         self.tp_degree = tp_degree
         self.world_size = world_size
 
         # SPMDRank for getting global rank at runtime (crucial for SPMD scatter/gather)
         self.global_rank = SPMDRank(world_size=world_size)
 
-        # DP group for CP communication
+        # DP group for CFG communication
         self.data_parallel_group = parallel_state.get_data_parallel_group()
 
         # Input projections
@@ -367,7 +354,7 @@ class NeuronQwenTransformerV3CP(nn.Module):
             if (i + 1) % 10 == 0:
                 print(f"  Sharded block {i+1}/{len(original_transformer.transformer_blocks)}")
 
-        # Replace attention with CP+NKI version
+        # Replace attention with CFG+NKI version
         self._replace_attention()
 
         # Final layers
@@ -378,12 +365,10 @@ class NeuronQwenTransformerV3CP(nn.Module):
         self.num_heads = original_transformer.transformer_blocks[0].attn.heads
 
     def _replace_attention(self):
-        """Replace attention modules with CP+NKI versions."""
+        """Replace attention modules with CFG+NKI versions (no K/V gathering)."""
         for i, block in enumerate(self.transformer_blocks):
-            block.attn = CPNKIQwenAttention(
-                block.attn, self.context_parallel_enabled, self.data_parallel_group
-            )
-        print(f"Replaced attention with CP+NKI versions on {len(self.transformer_blocks)} blocks")
+            block.attn = CFGNKIQwenAttention(block.attn)
+        print(f"Replaced attention with CFG+NKI versions on {len(self.transformer_blocks)} blocks")
 
     def forward(
         self,
@@ -393,34 +378,29 @@ class NeuronQwenTransformerV3CP(nn.Module):
         img_rotary_emb: torch.Tensor,
         txt_rotary_emb: torch.Tensor,
     ) -> torch.Tensor:
-        """Forward pass with Context Parallel data splitting."""
+        """Forward pass with CFG Parallel data splitting along batch dim."""
 
-        # Store original shapes for verification
-        orig_hidden_shape = hidden_states.shape
-        orig_enc_shape = encoder_hidden_states.shape
-
-        # ========== CONTEXT PARALLEL: SPLIT DATA AT ENTRY ==========
-        if self.context_parallel_enabled:
-            # Compute DP rank at runtime using SPMDRank (returns different values per rank)
+        # ========== CFG PARALLEL: SPLIT DATA AT ENTRY (dim=0, batch) ==========
+        if self.cfg_parallel_enabled:
+            # Compute DP rank at runtime using SPMDRank
             dp_rank = get_dp_rank_spmd(self.global_rank.get_rank(), self.tp_degree)
 
-            # Split hidden_states along sequence dim (dim=1)
+            # Split hidden_states along batch dim (dim=0): [2,S,C] -> [1,S,C]
             hidden_states = split_along_dim(
-                hidden_states, dim=1, rank=dp_rank, data_parallel_group=self.data_parallel_group
+                hidden_states, dim=0, rank=dp_rank, data_parallel_group=self.data_parallel_group
             )
 
-            # Split encoder_hidden_states along sequence dim (dim=1)
+            # Split encoder_hidden_states along batch dim (dim=0): [2,S,C] -> [1,S,C]
             encoder_hidden_states = split_along_dim(
-                encoder_hidden_states, dim=1, rank=dp_rank, data_parallel_group=self.data_parallel_group
+                encoder_hidden_states, dim=0, rank=dp_rank, data_parallel_group=self.data_parallel_group
             )
 
-            # Split RoPE along position dim (dim=0)
-            img_rotary_emb = split_along_dim(
-                img_rotary_emb, dim=0, rank=dp_rank, data_parallel_group=self.data_parallel_group
+            # Split timestep along batch dim (dim=0): [2] -> [1]
+            timestep = split_along_dim(
+                timestep, dim=0, rank=dp_rank, data_parallel_group=self.data_parallel_group
             )
-            txt_rotary_emb = split_along_dim(
-                txt_rotary_emb, dim=0, rank=dp_rank, data_parallel_group=self.data_parallel_group
-            )
+
+            # Do NOT scatter RoPE - position-indexed, same for both batch items
 
         # Split RoPE into cos/sin
         img_freqs_cos = img_rotary_emb[..., 0]
@@ -456,15 +436,13 @@ class NeuronQwenTransformerV3CP(nn.Module):
         hidden_states = self.norm_out(hidden_states, temb)
         output = self.proj_out(hidden_states)
 
-        # ========== CONTEXT PARALLEL: GATHER OUTPUT ==========
-        if self.context_parallel_enabled:
-            # Before gather: output has shape [B, local_patches, C]
+        # ========== CFG PARALLEL: GATHER OUTPUT (dim=0, batch) ==========
+        if self.cfg_parallel_enabled:
+            # Before gather: output has shape [1, patches, C]
             output = gather_from_tensor_model_parallel_region_with_dim(
-                output, gather_dim=1, process_group=self.data_parallel_group
+                output, gather_dim=0, process_group=self.data_parallel_group
             )
-            # After gather: output should have shape [B, full_patches, C]
-            # Verify that we recovered the original sequence length
-            # orig_hidden_shape[1] is the original num_patches
+            # After gather: output has shape [2, patches, C]
 
         return output
 
@@ -507,18 +485,18 @@ def get_rope_from_original_model(pipe, frame, height, width, text_seq_len, dtype
     return img_rotary_emb, txt_rotary_emb
 
 
-def compile_transformer_v3_cp(args):
-    """Compile transformer with Context Parallel using ModelBuilder API."""
+def compile_transformer_v3_cfg(args):
+    """Compile transformer with CFG Parallelism using ModelBuilder API."""
 
     tp_degree = args.tp_degree
     world_size = args.world_size
-    context_parallel_enabled = (world_size != tp_degree)
+    cfg_parallel_enabled = (world_size != tp_degree)
 
-    if context_parallel_enabled:
-        cp_degree = world_size // tp_degree
-        print(f"Context Parallel enabled: CP={cp_degree}")
+    if cfg_parallel_enabled:
+        dp_degree = world_size // tp_degree
+        print(f"CFG Parallel enabled: DP={dp_degree}")
     else:
-        cp_degree = 1
+        dp_degree = 1
 
     # Calculate dimensions
     latent_h = args.height // 8
@@ -534,44 +512,39 @@ def compile_transformer_v3_cp(args):
     in_channels = 64
     head_dim = 128
 
-    # Calculate CP alignment padding (padding goes to patches, not text)
-    # This keeps text_seq_len unchanged, avoiding RoPE position issues
-    if context_parallel_enabled:
-        local_patches = num_patches // cp_degree
-        local_text = text_seq_len // cp_degree
-        local_total = local_patches + local_text
+    # CFG alignment padding (simpler than CP - no sequence splitting)
+    # Just pad num_patches so total_seq = num_patches + text_seq_len is multiple of 128
+    total_seq = num_patches + text_seq_len
+    alignment = 128
+    need_padding = (alignment - total_seq % alignment) % alignment
+    num_patches_padded = num_patches + need_padding
+    patches_padding = need_padding
 
-        # NKI Flash Attention requires sequence length to be multiple of 128
-        alignment = 128
-        need_padding = (alignment - local_total % alignment) % alignment
-        patches_padding = need_padding * cp_degree  # Total padding for patches
-        num_patches_padded = num_patches + patches_padding
-    else:
-        patches_padding = 0
-        num_patches_padded = num_patches
+    # Hard-coded batch_size=2 for CFG (one positive + one negative)
+    batch_size = 2
 
     print("=" * 60)
-    print("Transformer V3 Context Parallel Compilation")
+    print("Transformer V3 CFG Parallel Compilation")
     print("=" * 60)
     print(f"Image: {args.height}x{args.width}")
     print(f"Original patches: {num_patches}")
     if patches_padding > 0:
-        print(f"Padded patches: {num_patches_padded} (+{patches_padding} for CP alignment)")
+        print(f"Padded patches: {num_patches_padded} (+{patches_padding} for alignment)")
+    print(f"Total seq (padded): {num_patches_padded + text_seq_len}")
     print(f"Total text seq: {text_seq_len}")
     print(f"TP degree: {tp_degree}")
     print(f"World size: {world_size}")
-    print(f"Context Parallel: {context_parallel_enabled} (CP={cp_degree})")
+    print(f"CFG Parallel: {cfg_parallel_enabled} (DP={dp_degree})")
     print(f"NKI Flash Attention: Enabled")
-    print(f"Batch size: {args.batch_size}")
+    print(f"Batch size: {batch_size} (hard-coded for CFG)")
 
-    # Sample inputs (use padded num_patches for compilation)
-    batch_size = args.batch_size
+    # Sample inputs (batch_size=2 for CFG)
     sample_hidden_states = torch.randn(batch_size, num_patches_padded, in_channels, dtype=torch.bfloat16)
     sample_encoder_hidden_states = torch.randn(batch_size, text_seq_len, text_hidden_size, dtype=torch.bfloat16)
     sample_timestep = torch.randn(batch_size, dtype=torch.float32)
 
     # Use NxDParallelState context for compilation
-    # world_size=8, tensor_model_parallel_size=4 means DP=2 (used for CP)
+    # world_size=8, tensor_model_parallel_size=4 means DP=2 (used for CFG)
     with NxDParallelState(world_size=world_size, tensor_model_parallel_size=tp_degree):
         print("\nLoading model...")
         load_kwargs = {"torch_dtype": torch.bfloat16, "local_files_only": True}
@@ -592,9 +565,8 @@ def compile_transformer_v3_cp(args):
         print(f"  img RoPE (original): {img_rotary_emb.shape}")
         print(f"  txt RoPE: {txt_rotary_emb.shape}")
 
-        # Pad img_rotary_emb if needed for CP alignment
+        # Pad img_rotary_emb if needed for alignment
         if patches_padding > 0:
-            # Repeat last position's RoPE for padding (position doesn't matter for padding tokens)
             rope_padding = img_rotary_emb[-1:].repeat(patches_padding, 1, 1)
             img_rotary_emb = torch.cat([img_rotary_emb, rope_padding], dim=0)
             print(f"  img RoPE (padded): {img_rotary_emb.shape} (+{patches_padding})")
@@ -604,8 +576,8 @@ def compile_transformer_v3_cp(args):
 
         # Create Neuron transformer
         print("\nCreating Neuron transformer (sharding layers with TP={}, world_size={})...".format(tp_degree, world_size))
-        neuron_transformer = NeuronQwenTransformerV3CP(
-            pipe.transformer, tp_degree, world_size, context_parallel_enabled
+        neuron_transformer = NeuronQwenTransformerV3CFG(
+            pipe.transformer, tp_degree, world_size, cfg_parallel_enabled
         )
         neuron_transformer = neuron_transformer.to(torch.bfloat16)
         neuron_transformer.eval()
@@ -629,10 +601,6 @@ def compile_transformer_v3_cp(args):
         )
 
         print("Compiling model...")
-        # Pass compiler args directly to compile() for State Buffer optimization
-        # --enable-native-kernel=1: enables native kernel mode
-        # --remat: enables rematerialization to save memory
-        # NOTE: Using -O1 instead of -O2 because -O2 can cause numerical issues in some cases
         compile_args = "--model-type=transformer -O1 --auto-cast=none --internal-hlo2tensorizer-options='--enable-native-kernel=1 --remat'"
         traced_model = builder.compile(
             compiler_args=compile_args,
@@ -640,7 +608,7 @@ def compile_transformer_v3_cp(args):
         )
 
         # Save
-        output_path = f"{args.compiled_models_dir}/transformer_v3_cp"
+        output_path = f"{args.compiled_models_dir}/transformer_v3_cfg"
         os.makedirs(output_path, exist_ok=True)
 
         print(f"\nSaving to {output_path}...")
@@ -679,7 +647,7 @@ def compile_transformer_v3_cp(args):
         # 2. Add global_rank state (SPMDRank) to each checkpoint
         print("\nPost-processing sharded checkpoints...")
         from safetensors.torch import load_file, save_file
-        for rank in range(tp_degree):  # Only TP checkpoints are created, CP duplicates them at load time
+        for rank in range(tp_degree):  # Only TP checkpoints are created, CFG duplicates them at load time
             shard_file = os.path.join(weights_path, f"tp{rank}_sharded_checkpoint.safetensors")
             if not os.path.exists(shard_file):
                 print(f"  WARNING: {shard_file} not found")
@@ -712,8 +680,8 @@ def compile_transformer_v3_cp(args):
             "patch_multiplier": args.patch_multiplier,
             "tp_degree": tp_degree,
             "world_size": world_size,
-            "context_parallel": context_parallel_enabled,
-            "cp_degree": cp_degree,
+            "cfg_parallel": cfg_parallel_enabled,
+            "dp_degree": dp_degree,
             "head_dim": head_dim,
             "frame": temporal_frames,
             "patch_h": patch_h,
@@ -744,8 +712,6 @@ if __name__ == "__main__":
     parser.add_argument("--patch_multiplier", type=int, default=3)
     parser.add_argument("--tp_degree", type=int, default=4)
     parser.add_argument("--world_size", type=int, default=8)
-    parser.add_argument("--batch_size", type=int, default=1,
-                        help="Batch size for compiled model (default: 1)")
     parser.add_argument("--compiled_models_dir", type=str, default="/opt/dlami/nvme/compiled_models")
     parser.add_argument("--compiler_workdir", type=str, default="/opt/dlami/nvme/compiler_workdir")
     args = parser.parse_args()
@@ -755,4 +721,4 @@ if __name__ == "__main__":
         MODEL_ID = args.model_path
         CACHE_DIR = None
 
-    compile_transformer_v3_cp(args)
+    compile_transformer_v3_cfg(args)

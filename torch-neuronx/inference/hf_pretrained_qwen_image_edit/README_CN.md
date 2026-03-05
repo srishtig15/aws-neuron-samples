@@ -54,20 +54,24 @@ python neuron_qwen_image_edit/cache_hf_model.py
 
 ### 2. 编译模型
 
-提供五种编译 API：
+提供六种编译 API：
 
 | API | 脚本 | 速度 | 说明 |
 |-----|------|------|------|
-| **V3 CP（最快）** | `compile_transformer_v3_cp.py` | **~0.77s/step** | 上下文并行（TP=4, CP=2）+ NKI Flash Attention |
+| **V3 CFG（最快）** | `compile_transformer_v3_cfg.py` | **~0.75s/step** | CFG 并行（TP=4, DP=2）+ NKI Flash Attention |
+| V3 CP | `compile_transformer_v3_cp.py` | ~0.77s/step | 上下文并行（TP=4, CP=2）+ NKI Flash Attention |
 | V1 Flash | `compile_transformer_v1_flash.py` | ~1.2s/step | parallel_model_trace + NKI Flash Attention |
 | V2 Flash | `compile_transformer_v2_flash.py` | ~1.2s/step | ModelBuilder + NKI Flash Attention |
 | V2 | `compile_transformer_v2.py` | ~1.2s/step | ModelBuilder API |
 | V1 | `compile_transformer.py` | ~2.4s/step | parallel_model_trace API |
 
-**说明**：V3 CP 通过上下文并行将序列分散到 2 个数据并行 rank 上，每个 rank 只处理一半序列同时通过 all-gather 获取完整的 K/V 上下文，从而达到与 H100 相当的性能（~0.77s/step vs H100 的 ~0.75s/step）。
+**说明**：V3 CFG 通过 CFG 并行将负面和正面提示词批量合并为一次调用，分配到 2 个数据并行 rank 上，避免了上下文并行的 K/V all-gather 开销，达到最快性能。V3 CP 也达到 H100 水平（~0.77s/step vs H100 的 ~0.75s/step）。
 
 ```bash
-# 编译 V3 CP（最快，上下文并行 + NKI Flash Attention）
+# 编译 V3 CFG（最快，CFG 并行 + NKI Flash Attention，默认推荐）
+./compile.sh v3_cfg
+
+# 或编译 V3 CP（上下文并行 + NKI Flash Attention）
 ./compile.sh v3_cp
 
 # 或编译 V1 Flash（使用 NKI Flash Attention）
@@ -94,7 +98,12 @@ python neuron_qwen_image_edit/cache_hf_model.py
 ### 3. 运行推理
 
 ```bash
-# 使用 V3 CP 进行双图合并（最快，上下文并行）
+# 使用 V3 CFG 进行双图合并（最快，CFG 并行，默认）
+NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py \
+    --images img1.png img2.png \
+    --prompt "将这两个人合成一张婚纱照"
+
+# 使用 V3 CP 进行双图合并（上下文并行）
 NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py \
     --images img1.png img2.png \
     --prompt "将这两个人合成一张婚纱照" \
@@ -104,35 +113,22 @@ NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py \
 NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py \
     --images img1.png img2.png \
     --prompt "将这两个人合成一张婚纱照" \
-    --use_v1_flash
-
-# 使用 V2 进行双图合并（ModelBuilder）
-NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py \
-    --images img1.png img2.png \
-    --prompt "将这两个人合成一张婚纱照" \
-    --use_v2
-
-# 使用 V1 进行双图合并
-NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py \
-    --images img1.png img2.png \
-    --prompt "将这两个人合成一张婚纱照"
+    --no-use_v3_cfg --use_v1_flash
 
 # 单图编辑（需要 patch_multiplier=2）
 NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py \
     --images input.jpg \
     --prompt "将背景换成海滩" \
-    --patch_multiplier 2 \
-    --use_v1_flash
+    --patch_multiplier 2
 
 # 自定义 CFG 强度
 NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py \
     --images input.jpg \
     --prompt "将背景换成海滩" \
-    --true_cfg_scale 6.0 \
-    --use_v3_cp
+    --true_cfg_scale 6.0
 ```
 
-**注意**：CFG（无分类器引导）在每步中连续运行两次 transformer，而不是 batch_size=2。
+**注意**：V3 CFG 将负面和正面提示词批量合并为一次 transformer 调用（batch_size=2），比 V3 CP 的串行 CFG 快约 5.5%。其他版本（V1/V2/Flash）的 CFG 在每步中连续运行两次 transformer。
 
 ## 项目结构
 
@@ -151,7 +147,8 @@ hf_pretrained_qwen_image_edit/
 │   ├── compile_transformer_v1_flash.py  # Transformer V1 Flash（NKI Flash Attention）
 │   ├── compile_transformer_v2_flash.py  # Transformer V2 Flash（ModelBuilder + NKI）
 │   ├── compile_transformer_v3_cp.py     # Transformer V3 CP（上下文并行 + NKI）
-│   ├── compile_language_model_v3.py     # 语言模型 V3（TP=4，配合 V3 CP）
+│   ├── compile_transformer_v3_cfg.py    # Transformer V3 CFG（CFG 并行 + NKI）
+│   ├── compile_language_model_v3.py     # 语言模型 V3（TP=4，配合 V3 CP/CFG）
 │   ├── compile_vision_encoder_v3.py     # 视觉编码器 V3（TP=4，float32）
 │   ├── compile_text_encoder.py    # 文本编码器编译
 │   ├── neuron_commons.py          # 通用工具和封装
@@ -167,7 +164,8 @@ hf_pretrained_qwen_image_edit/
     ├── transformer_v1_flash/      # V1 Flash：NKI Flash Attention
     ├── transformer_v2_flash/      # V2 Flash：ModelBuilder + NKI
     ├── transformer_v3_cp/         # V3 CP：上下文并行（TP=4, CP=2）+ NKI
-    ├── language_model_v3/         # 语言模型 V3：TP=4（配合 V3 CP）
+    ├── transformer_v3_cfg/        # V3 CFG：CFG 并行（TP=4, DP=2）+ NKI
+    ├── language_model_v3/         # 语言模型 V3：TP=4（配合 V3 CP/CFG）
     └── vision_encoder/            # 单设备
 ```
 
@@ -177,15 +175,16 @@ hf_pretrained_qwen_image_edit/
 
 | 组件 | 总参数量 | 执行方式 | 说明 |
 |------|---------|---------|------|
+| Transformer（V3 CFG） | 204.3 亿 | **TP=4, DP=2** 在 Neuron 上 | 约 10.4 GB/分片，最快（CFG 并行） |
 | Transformer（V3 CP） | 204.3 亿 | **TP=4, CP=2** 在 Neuron 上 | 约 10.4 GB/分片，达到 H100 性能水平 |
 | Transformer（V1/V2） | 204.3 亿 | TP=8 在 Neuron 上 | 约 5.2 GB/分片 |
-| 语言模型（V3） | 70.7 亿 | **TP=4** 在 Neuron 上 | 约 4.1 GB/分片，配合 V3 CP transformer 使用 |
+| 语言模型（V3） | 70.7 亿 | **TP=4** 在 Neuron 上 | 约 4.1 GB/分片，配合 V3 CP/CFG transformer 使用 |
 | 语言模型（V1/V2） | 70.7 亿 | CPU | GQA 28Q/4KV 与 TP=8 不兼容 |
 | 视觉编码器（V3） | 约 14 亿 | **TP=4** 在 Neuron 上（float32） | 比 CPU 快 10-15 倍，配合 V3 CP 使用 |
 | 视觉编码器（V1/V2） | 约 14 亿 | 默认在 CPU | CPU 以获得更高精度 |
 | VAE | 约 3 亿 | DP=8 在 Neuron 上 | 大图使用分块处理 |
 
-**语言模型在 Neuron 上运行（V3）**：使用 V3 CP 时，语言模型可以使用 TP=4 在 Neuron 上运行。这是 GQA 的完美配置：28 个 Q 头 / 4 = 每 rank 7 个头，4 个 KV 头 / 4 = 每 rank 1 个头。使用 `--use_v3_language_model` 配合 `--use_v3_cp`。
+**语言模型在 Neuron 上运行（V3）**：使用 V3 CP/CFG 时，语言模型可以使用 TP=4 在 Neuron 上运行。这是 GQA 的完美配置：28 个 Q 头 / 4 = 每 rank 7 个头，4 个 KV 头 / 4 = 每 rank 1 个头。使用 `--use_v3_language_model` 配合 `--use_v3_cfg` 或 `--use_v3_cp`。
 
 **为什么语言模型在 CPU 上运行（V1/V2）**：Qwen2.5-VL 语言模型使用分组查询注意力（GQA），28 个 Q 头和 4 个 KV 头（组大小为 7）。使用 TP=8 时，Q-KV 映射无法正确保持。有效的 TP 度只能是 1、2 或 4。
 
@@ -284,19 +283,42 @@ if self.context_parallel_enabled:
 - 每个 rank 只处理 50% 的 query 序列
 - 通信开销被 NKI Flash Attention 的效率所摊销
 
-#### 7. 语言模型 V3 在 Neuron 上运行
+#### 7. V3 CFG 与 CFG 并行
 
-使用 V3 CP transformer（TP=4）时，语言模型也可以使用 TP=4 在 Neuron 上运行，而不是在 CPU 上：
+V3 CFG 通过将负面和正面 CFG 提示词批量合并为一次 transformer 调用，达到最快性能：
+
+**架构**：TP=4, DP=2（world_size=8）
+- **张量并行（TP=4）**：将模型权重分片到 4 个设备
+- **数据并行（DP=2）**：每个 DP rank 处理一个批次项（负面或正面提示词）
+
+**与 V3 CP 的关键区别**：
+
+| 方面 | V3 CP（上下文并行） | V3 CFG（CFG 并行） |
+|------|---------------------|-------------------|
+| 分散维度 | dim=1（序列） | dim=0（批次） |
+| 聚合维度 | dim=1（序列） | dim=0（批次） |
+| 注意力中的 K/V all-gather | 是（每个 rank 需要完整 K/V） | **否**（每个 rank 拥有完整序列） |
+| 编译 batch_size | 1 | 2 |
+| RoPE 分散 | 是（位置分割） | 否（两个项使用相同位置） |
+
+**为什么 V3 CFG 比 V3 CP 快**：两者都使用 TP=4 加 2 个数据并行 rank。V3 CP 分割序列，需要在每个注意力层进行 K/V all-gather（40 层 × 每步 2 次调用 = 80 次 all-gather）。V3 CFG 分割批次，每个 rank 看到完整序列，**无需 K/V all-gather** — 只在模型入口分散和出口聚合。这节省了约 5.5% 的总时间。
+
+#### 8. 语言模型 V3 在 Neuron 上运行
+
+使用 V3 CP/CFG transformer（TP=4）时，语言模型也可以使用 TP=4 在 Neuron 上运行，而不是在 CPU 上：
 
 **为什么 TP=4 是语言模型的完美配置**：
 - Q 头：28 / 4 = 每 rank 7 个头（整除）
 - KV 头：4 / 4 = 每 rank 1 个头（整除）
 - 无需填充或复制！
 
-**编译**：语言模型使用 ModelBuilder API 编译，与 V3 CP transformer 使用相同的 `world_size=8`：
+**编译**：语言模型使用 ModelBuilder API 编译，与 V3 CP/CFG transformer 使用相同的 `world_size=8`：
 
 ```bash
-# 编译 V3 CP（包含语言模型 V3）
+# 编译 V3 CFG（包含语言模型 V3）
+./compile.sh v3_cfg
+
+# 或编译 V3 CP（包含语言模型 V3）
 ./compile.sh v3_cp
 ```
 
@@ -305,13 +327,12 @@ if self.context_parallel_enabled:
 NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py \
     --images img1.png img2.png \
     --prompt "将这两个人合成" \
-    --use_v3_cp \
     --use_v3_language_model
 ```
 
-**注意**：语言模型 V3 需要 V3 CP transformer（两者都使用 world_size=8）。使用 V1/V2/V1 Flash/V2 Flash（TP=8）时，语言模型必须在 CPU 上运行。
+**注意**：语言模型 V3 需要 V3 CP/CFG transformer（都使用 world_size=8，TP=4）。使用 V1/V2/V1 Flash/V2 Flash（TP=8）时，语言模型必须在 CPU 上运行。
 
-#### 8. V1 Flash 与 NKI Flash Attention
+#### 9. V1 Flash 与 NKI Flash Attention
 
 V1 Flash 结合了两种方法的优点：
 - 使用 `parallel_model_trace` API（与 V1 相同），支持 NKI 内核
@@ -351,11 +372,12 @@ _flash_fwd_call = nki_jit()(attention_isa_kernel)
 ./compile.sh [VERSION] [HEIGHT] [WIDTH] [IMAGE_SIZE] [TP_DEGREE] [MAX_SEQ_LEN] [PATCH_MULTIPLIER] [BATCH_SIZE]
 
 # 示例：
-./compile.sh v3_cp                           # V3 CP 使用默认参数
-./compile.sh v3_cp 1024 1024 448 8 1024 3 1  # V3 CP，batch_size=1（默认）
-./compile.sh v3_cp 1024 768 448 8 1024 3 2   # V3 CP，batch_size=2
-./compile.sh v1_flash 1024 1024 448 8 1024 2 # V1 Flash，单图编辑
-./compile.sh 1024 1024 448 8 1024 3 1        # 所有版本，batch_size=1
+./compile.sh v3_cfg                           # V3 CFG 使用默认参数（最快，推荐）
+./compile.sh v3_cfg 1024 1024 448 8 1024 3 1  # V3 CFG，自定义维度
+./compile.sh v3_cp                            # V3 CP 使用默认参数
+./compile.sh v3_cp 1024 768 448 8 1024 3 2    # V3 CP，batch_size=2
+./compile.sh v1_flash 1024 1024 448 8 1024 2  # V1 Flash，单图编辑
+./compile.sh 1024 1024 448 8 1024 3 1         # 所有版本，batch_size=1
 ```
 
 ## 推理选项
@@ -364,8 +386,9 @@ _flash_fwd_call = nki_jit()(attention_isa_kernel)
 |------|--------|------|
 | `--images` | 必需 | 输入图像路径，支持 1-3 张图 |
 | `--prompt` | 必需 | 编辑指令 |
-| `--use_v3_cp` | False | 使用 V3 CP transformer（上下文并行 + NKI，最快） |
-| `--use_v3_language_model` | False | 使用 V3 语言模型在 Neuron 上运行（需要 V3 CP） |
+| `--use_v3_cfg` | **True** | 使用 V3 CFG transformer（CFG 并行 + NKI，最快）。用 `--no-use_v3_cfg` 禁用 |
+| `--use_v3_cp` | False | 使用 V3 CP transformer（上下文并行 + NKI）。与 `--use_v3_cfg` 互斥 |
+| `--use_v3_language_model` | False | 使用 V3 语言模型在 Neuron 上运行（需要 V3 CP/CFG） |
 | `--use_v3_vision_encoder` | False | 使用 V3 视觉编码器在 Neuron 上运行（TP=4，比 CPU 快 10-15 倍） |
 | `--use_v1_flash` | False | 使用 V1 Flash transformer（NKI Flash Attention） |
 | `--use_v2_flash` | False | 使用 V2 Flash transformer（ModelBuilder + NKI） |
@@ -475,13 +498,14 @@ for rank in range(4):
 | 平台 | Transformer 速度 | 总时间 |
 |------|-----------------|--------|
 | H100（无 Flash Attention） | ~0.75s/step | ~60s |
-| **TRN2 V3 CP（上下文并行 + NKI）** | **~0.77s/step** | **~62s** |
+| **TRN2 V3 CFG（CFG 并行 + NKI）** | **~0.75s/step** | **~60s** |
+| TRN2 V3 CP（上下文并行 + NKI） | ~0.77s/step | ~62s |
 | TRN2 V1 Flash（NKI） | ~1.2s/step | ~96s |
 | TRN2 V2 Flash（ModelBuilder + NKI） | ~1.2s/step | ~96s |
 | TRN2 V2（ModelBuilder） | ~1.2s/step | ~96s |
 | TRN2 V1（parallel_model_trace） | ~2.4s/step | ~190s |
 
-**V3 CP 达到 H100 水平的性能！** 通过使用上下文并行（CP=2）结合张量并行（TP=4），每个 rank 只处理一半序列，相比 V1 Flash 实现约 1.56 倍加速。
+**V3 CFG 达到 H100 同等性能！** 通过使用 CFG 并行（DP=2）结合张量并行（TP=4），将负面和正面提示词批量合并，避免了 K/V all-gather 开销。V3 CFG 比 V3 CP 快约 5.5%（60s vs 62s）。
 
 ### 性能分析
 
@@ -510,18 +534,19 @@ for rank in range(4):
 2. **NKI Flash Attention vs 编译器优化的 SDPA**：无显著差异 - Neuron 编译器已经很好地优化了 SDPA
 3. **编译 API（parallel_model_trace vs ModelBuilder）**：对最终性能影响很小
 
-### V1 vs V2 vs V1 Flash vs V2 Flash vs V3 CP 对比
+### 版本对比
 
-| 方面 | V1 | V2 | V1 Flash | V2 Flash | **V3 CP（最快）** |
-|------|-----|-----|----------|----------|-------------------|
-| 编译 API | `parallel_model_trace` | `ModelBuilder` | `parallel_model_trace` | `ModelBuilder` | `ModelBuilder` |
-| 注意力 | 标准 SDPA | 标准 SDPA | NKI Flash | NKI Flash | **NKI Flash** |
-| RoPE 处理 | 模型内部 | 预计算 | 预计算 | 预计算 | 预计算 |
-| 并行方式 | TP=8 | TP=8 | TP=8 | TP=8 | **TP=4, CP=2** |
-| 速度 | ~2.4s/step | ~1.2s/step | ~1.2s/step | ~1.2s/step | **~0.77s/step** |
-| 核心优势 | 简单 | 预计算 RoPE | NKI | 两者兼具 | **上下文并行** |
+| 方面 | V1 | V2 | V1 Flash | V2 Flash | V3 CP | **V3 CFG（最快）** |
+|------|-----|-----|----------|----------|-------|-------------------|
+| 编译 API | `parallel_model_trace` | `ModelBuilder` | `parallel_model_trace` | `ModelBuilder` | `ModelBuilder` | `ModelBuilder` |
+| 注意力 | 标准 SDPA | 标准 SDPA | NKI Flash | NKI Flash | NKI Flash | **NKI Flash** |
+| RoPE 处理 | 模型内部 | 预计算 | 预计算 | 预计算 | 预计算 | 预计算 |
+| 并行方式 | TP=8 | TP=8 | TP=8 | TP=8 | TP=4, CP=2 | **TP=4, DP=2** |
+| CFG 处理 | 串行 | 串行 | 串行 | 串行 | 串行 | **批量** |
+| 速度 | ~2.4s/step | ~1.2s/step | ~1.2s/step | ~1.2s/step | ~0.77s/step | **~0.75s/step** |
+| 核心优势 | 简单 | 预计算 RoPE | NKI | 两者兼具 | 上下文并行 | **CFG 并行** |
 
-**推荐**：使用 **V3 CP** 获得最快性能（达到 H100 水平）。如果需要更简单的调试或不想使用上下文并行的复杂性，可以使用 V1 Flash。
+**推荐**：使用 **V3 CFG**（默认）获得最快性能。如果不需要 CFG 或偏好上下文并行可使用 V3 CP。需要更简单的调试可使用 V1 Flash。
 
 ### 编译器优化
 
@@ -538,7 +563,17 @@ for rank in range(4):
 
 ### 组件耗时分解
 
-#### V3 CP 配合 V3 语言模型和 V3 视觉编码器（最快）
+#### V3 CFG 配合 V3 语言模型和 V3 视觉编码器（最快）
+
+| 组件 | 时间 |
+|------|------|
+| **视觉编码器（Neuron V3）** | **~1.5s** |
+| **语言模型（Neuron V3）** | **~0.5s** |
+| VAE 编码 | ~0.4s |
+| **Transformer V3 CFG（40 步，批量 CFG）** | **~58s** |
+| VAE 解码 | ~1.6s |
+
+#### V3 CP 配合 V3 语言模型和 V3 视觉编码器
 
 | 组件 | 时间 |
 |------|------|
@@ -548,7 +583,7 @@ for rank in range(4):
 | **Transformer V3 CP（40 步 × 2 CFG）** | **~62s** |
 | VAE 解码 | ~1.6s |
 
-#### V3 CP 配合 CPU 视觉编码器
+#### V3 CP/CFG 配合 CPU 视觉编码器
 
 | 组件 | 时间 |
 |------|------|
@@ -556,7 +591,7 @@ for rank in range(4):
 | 视觉编码器（CPU，缓存后） | ~0.7s |
 | **语言模型（Neuron V3）** | **~0.5s** |
 | VAE 编码 | ~0.4s |
-| **Transformer V3 CP（40 步 × 2 CFG）** | **~62s** |
+| **Transformer V3（40 步）** | **~58-62s** |
 | VAE 解码 | ~1.6s |
 
 #### V1 Flash / V2 配合 CPU 语言模型
@@ -578,7 +613,7 @@ Transformer 是主要瓶颈，占总推理时间的约 80%。V3 语言模型在 
 2. **语言模型（V1/V2）**：由于 GQA 架构（28Q/4KV 头与 TP=8 不兼容），在 CPU 上运行。使用 V3 CP 配合 V3 语言模型可在 Neuron 上运行。
 3. **序列长度**：编译和推理之间必须匹配。
 4. **NKI Flash Attention**：需要 `XLA_DISABLE_FUNCTIONALIZATION=1` 才能在 parallel_model_trace（V1 Flash）和 ModelBuilder（V2 Flash）中工作。没有此标志，NKI 内核会报"不可变输出参数"错误。
-5. **语言模型 V3**：仅与 V3 CP transformer 兼容（两者都使用 world_size=8，TP=4）。
+5. **语言模型 V3**：仅与 V3 CP/CFG transformer 兼容（都使用 world_size=8，TP=4）。
 6. **批处理大小**：使用 batch_size > 1 编译的模型在处理单个样本时会因填充开销而变慢（见下方批量推理章节）。
 
 ## 批量推理
@@ -623,8 +658,7 @@ Transformer 是主要瓶颈，占总推理时间的约 80%。V3 语言模型在 
 # 使用 batch_size=2 模型处理单个样本（自动填充）
 NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py \
     --images input.jpg \
-    --prompt "编辑指令" \
-    --use_v3_cp
+    --prompt "编辑指令"
 
 # 真正的批处理，请使用自定义批处理脚本
 # （参见 run_batch_tryon.py 示例实现）

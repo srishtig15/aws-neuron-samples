@@ -851,6 +851,587 @@ class NeuronTransformerWrapperV3CP(torch.nn.Module):
         return (output_tensor,)
 
 
+class NeuronTransformerWrapperV3CFG(torch.nn.Module):
+    """
+    Wrapper for V3 CFG (CFG Parallel) compiled transformer.
+
+    Key features:
+    - Uses TP=4, DP=2 (world_size=8)
+    - Batches positive + negative prompts (batch_size=2)
+    - Each DP rank processes one complete batch item (full sequence)
+    - No K/V all-gather needed
+    """
+    def __init__(self, original_transformer, nxd_model, img_rotary_emb, txt_rotary_emb,
+                 expected_num_patches=1024, num_patches_padded=None, patches_padding=0,
+                 expected_seq_len=512, temporal_frames=3, dp_degree=2):
+        super().__init__()
+        self.config = original_transformer.config
+        self.dtype = original_transformer.dtype
+        self.device = original_transformer.device
+        self.nxd_model = nxd_model
+
+        # Full RoPE (same for both batch items, not scattered)
+        self.img_rotary_emb_full = img_rotary_emb
+        self.txt_rotary_emb_full = txt_rotary_emb
+
+        self.expected_num_patches = expected_num_patches
+        self.num_patches_padded = num_patches_padded if num_patches_padded else expected_num_patches
+        self.patches_padding = patches_padding
+        self.expected_seq_len = expected_seq_len
+        self.temporal_frames = temporal_frames
+        self.base_patches = expected_num_patches // temporal_frames
+        self.dp_degree = dp_degree
+        # CFG always uses batch_size=2 (positive + negative)
+        self.compiled_batch_size = 2
+
+    @contextlib.contextmanager
+    def cache_context(self, name: str):
+        """Dummy cache context for compatibility with pipeline."""
+        yield
+
+    def forward(self, hidden_states, encoder_hidden_states=None,
+                timestep=None, img_shapes=None, return_dict=False, **kwargs):
+        """Forward pass with CFG Parallel. Expects batch_size=2 input."""
+        batch_size = hidden_states.shape[0]
+
+        if not hasattr(self, '_debug_printed'):
+            print(f"DEBUG Transformer V3 CFG input shapes:")
+            print(f"  hidden_states: {hidden_states.shape}")
+            print(f"  encoder_hidden_states: {encoder_hidden_states.shape}")
+            print(f"  timestep: {timestep.shape}")
+            print(f"  img_rotary_emb_full: {self.img_rotary_emb_full.shape}")
+            print(f"  txt_rotary_emb_full: {self.txt_rotary_emb_full.shape}")
+            print(f"  DP degree: {self.dp_degree}")
+            print(f"  Compiled batch size: {self.compiled_batch_size}")
+            self._debug_printed = True
+
+        if batch_size != self.compiled_batch_size:
+            raise ValueError(
+                f"V3 CFG requires batch_size={self.compiled_batch_size} "
+                f"(negative + positive), got {batch_size}"
+            )
+
+        # Pad hidden_states to expected_num_patches
+        actual_patches = hidden_states.shape[1]
+        if actual_patches < self.expected_num_patches:
+            pad_size = self.expected_num_patches - actual_patches
+            padding = torch.zeros(
+                (batch_size, pad_size, hidden_states.shape[2]),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device
+            )
+            hidden_states = torch.cat([hidden_states, padding], dim=1)
+        elif actual_patches > self.expected_num_patches:
+            hidden_states = hidden_states[:, :self.expected_num_patches, :]
+
+        # Apply alignment padding if needed
+        if self.patches_padding > 0:
+            cfg_padding = torch.zeros(
+                (batch_size, self.patches_padding, hidden_states.shape[2]),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device
+            )
+            hidden_states = torch.cat([hidden_states, cfg_padding], dim=1)
+
+        # Pad encoder_hidden_states to expected_seq_len
+        actual_seq_len = encoder_hidden_states.shape[1]
+        if actual_seq_len < self.expected_seq_len:
+            pad_size = self.expected_seq_len - actual_seq_len
+            padding = torch.zeros(
+                (batch_size, pad_size, encoder_hidden_states.shape[2]),
+                dtype=encoder_hidden_states.dtype,
+                device=encoder_hidden_states.device
+            )
+            encoder_hidden_states = torch.cat([encoder_hidden_states, padding], dim=1)
+        elif actual_seq_len > self.expected_seq_len:
+            encoder_hidden_states = encoder_hidden_states[:, :self.expected_seq_len, :]
+
+        # Convert timestep to float32
+        timestep = timestep.to(torch.float32)
+
+        # Run model - passes full RoPE (same for both batch items)
+        output = self.nxd_model(
+            hidden_states,
+            encoder_hidden_states,
+            timestep,
+            self.img_rotary_emb_full,
+            self.txt_rotary_emb_full
+        )
+
+        # Extract tensor from output
+        if isinstance(output, tuple):
+            output_tensor = output[0]
+        else:
+            output_tensor = output
+
+        # Extract first frame as noise prediction for both batch items
+        output_tensor = output_tensor[:, :self.base_patches, :]
+
+        if return_dict:
+            from diffusers.models.modeling_outputs import Transformer2DModelOutput
+            return Transformer2DModelOutput(sample=output_tensor)
+        return (output_tensor,)
+
+
+def load_transformer_v3_cfg(compiled_models_dir: str, pipe, args):
+    """
+    Load V3 CFG compiled transformer with CFG Parallelism.
+
+    V3 CFG models use:
+    - TP=4, DP=2 (world_size=8)
+    - Batch parallelism for negative + positive prompts
+    - NKI Flash Attention
+
+    Args:
+        compiled_models_dir: Directory containing compiled model artifacts
+        pipe: Pipeline with original transformer (for config)
+        args: Command line arguments
+
+    Returns:
+        NeuronTransformerWrapperV3CFG wrapping the loaded model
+    """
+    import json
+
+    if not NXD_MODEL_AVAILABLE:
+        raise RuntimeError(
+            "NxDModel is not available. Please ensure neuronx_distributed is installed correctly."
+        )
+
+    v3_cfg_path = f"{compiled_models_dir}/transformer_v3_cfg"
+    nxd_model_path = f"{v3_cfg_path}/nxd_model.pt"
+    weights_path = f"{v3_cfg_path}/weights"
+    rope_cache_path = f"{v3_cfg_path}/rope_cache.pt"
+    config_path = f"{v3_cfg_path}/config.json"
+
+    # Validate files exist
+    for path, name in [(nxd_model_path, "model"), (weights_path, "weights"), (rope_cache_path, "RoPE cache")]:
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"V3 CFG transformer {name} not found at {path}\n"
+                "Please run: python neuron_qwen_image_edit/compile_transformer_v3_cfg.py"
+            )
+
+    # Load config
+    print(f"  Loading V3 CFG config from {config_path}...")
+    with open(config_path, "r") as f:
+        config = json.load(f)
+
+    expected_num_patches = config["num_patches"]
+    num_patches_padded = config.get("num_patches_padded", expected_num_patches)
+    patches_padding = config.get("patches_padding", 0)
+    expected_seq_len = config["text_seq_len"]
+    temporal_frames = config.get("frame", config.get("patch_multiplier", 3))
+    tp_degree = config.get("tp_degree", 4)
+    world_size = config.get("world_size", 8)
+    dp_degree = config.get("dp_degree", 2)
+    compiled_batch_size = config.get("batch_size", 2)
+    base_patches = expected_num_patches // temporal_frames
+
+    print(f"  V3 CFG config: patches={expected_num_patches}, seq_len={expected_seq_len}")
+    if patches_padding > 0:
+        print(f"  V3 CFG config: patches_padded={num_patches_padded} (+{patches_padding} for alignment)")
+    print(f"  V3 CFG config: temporal_frames={temporal_frames}, base_patches={base_patches}")
+    print(f"  V3 CFG config: TP={tp_degree}, world_size={world_size}, DP={dp_degree}")
+    print(f"  V3 CFG config: batch_size={compiled_batch_size}")
+    print(f"  CFG Parallel: {config.get('cfg_parallel', False)}")
+    print(f"  NKI Flash Attention: {config.get('nki_flash_attention', False)}")
+
+    # Load pre-computed RoPE tensors (full, not sharded)
+    print(f"  Loading RoPE cache from {rope_cache_path}...")
+    rope_cache = torch.load(rope_cache_path)
+    img_rotary_emb = rope_cache["img_rotary_emb"].to(torch.bfloat16)
+    txt_rotary_emb = rope_cache["txt_rotary_emb"].to(torch.bfloat16)
+    print(f"  img_rotary_emb: {img_rotary_emb.shape}")
+    print(f"  txt_rotary_emb: {txt_rotary_emb.shape}")
+
+    # Load the compiled model using NxDModel.load()
+    print(f"  Loading V3 CFG model from {nxd_model_path}...")
+    nxd_model = NxDModel.load(nxd_model_path)
+
+    # Load sharded checkpoints
+    # For CFG Parallel: TP=4 but world_size=8
+    # Each DP rank uses the same weights as its corresponding TP rank
+    # Duplicate: [tp0, tp1, tp2, tp3] -> [tp0, tp1, tp2, tp3, tp0, tp1, tp2, tp3]
+    from safetensors.torch import load_file
+    print(f"  Loading sharded weights for TP={tp_degree}, world_size={world_size}...")
+
+    # First load the TP checkpoints
+    tp_checkpoints = []
+    for rank in range(tp_degree):
+        ckpt_path = f"{weights_path}/tp{rank}_sharded_checkpoint.safetensors"
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+        ckpt = load_file(ckpt_path)
+        tp_checkpoints.append(ckpt)
+        if rank == 0:
+            print(f"    Rank 0 checkpoint keys: {len(ckpt)} tensors")
+
+    # Duplicate checkpoints for each DP rank with unique global_rank values
+    sharded_checkpoints = []
+    for dp_rank in range(dp_degree):
+        for tp_rank in range(tp_degree):
+            world_rank = dp_rank * tp_degree + tp_rank
+            ckpt_copy = {k: v.clone() for k, v in tp_checkpoints[tp_rank].items()}
+
+            # Set the correct global_rank for SPMD scatter/gather
+            global_rank_key = 'transformer.global_rank.rank'
+            if global_rank_key in ckpt_copy:
+                ckpt_copy[global_rank_key] = torch.tensor([world_rank], dtype=torch.int32)
+                if world_rank < 2 or world_rank >= world_size - 2:
+                    print(f"    World rank {world_rank}: global_rank set to {world_rank}")
+
+            sharded_checkpoints.append(ckpt_copy)
+
+    print(f"  Total checkpoints: {len(sharded_checkpoints)} (TP={tp_degree} x DP={dp_degree})")
+    print(f"  Each world rank has unique global_rank for SPMD execution")
+
+    # Initialize model with weights and move to Neuron
+    print("  Setting weights...")
+    for i in [0, 4]:  # Check first rank of each DP group
+        if i < len(sharded_checkpoints):
+            ckpt = sharded_checkpoints[i]
+            gr_key = 'transformer.global_rank.rank'
+            if gr_key in ckpt:
+                print(f"    Checkpoint[{i}] global_rank = {ckpt[gr_key].item()}")
+    nxd_model.set_weights(sharded_checkpoints)
+    print("  Moving model to Neuron...")
+    nxd_model.to_neuron()
+    print("  V3 CFG model initialized on Neuron!")
+
+    # Create wrapper
+    wrapper = NeuronTransformerWrapperV3CFG(
+        original_transformer=pipe.transformer,
+        nxd_model=nxd_model,
+        img_rotary_emb=img_rotary_emb,
+        txt_rotary_emb=txt_rotary_emb,
+        expected_num_patches=expected_num_patches,
+        num_patches_padded=num_patches_padded,
+        patches_padding=patches_padding,
+        expected_seq_len=expected_seq_len,
+        temporal_frames=temporal_frames,
+        dp_degree=dp_degree,
+    )
+
+    return wrapper
+
+
+def patch_pipeline_for_cfg_parallel(pipe):
+    """
+    Monkey-patch the pipeline's denoising loop for batched CFG inference.
+
+    Instead of two sequential transformer calls (positive + negative),
+    this batches both into a single call with batch_size=2.
+    The V3 CFG transformer scatters along batch dim across DP ranks.
+    """
+    import types
+    import numpy as np
+    from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import (
+        calculate_dimensions,
+        calculate_shift,
+        retrieve_timesteps,
+        QwenImagePipelineOutput,
+        CONDITION_IMAGE_SIZE,
+        VAE_IMAGE_SIZE,
+        logger,
+    )
+    try:
+        from diffusers.utils import XLA_AVAILABLE
+    except ImportError:
+        XLA_AVAILABLE = False
+    if XLA_AVAILABLE:
+        import torch_xla.core.xla_model as xm
+
+    def __call__(
+        self,
+        image=None,
+        prompt=None,
+        negative_prompt=None,
+        true_cfg_scale: float = 4.0,
+        height=None,
+        width=None,
+        num_inference_steps: int = 50,
+        sigmas=None,
+        guidance_scale=None,
+        num_images_per_prompt: int = 1,
+        generator=None,
+        latents=None,
+        prompt_embeds=None,
+        prompt_embeds_mask=None,
+        negative_prompt_embeds=None,
+        negative_prompt_embeds_mask=None,
+        output_type="pil",
+        return_dict=True,
+        attention_kwargs=None,
+        callback_on_step_end=None,
+        callback_on_step_end_tensor_inputs=["latents"],
+        max_sequence_length: int = 512,
+    ):
+        image_size = image[-1].size if isinstance(image, list) else image.size
+        calculated_width, calculated_height = calculate_dimensions(1024 * 1024, image_size[0] / image_size[1])
+        height = height or calculated_height
+        width = width or calculated_width
+
+        multiple_of = self.vae_scale_factor * 2
+        width = width // multiple_of * multiple_of
+        height = height // multiple_of * multiple_of
+
+        # 1. Check inputs
+        self.check_inputs(
+            prompt, height, width,
+            negative_prompt=negative_prompt,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            prompt_embeds_mask=prompt_embeds_mask,
+            negative_prompt_embeds_mask=negative_prompt_embeds_mask,
+            callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
+            max_sequence_length=max_sequence_length,
+        )
+
+        self._guidance_scale = guidance_scale
+        self._attention_kwargs = attention_kwargs
+        self._current_timestep = None
+        self._interrupt = False
+
+        # 2. Define call parameters
+        if prompt is not None and isinstance(prompt, str):
+            batch_size = 1
+        elif prompt is not None and isinstance(prompt, list):
+            batch_size = len(prompt)
+        else:
+            batch_size = prompt_embeds.shape[0]
+
+        device = self._execution_device
+
+        # 3. Preprocess image
+        if image is not None and not (isinstance(image, torch.Tensor) and image.size(1) == self.latent_channels):
+            if not isinstance(image, list):
+                image = [image]
+            condition_image_sizes = []
+            condition_images = []
+            vae_image_sizes = []
+            vae_images = []
+            for img in image:
+                image_width, image_height = img.size
+                condition_width, condition_height = calculate_dimensions(
+                    CONDITION_IMAGE_SIZE, image_width / image_height
+                )
+                vae_width, vae_height = calculate_dimensions(VAE_IMAGE_SIZE, image_width / image_height)
+                condition_image_sizes.append((condition_width, condition_height))
+                vae_image_sizes.append((vae_width, vae_height))
+                condition_images.append(self.image_processor.resize(img, condition_height, condition_width))
+                vae_images.append(self.image_processor.preprocess(img, vae_height, vae_width).unsqueeze(2))
+
+        has_neg_prompt = negative_prompt is not None or (
+            negative_prompt_embeds is not None and negative_prompt_embeds_mask is not None
+        )
+
+        if true_cfg_scale > 1 and not has_neg_prompt:
+            logger.warning(
+                f"true_cfg_scale is passed as {true_cfg_scale}, but classifier-free guidance is not enabled since no negative_prompt is provided."
+            )
+        elif true_cfg_scale <= 1 and has_neg_prompt:
+            logger.warning(
+                " negative_prompt is passed but classifier-free guidance is not enabled since true_cfg_scale <= 1"
+            )
+
+        do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
+        prompt_embeds, prompt_embeds_mask = self.encode_prompt(
+            image=condition_images,
+            prompt=prompt,
+            prompt_embeds=prompt_embeds,
+            prompt_embeds_mask=prompt_embeds_mask,
+            device=device,
+            num_images_per_prompt=num_images_per_prompt,
+            max_sequence_length=max_sequence_length,
+        )
+        if do_true_cfg:
+            negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(
+                image=condition_images,
+                prompt=negative_prompt,
+                prompt_embeds=negative_prompt_embeds,
+                prompt_embeds_mask=negative_prompt_embeds_mask,
+                device=device,
+                num_images_per_prompt=num_images_per_prompt,
+                max_sequence_length=max_sequence_length,
+            )
+
+        # 4. Prepare latent variables
+        num_channels_latents = self.transformer.config.in_channels // 4
+        latents, image_latents = self.prepare_latents(
+            vae_images,
+            batch_size * num_images_per_prompt,
+            num_channels_latents,
+            height,
+            width,
+            prompt_embeds.dtype,
+            device,
+            generator,
+            latents,
+        )
+        img_shapes = [
+            [
+                (1, height // self.vae_scale_factor // 2, width // self.vae_scale_factor // 2),
+                *[
+                    (1, vae_height // self.vae_scale_factor // 2, vae_width // self.vae_scale_factor // 2)
+                    for vae_width, vae_height in vae_image_sizes
+                ],
+            ]
+        ] * batch_size
+
+        # 5. Prepare timesteps
+        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
+        image_seq_len = latents.shape[1]
+        mu = calculate_shift(
+            image_seq_len,
+            self.scheduler.config.get("base_image_seq_len", 256),
+            self.scheduler.config.get("max_image_seq_len", 4096),
+            self.scheduler.config.get("base_shift", 0.5),
+            self.scheduler.config.get("max_shift", 1.15),
+        )
+        timesteps, num_inference_steps = retrieve_timesteps(
+            self.scheduler, num_inference_steps, device, sigmas=sigmas, mu=mu,
+        )
+        num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
+        self._num_timesteps = len(timesteps)
+
+        # handle guidance
+        if self.transformer.config.guidance_embeds and guidance_scale is None:
+            raise ValueError("guidance_scale is required for guidance-distilled model.")
+        elif self.transformer.config.guidance_embeds:
+            guidance = torch.full([1], guidance_scale, device=device, dtype=torch.float32)
+            guidance = guidance.expand(latents.shape[0])
+        elif not self.transformer.config.guidance_embeds and guidance_scale is not None:
+            logger.warning(
+                f"guidance_scale is passed as {guidance_scale}, but ignored since the model is not guidance-distilled."
+            )
+            guidance = None
+        elif not self.transformer.config.guidance_embeds and guidance_scale is None:
+            guidance = None
+
+        if self.attention_kwargs is None:
+            self._attention_kwargs = {}
+
+        # ===== CFG PARALLEL: Pre-concatenate embeddings =====
+        if do_true_cfg:
+            # Pad negative_prompt_embeds to match prompt_embeds length if needed
+            neg_seq = negative_prompt_embeds.shape[1]
+            pos_seq = prompt_embeds.shape[1]
+            if neg_seq < pos_seq:
+                pad = torch.zeros(
+                    (negative_prompt_embeds.shape[0], pos_seq - neg_seq, negative_prompt_embeds.shape[2]),
+                    dtype=negative_prompt_embeds.dtype, device=negative_prompt_embeds.device
+                )
+                negative_prompt_embeds = torch.cat([negative_prompt_embeds, pad], dim=1)
+            elif pos_seq < neg_seq:
+                pad = torch.zeros(
+                    (prompt_embeds.shape[0], neg_seq - pos_seq, prompt_embeds.shape[2]),
+                    dtype=prompt_embeds.dtype, device=prompt_embeds.device
+                )
+                prompt_embeds = torch.cat([prompt_embeds, pad], dim=1)
+            # [negative, positive] along batch dim -> [2, seq, C]
+            batched_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+
+        # 6. Denoising loop
+        self.scheduler.set_begin_index(0)
+        with self.progress_bar(total=num_inference_steps) as progress_bar:
+            for i, t in enumerate(timesteps):
+                if self.interrupt:
+                    continue
+
+                self._current_timestep = t
+
+                latent_model_input = latents
+                if image_latents is not None:
+                    latent_model_input = torch.cat([latents, image_latents], dim=1)
+
+                if do_true_cfg:
+                    # ===== CFG PARALLEL: Single batched call =====
+                    # Duplicate latents for both negative and positive: [2, patches, C]
+                    batched_latent = torch.cat([latent_model_input, latent_model_input], dim=0)
+                    batched_timestep = t.expand(2).to(latents.dtype) / 1000
+
+                    batched_output = self.transformer(
+                        hidden_states=batched_latent,
+                        timestep=batched_timestep,
+                        encoder_hidden_states=batched_embeds,
+                        img_shapes=img_shapes,
+                        return_dict=False,
+                    )[0]
+
+                    # Split: index 0 is negative, index 1 is positive
+                    noise_pred = batched_output[1:2, :latents.size(1)]      # positive
+                    neg_noise_pred = batched_output[0:1, :latents.size(1)]   # negative
+
+                    # Apply CFG with norm rescale (Qwen-specific)
+                    comb_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
+                    cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
+                    noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
+                    noise_pred = comb_pred * (cond_norm / noise_norm)
+                else:
+                    # No CFG - single call
+                    timestep_input = t.expand(latents.shape[0]).to(latents.dtype)
+                    with self.transformer.cache_context("cond"):
+                        noise_pred = self.transformer(
+                            hidden_states=latent_model_input,
+                            timestep=timestep_input / 1000,
+                            guidance=guidance,
+                            encoder_hidden_states=prompt_embeds,
+                            img_shapes=img_shapes,
+                            return_dict=False,
+                        )[0]
+                    noise_pred = noise_pred[:, :latents.size(1)]
+
+                # compute the previous noisy sample x_t -> x_t-1
+                latents_dtype = latents.dtype
+                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+                if latents.dtype != latents_dtype:
+                    if torch.backends.mps.is_available():
+                        latents = latents.to(latents_dtype)
+
+                if callback_on_step_end is not None:
+                    callback_kwargs = {}
+                    for k in callback_on_step_end_tensor_inputs:
+                        callback_kwargs[k] = locals()[k]
+                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+                    latents = callback_outputs.pop("latents", latents)
+                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+
+                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                    progress_bar.update()
+
+                if XLA_AVAILABLE:
+                    xm.mark_step()
+
+        self._current_timestep = None
+        if output_type == "latent":
+            image = latents
+        else:
+            latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
+            latents = latents.to(self.vae.dtype)
+            latents_mean = (
+                torch.tensor(self.vae.config.latents_mean)
+                .view(1, self.vae.config.z_dim, 1, 1, 1)
+                .to(latents.device, latents.dtype)
+            )
+            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
+                latents.device, latents.dtype
+            )
+            latents = latents / latents_std + latents_mean
+            image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
+            image = self.image_processor.postprocess(image, output_type=output_type)
+
+        self.maybe_free_model_hooks()
+
+        if not return_dict:
+            return (image,)
+
+        return QwenImagePipelineOutput(images=image)
+
+    pipe.__class__.__call__ = __call__
+    print("  Pipeline patched for CFG Parallel (batched denoising loop)")
+
+
 def load_transformer_v3_cp(compiled_models_dir: str, pipe, args):
     """
     Load V3 CP compiled transformer with Context Parallel.
@@ -1633,12 +2214,36 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     use_v1_flash = getattr(args, 'use_v1_flash', False)
     use_v2_flash = getattr(args, 'use_v2_flash', False)
     use_v3_cp = getattr(args, 'use_v3_cp', False)
+    use_v3_cfg = getattr(args, 'use_v3_cfg', False)
     v2_available = os.path.exists(f"{compiled_models_dir}/transformer_v2/nxd_model.pt")
     v1_flash_available = os.path.exists(f"{compiled_models_dir}/transformer_v1_flash")
     v2_flash_available = os.path.exists(f"{compiled_models_dir}/transformer_v2_flash/nxd_model.pt")
     v3_cp_available = os.path.exists(f"{compiled_models_dir}/transformer_v3_cp/nxd_model.pt")
+    v3_cfg_available = os.path.exists(f"{compiled_models_dir}/transformer_v3_cfg/nxd_model.pt")
 
-    if use_v3_cp:
+    if use_v3_cfg:
+        print("\n[1/3] Loading Transformer V3 CFG (CFG Parallel + NKI Flash Attention, TP=4, DP=2)...")
+        if not v3_cfg_available:
+            raise FileNotFoundError(
+                f"V3 CFG transformer not found. Please run: python neuron_qwen_image_edit/compile_transformer_v3_cfg.py"
+            )
+
+        # Store reference to original for wrapper
+        original_transformer = pipe.transformer
+
+        # Load V3 CFG model and assign to pipe
+        pipe.transformer = load_transformer_v3_cfg(compiled_models_dir, pipe, args)
+
+        # Delete original transformer to free memory
+        del original_transformer
+        import gc
+        gc.collect()
+        print("  Transformer V3 CFG loaded!")
+        print("  Original transformer deleted to free memory.")
+
+        # Patch pipeline for batched CFG
+        patch_pipeline_for_cfg_parallel(pipe)
+    elif use_v3_cp:
         print("\n[1/3] Loading Transformer V3 CP (Context Parallel + NKI Flash Attention, TP=4, CP=2)...")
         if not v3_cp_available:
             raise FileNotFoundError(
@@ -1910,7 +2515,7 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
         attn_scales=original_vae_config.attn_scales,
         temperal_downsample=original_vae_config.temperal_downsample,
         dropout=original_vae_config.dropout,
-        input_channels=original_vae_config.input_channels,
+        input_channels=getattr(original_vae_config, 'input_channels', 3),
         latents_mean=original_vae_config.latents_mean,
         latents_std=original_vae_config.latents_std,
     )
@@ -1995,7 +2600,10 @@ def load_all_compiled_models(compiled_models_dir: str, pipe, args):
     type(pipe)._execution_device = property(lambda self: torch.device("cpu"))
 
     # Use vision_mode and language_mode defined at the top of the function
-    if use_v3_cp:
+    if use_v3_cfg:
+        transformer_api = "V3 CFG (CFG Parallel + NKI, TP=4, DP=2)"
+        tp_info = "TP=4, DP=2"
+    elif use_v3_cp:
         transformer_api = "V3 CP (Context Parallel + NKI, TP=4, CP=2)"
         tp_info = "TP=4, CP=2"
     elif use_v2_flash:
@@ -2333,10 +2941,15 @@ if __name__ == "__main__":
                         help="Use V2 Flash transformer with ModelBuilder + NKI Flash Attention. "
                              "Combines ModelBuilder's XLA optimization with NKI's hardware attention. "
                              "Requires: python neuron_qwen_image_edit/compile_transformer_v2_flash.py")
-    parser.add_argument("--use_v3_cp", action=argparse.BooleanOptionalAction, default=True,
+    parser.add_argument("--use_v3_cp", action="store_true",
                         help="Use V3 CP transformer with Context Parallel + NKI Flash Attention. "
-                             "Default: True. Use --no-use_v3_cp to disable. "
+                             "Mutually exclusive with --use_v3_cfg. "
                              "Requires: ./compile.sh v3_cp")
+    parser.add_argument("--use_v3_cfg", action=argparse.BooleanOptionalAction, default=True,
+                        help="Use V3 CFG transformer with CFG Parallel + NKI Flash Attention. "
+                             "Batches negative + positive prompts for parallel inference. "
+                             "Default: True. Use --no-use_v3_cfg to disable. "
+                             "Requires: ./compile.sh v3_cfg")
 
     # Other options
     parser.add_argument("--warmup", action="store_true",
@@ -2357,5 +2970,10 @@ if __name__ == "__main__":
     # Validate number of images (1-3 supported by Qwen-Image-Edit)
     if len(args.images) > 3:
         parser.error("Qwen-Image-Edit supports 1-3 images, but {} were provided".format(len(args.images)))
+
+    # Mutual exclusivity: --use_v3_cfg and --use_v3_cp
+    if args.use_v3_cfg and args.use_v3_cp:
+        # --use_v3_cp explicitly set takes priority, disable v3_cfg
+        args.use_v3_cfg = False
 
     run_inference(args)
