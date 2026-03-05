@@ -285,6 +285,167 @@ class NeuronTransformerWrapper(torch.nn.Module):
         return (output_tensor,)
 
 
+class NeuronTransformerWrapperCFG(torch.nn.Module):
+    """
+    Wrapper for CFG Parallel compiled LongCat FLUX transformer on Trainium2.
+
+    Similar to NeuronTransformerWrapper but expects batch_size=2 input
+    (negative + positive prompt embeddings batched together).
+    No batch padding needed since CFG always uses exactly 2 batch items.
+    """
+    def __init__(self, original_transformer, nxd_model,
+                 pos_embed, patch_h, patch_w,
+                 expected_img_patches=8192, expected_txt_seq=1024,
+                 target_patches=4096):
+        super().__init__()
+        self.config = original_transformer.config
+        self.dtype = original_transformer.dtype
+        self.device = original_transformer.device
+        self.nxd_model = nxd_model
+
+        self.pos_embed = pos_embed
+        self.patch_h = patch_h
+        self.patch_w = patch_w
+
+        self.expected_img_patches = expected_img_patches
+        self.expected_txt_seq = expected_txt_seq
+        self.target_patches = target_patches
+        self.compiled_batch_size = 2  # Always 2 for CFG
+
+        self._rope_cache = {}
+
+    @contextlib.contextmanager
+    def cache_context(self, name: str):
+        yield
+
+    def _compute_rope_from_ids(self, txt_ids, img_ids):
+        """Compute RoPE from pipeline-provided position IDs."""
+        actual_txt = txt_ids.shape[0]
+        actual_img = img_ids.shape[0]
+        cache_key = (actual_txt, actual_img)
+
+        if cache_key in self._rope_cache:
+            return self._rope_cache[cache_key]
+
+        if actual_txt < self.expected_txt_seq:
+            pad_len = self.expected_txt_seq - actual_txt
+            pad_ids = torch.zeros(pad_len, 3, dtype=txt_ids.dtype, device=txt_ids.device)
+            last_row = txt_ids[-1, 1].item() if actual_txt > 0 else 0
+            for i in range(pad_len):
+                pad_ids[i, 0] = 0
+                pad_ids[i, 1] = last_row + 1 + i
+                pad_ids[i, 2] = last_row + 1 + i
+            txt_ids_padded = torch.cat([txt_ids, pad_ids], dim=0)
+        else:
+            txt_ids_padded = txt_ids[:self.expected_txt_seq]
+
+        if actual_img < self.expected_img_patches:
+            pad_n = self.expected_img_patches - actual_img
+            img_ids_padded = torch.cat(
+                [img_ids, img_ids[-1:].expand(pad_n, -1)], dim=0)
+        else:
+            img_ids_padded = img_ids[:self.expected_img_patches]
+
+        with torch.no_grad():
+            txt_cos, txt_sin = self.pos_embed(txt_ids_padded)
+            img_cos, img_sin = self.pos_embed(img_ids_padded)
+
+        rope = (
+            txt_cos.to(torch.bfloat16),
+            txt_sin.to(torch.bfloat16),
+            img_cos.to(torch.bfloat16),
+            img_sin.to(torch.bfloat16),
+        )
+        self._rope_cache[cache_key] = rope
+        return rope
+
+    def _compute_rope_fallback(self, actual_txt_len):
+        """Fallback RoPE computation when txt_ids/img_ids not provided."""
+        cache_key = ("fallback", actual_txt_len)
+        if cache_key in self._rope_cache:
+            return self._rope_cache[cache_key]
+
+        from diffusers.pipelines.longcat_image.pipeline_longcat_image_edit import prepare_pos_ids
+
+        text_ids = prepare_pos_ids(
+            modality_id=0, type="text", num_token=self.expected_txt_seq)
+        target_ids = prepare_pos_ids(
+            modality_id=1, type="image",
+            start=(actual_txt_len, actual_txt_len),
+            height=self.patch_h, width=self.patch_w)
+        source_ids = prepare_pos_ids(
+            modality_id=2, type="image",
+            start=(actual_txt_len, actual_txt_len),
+            height=self.patch_h, width=self.patch_w)
+        img_ids = torch.cat([target_ids, source_ids], dim=0)
+
+        return self._compute_rope_from_ids(text_ids, img_ids)
+
+    def forward(self, hidden_states, encoder_hidden_states=None,
+                timestep=None, txt_ids=None, img_ids=None,
+                return_dict=False, **kwargs):
+        """
+        Forward pass for CFG parallel transformer.
+
+        hidden_states: [2, img_patches, 64] -- batched neg+pos packed latents
+        encoder_hidden_states: [2, txt_seq, 3584] -- batched neg+pos text embeddings
+        timestep: [2] -- denoising timestep for both batch items
+        """
+        batch_size = hidden_states.shape[0]
+        actual_txt_len = encoder_hidden_states.shape[1]
+
+        # Compute RoPE (same for both batch items)
+        if txt_ids is not None and img_ids is not None:
+            txt_cos, txt_sin, img_cos, img_sin = self._compute_rope_from_ids(txt_ids, img_ids)
+        else:
+            txt_cos, txt_sin, img_cos, img_sin = self._compute_rope_fallback(actual_txt_len)
+
+        # Pad hidden_states (image patches)
+        actual_img = hidden_states.shape[1]
+        if actual_img < self.expected_img_patches:
+            pad = torch.zeros(
+                (batch_size, self.expected_img_patches - actual_img, hidden_states.shape[2]),
+                dtype=hidden_states.dtype, device=hidden_states.device)
+            hidden_states = torch.cat([hidden_states, pad], dim=1)
+        elif actual_img > self.expected_img_patches:
+            hidden_states = hidden_states[:, :self.expected_img_patches, :]
+
+        # Pad encoder_hidden_states (text)
+        if actual_txt_len < self.expected_txt_seq:
+            pad = torch.zeros(
+                (batch_size, self.expected_txt_seq - actual_txt_len, encoder_hidden_states.shape[2]),
+                dtype=encoder_hidden_states.dtype, device=encoder_hidden_states.device)
+            encoder_hidden_states = torch.cat([encoder_hidden_states, pad], dim=1)
+        elif actual_txt_len > self.expected_txt_seq:
+            encoder_hidden_states = encoder_hidden_states[:, :self.expected_txt_seq, :]
+
+        timestep = timestep.to(torch.float32)
+
+        # Run compiled model (batch_size=2, no batch padding needed)
+        output = self.nxd_model(
+            hidden_states,
+            encoder_hidden_states,
+            timestep,
+            img_cos,
+            img_sin,
+            txt_cos,
+            txt_sin,
+        )
+
+        if isinstance(output, tuple):
+            output_tensor = output[0]
+        else:
+            output_tensor = output
+
+        # Extract target image patches for both batch items
+        output_tensor = output_tensor[:, :self.target_patches, :]
+
+        if return_dict:
+            from diffusers.models.modeling_outputs import Transformer2DModelOutput
+            return Transformer2DModelOutput(sample=output_tensor)
+        return (output_tensor,)
+
+
 class SimpleLatentDistribution:
     """Minimal latent distribution matching DiagonalGaussianDistribution interface."""
     def __init__(self, mean):
@@ -515,6 +676,183 @@ def load_transformer(compiled_models_dir, pipe, args):
     return wrapper
 
 
+def load_transformer_cfg(compiled_models_dir, pipe, args):
+    """Load CFG parallel compiled transformer model."""
+    model_path = f"{compiled_models_dir}/transformer_cfg"
+    nxd_model_path = f"{model_path}/nxd_model.pt"
+    weights_path = f"{model_path}/weights"
+    rope_cache_path = f"{model_path}/rope_cache.pt"
+    config_path = f"{model_path}/config.json"
+
+    for p, name in [(nxd_model_path, "model"), (weights_path, "weights"),
+                     (rope_cache_path, "RoPE cache"), (config_path, "config")]:
+        if not os.path.exists(p):
+            raise FileNotFoundError(f"Compiled CFG {name} not found at {p}")
+
+    with open(config_path, "r") as f:
+        config = json.load(f)
+
+    expected_img_patches = config["num_img_patches_padded"]
+    expected_txt_seq = config["text_seq_len"]
+    target_patches = config["num_img_patches"] // 2
+    patch_h = config["patch_h"]
+    patch_w = config["patch_w"]
+
+    print(f"  CFG config: img_patches={expected_img_patches}, txt_seq={expected_txt_seq}")
+    print(f"  Target patches: {target_patches}, batch_size=2 (CFG)")
+    print(f"  Patch grid: {patch_h}x{patch_w}")
+
+    # Load NxDModel
+    print(f"  Loading CFG compiled model...")
+    nxd_model = NxDModel.load(nxd_model_path)
+
+    from safetensors.torch import load_file
+    tp_degree = config.get("tp_degree", 4)
+    world_size = config.get("world_size", 8)
+
+    tp_checkpoints = []
+    for rank in range(tp_degree):
+        ckpt_path = f"{weights_path}/tp{rank}_sharded_checkpoint.safetensors"
+        ckpt = load_file(ckpt_path)
+        tp_checkpoints.append(ckpt)
+        print(f"    Loaded tp{rank}: {len(ckpt)} tensors")
+
+    # Duplicate for all world ranks (DP ranks share TP weights)
+    import copy
+    sharded_checkpoints = []
+    for world_rank in range(world_size):
+        tp_rank = world_rank % tp_degree
+        ckpt_copy = dict(tp_checkpoints[tp_rank])
+        rank_key = "transformer.global_rank.rank"
+        if rank_key in ckpt_copy:
+            ckpt_copy[rank_key] = torch.tensor([world_rank], dtype=torch.int32)
+        sharded_checkpoints.append(ckpt_copy)
+    print(f"  Prepared {len(sharded_checkpoints)} weight shards for world_size={world_size}")
+
+    nxd_model.set_weights(sharded_checkpoints)
+    print("  Weights set, loading to Neuron...")
+    nxd_model.to_neuron()
+    print("  CFG compiled model initialized on Neuron!")
+
+    wrapper = NeuronTransformerWrapperCFG(
+        original_transformer=pipe.transformer,
+        nxd_model=nxd_model,
+        pos_embed=pipe.transformer.pos_embed,
+        patch_h=patch_h,
+        patch_w=patch_w,
+        expected_img_patches=expected_img_patches,
+        expected_txt_seq=expected_txt_seq,
+        target_patches=target_patches,
+    )
+    return wrapper
+
+
+def patch_pipeline_for_cfg_parallel(pipe):
+    """
+    Monkey-patch pipeline for CFG parallel inference.
+
+    The LongCat pipeline calls transformer twice per denoising step when
+    guidance_scale > 1 (positive first, then negative). This patch:
+    1. Captures negative prompt embeddings from encode_prompt
+    2. Replaces transformer with a proxy that batches both calls into one
+    3. On positive call: runs batched [neg, pos], returns positive result
+    4. On negative call: returns cached negative result (no computation)
+    """
+    real_transformer = pipe.transformer
+    neg_state = {"embeds": None, "txt_ids": None}
+
+    # Monkey-patch encode_prompt to capture negative embeddings
+    original_encode = pipe.encode_prompt
+    encode_call_count = [0]
+
+    def capturing_encode_prompt(*args, **kwargs):
+        result = original_encode(*args, **kwargs)
+        encode_call_count[0] += 1
+        # Second encode call is the negative prompt
+        if encode_call_count[0] % 2 == 0:
+            neg_state["embeds"] = result[0]   # negative_prompt_embeds
+            neg_state["txt_ids"] = result[1]  # negative_text_ids
+        return result
+
+    pipe.encode_prompt = capturing_encode_prompt
+
+    # Create CFG batching proxy
+    class CFGBatchingProxy:
+        """
+        Proxy that batches two sequential CFG transformer calls into one.
+
+        Pipeline call order per step:
+        1. noise_pred_text = transformer(latents, pos_embeds, t, ...)  [positive]
+        2. noise_pred_uncond = transformer(latents, neg_embeds, t, ...) [negative]
+
+        Proxy behavior:
+        1. On positive call: batch [neg, pos] using stored neg_embeds, run ONCE
+        2. On negative call: return cached result (zero compute)
+        """
+        def __init__(self, real_tf):
+            self._real_tf = real_tf
+            self.config = real_tf.config
+            self.dtype = real_tf.dtype
+            self.device = real_tf.device
+            self._call_idx = 0  # 0=positive, 1=negative per step
+            self._cached_neg_result = None
+
+        def cache_context(self, name):
+            return self._real_tf.cache_context(name)
+
+        def __call__(self, hidden_states, timestep, encoder_hidden_states,
+                     txt_ids=None, img_ids=None, return_dict=False, **kw):
+            if self._call_idx == 0 and neg_state["embeds"] is not None:
+                # Positive call: batch with stored negative, run once
+                # hidden_states and timestep are the same for both batch items
+                batched_hs = torch.cat([hidden_states, hidden_states], dim=0)
+                batched_enc = torch.cat([neg_state["embeds"], encoder_hidden_states], dim=0)
+                batched_t = torch.cat([timestep, timestep], dim=0)
+
+                result = self._real_tf(
+                    hidden_states=batched_hs,
+                    encoder_hidden_states=batched_enc,
+                    timestep=batched_t,
+                    txt_ids=txt_ids,  # Same RoPE for both batch items
+                    img_ids=img_ids,
+                    return_dict=False,
+                )
+
+                output = result[0]  # [2, target_patches, 64]
+                self._cached_neg_result = output[0:1]  # neg result
+                self._call_idx = 1
+                return (output[1:2],)  # pos result
+
+            elif self._call_idx == 1 and self._cached_neg_result is not None:
+                # Negative call: return cached result (no computation)
+                result = self._cached_neg_result
+                self._cached_neg_result = None
+                self._call_idx = 0
+                return (result,)
+
+            else:
+                # Fallback: run normally (non-CFG or neg_embeds not captured)
+                self._call_idx = 0
+                return self._real_tf(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    timestep=timestep,
+                    txt_ids=txt_ids,
+                    img_ids=img_ids,
+                    return_dict=return_dict,
+                    **kw,
+                )
+
+        def __getattr__(self, name):
+            return getattr(self._real_tf, name)
+
+    proxy = CFGBatchingProxy(real_transformer)
+    pipe.transformer = proxy
+    pipe._cfg_parallel_enabled = True
+
+    return pipe
+
+
 def load_text_encoder(compiled_models_dir, pipe, args, use_cpu_ve=False):
     """Load compiled text encoder (vision encoder + language model)."""
     # Load vision encoder
@@ -651,6 +989,9 @@ def main():
                         help="Use CPU text encoder instead of compiled")
     parser.add_argument("--cpu_vision_encoder", action="store_true",
                         help="Use CPU vision encoder for accuracy (Neuron LM still used)")
+    parser.add_argument("--use_cfg_parallel", action="store_true",
+                        help="Use CFG Parallel transformer (batches neg+pos prompts, ~2x denoising speedup). "
+                             "Requires: ./compile.sh cfg")
     parser.add_argument("--compiled_models_dir", type=str, default=COMPILED_MODELS_DIR)
     parser.add_argument("--transformer_dir", type=str, default=None,
                         help="Override transformer compiled dir (default: <compiled_models_dir>)")
@@ -683,8 +1024,12 @@ def main():
 
     # Transformer
     transformer_dir = args.transformer_dir or args.compiled_models_dir
-    print(f"Loading Compiled transformer from {transformer_dir}...")
-    neuron_transformer = load_transformer(transformer_dir, pipe, args)
+    if args.use_cfg_parallel:
+        print(f"Loading CFG Parallel transformer from {transformer_dir}...")
+        neuron_transformer = load_transformer_cfg(transformer_dir, pipe, args)
+    else:
+        print(f"Loading CP transformer from {transformer_dir}...")
+        neuron_transformer = load_transformer(transformer_dir, pipe, args)
 
     # Text encoder
     if args.skip_compiled_text_encoder:
@@ -702,6 +1047,12 @@ def main():
     pipe.transformer = neuron_transformer
     pipe.text_encoder = neuron_text_encoder
     pipe.vae = neuron_vae
+
+    # Apply CFG parallel pipeline patching
+    if args.use_cfg_parallel:
+        print("Applying CFG parallel pipeline patch...")
+        patch_pipeline_for_cfg_parallel(pipe)
+        print("  CFG parallel enabled: batched neg+pos transformer calls")
 
     # Delete original weights to save memory
     import gc
