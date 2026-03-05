@@ -42,66 +42,64 @@ class DistributedRMSNorm(nn.Module):
     
     def forward(self, hidden_states):
         """
-        前向传播
-        
+        Forward pass with distributed RMSNorm.
+
+        Memory-efficient: only uses float32 for the variance computation
+        (a temporary), NOT for the final multiply. This avoids keeping a large
+        float32 tensor alive across the all-reduce barrier, which would double
+        the NEFF size.
+
         Args:
-            hidden_states: [batch_size, seq_len, dim] 输入张量（dim是分片后的维度）
-        
+            hidden_states: [batch_size, seq_len, dim] (dim is the sharded size)
+
         Returns:
             normalized hidden_states
         """
-        # 保存输入dtype
         input_dtype = hidden_states.dtype
-        
-        # 转换为float32以提高精度
-        hidden_states_fp32 = hidden_states.to(torch.float32)
-        
-        # 检查是否在XLA环境中
         is_xla = hidden_states.device.type == 'xla'
-        
+
         try:
-            # 检查是否在分布式环境中
             tp_size = parallel_state.get_tensor_model_parallel_size()
-            
+
             if tp_size > 1 and is_xla:
-                # 使用XLA的all_reduce（编译时友好）
-                # 1. 计算局部平方和
-                local_sum_sq = hidden_states_fp32.pow(2).sum(dim=-1, keepdim=True)
-                
-                # 2. 使用XLA的all_reduce进行求和
-                # 注意：这里我们使用XLA的原生all_reduce，它在编译时应该能正常工作
-                groups = [list(range(tp_size))]  # 创建一个包含所有rank的组
-                global_sum_sq = xm.all_reduce(xm.REDUCE_SUM, local_sum_sq, groups=groups)
-                
-                # 3. 计算全局维度
+                # 1. Local sum-of-squares in float32 (temporary, can be fused)
+                local_sum_sq = hidden_states.to(torch.float32).pow(2).sum(dim=-1, keepdim=True)
+
+                # 2. All-reduce across TP group (tiny tensor: [batch, seq, 1])
+                world_size = tp_size
+                try:
+                    world_size = xm.xrt_world_size()
+                except Exception:
+                    pass
+                groups = []
+                for start in range(0, world_size, tp_size):
+                    groups.append(list(range(start, start + tp_size)))
+
+                global_sum_sq = xm.all_reduce(
+                    xm.REDUCE_SUM, local_sum_sq, groups=groups
+                )
+
+                # 3. RMS in float32 (tiny tensor), then cast to input dtype
                 global_dim = self.dim * tp_size
-                
-                # 4. 计算全局方差和RMS
-                global_variance = global_sum_sq / global_dim
-                rms = torch.rsqrt(global_variance + self.eps)
-                
-                # 5. 应用normalization
-                hidden_states_normalized = hidden_states_fp32 * rms
-                
+                rms = torch.rsqrt(global_sum_sq / global_dim + self.eps)
+
+                # 4. Normalize in original dtype (no large float32 across barrier)
+                hidden_states = hidden_states * rms.to(input_dtype)
             else:
-                # 单GPU或非XLA环境，使用标准计算
-                variance = hidden_states_fp32.pow(2).mean(dim=-1, keepdim=True)
-                hidden_states_normalized = hidden_states_fp32 * torch.rsqrt(variance + self.eps)
-                
+                # Single device or non-XLA: same pattern as local_rms_norm
+                variance = hidden_states.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
+                hidden_states = hidden_states * torch.rsqrt(variance + self.eps).to(input_dtype)
+
         except Exception as e:
-            # 如果分布式操作失败，回退到标准RMSNorm行为
-            # 静默回退，避免在编译时产生过多输出
-            print('如果分布式操作失败，回退到标准RMSNorm行为:', e)
-            variance = hidden_states_fp32.pow(2).mean(dim=-1, keepdim=True)
-            hidden_states_normalized = hidden_states_fp32 * torch.rsqrt(variance + self.eps)
-        
-        # 6. 应用可学习的缩放参数（如果有）
+            print('DistributedRMSNorm fallback to local:', e)
+            variance = hidden_states.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
+            hidden_states = hidden_states * torch.rsqrt(variance + self.eps).to(input_dtype)
+
+        # Apply learned scale
         if self.weight is not None:
-            # weight已经是分片的，直接应用
-            hidden_states_normalized = hidden_states_normalized * self.weight
-        
-        # 7. 转回原始dtype
-        return hidden_states_normalized.to(input_dtype)
+            hidden_states = hidden_states * self.weight
+
+        return hidden_states
     
     def extra_repr(self):
         return f'dim={self.dim}, eps={self.eps}, elementwise_affine={self.elementwise_affine}'

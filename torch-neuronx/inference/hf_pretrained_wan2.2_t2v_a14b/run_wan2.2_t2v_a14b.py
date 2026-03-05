@@ -44,7 +44,6 @@ from safetensors.torch import load_file
 
 from neuron_wan2_2_t2v_a14b.neuron_commons import (
     InferenceTextEncoderWrapperV2,
-    PostQuantConvWrapperV2,
 )
 
 
@@ -127,41 +126,16 @@ def prepare_cp_checkpoints(tp_checkpoints, tp_degree, cp_degree):
 # Phase 1: Text Encoding
 # ============================================================
 def phase_text_encoding(pipe, compiled_models_dir, seqlen, prompt, negative_prompt):
-    """Load text encoder, encode prompt, unload text encoder."""
+    """Encode prompt using CPU text encoder (avoids NeuronCore NEFF residual)."""
     print("\n" + "="*60)
-    print("PHASE 1: Text Encoding")
+    print("PHASE 1: Text Encoding (CPU)")
     print("="*60)
 
-    text_encoder_dir = f"{compiled_models_dir}/text_encoder"
-    text_encoder_wrapper = InferenceTextEncoderWrapperV2(
-        torch.bfloat16, pipe.text_encoder, seqlen
-    )
-
-    text_encoder_config = load_model_config(text_encoder_dir)
-    text_encoder_tp = text_encoder_config["tp_degree"]
-    text_encoder_world_size = text_encoder_config.get("world_size", text_encoder_tp)
-
-    print(f"Loading text encoder (TP={text_encoder_tp}, world_size={text_encoder_world_size})...")
-    text_encoder_nxd = NxDModel.load(
-        os.path.join(text_encoder_dir, "nxd_model.pt"),
-        start_rank=0, local_ranks_size=text_encoder_world_size,
-    )
-    text_encoder_weights = load_sharded_weights(text_encoder_dir, text_encoder_tp)
-    if text_encoder_world_size > text_encoder_tp:
-        cp_degree = text_encoder_world_size // text_encoder_tp
-        text_encoder_weights = prepare_cp_checkpoints(text_encoder_weights, text_encoder_tp, cp_degree)
-    text_encoder_nxd.set_weights(text_encoder_weights)
-    text_encoder_nxd.to_neuron()
-    text_encoder_wrapper.t = text_encoder_nxd
-    print("Text encoder loaded.")
-
-    # Replace pipeline text encoder temporarily
-    original_text_encoder = pipe.text_encoder
-    pipe.text_encoder = text_encoder_wrapper
-
-    # Encode prompt
-    print("Encoding prompt...")
+    # Use CPU text encoder to avoid leaving residual NEFF on NeuronCores
+    # that would conflict with transformer loading (HBM limit)
+    print("Encoding prompt on CPU...")
     device = torch.device("cpu")
+    t0 = time.time()
     prompt_embeds, negative_prompt_embeds = pipe.encode_prompt(
         prompt=prompt,
         negative_prompt=negative_prompt,
@@ -171,12 +145,7 @@ def phase_text_encoding(pipe, compiled_models_dir, seqlen, prompt, negative_prom
         device=device,
     )
     print(f"  prompt_embeds: {prompt_embeds.shape}, negative: {negative_prompt_embeds.shape}")
-
-    # Unload text encoder
-    pipe.text_encoder = original_text_encoder
-    del text_encoder_nxd, text_encoder_wrapper, text_encoder_weights
-    gc.collect()
-    print("  Text encoder unloaded.")
+    print(f"  Text encoding done in {time.time() - t0:.1f}s")
 
     return prompt_embeds, negative_prompt_embeds
 
@@ -319,7 +288,8 @@ def phase_denoising(pipe, compiled_models_dir, prompt_embeds, negative_prompt_em
                                            rotary_emb_cos, rotary_emb_sin)
         noise_uncond = run_transformer_step(nxd_model, latent_input, ts, negative_prompt_embeds,
                                              rotary_emb_cos, rotary_emb_sin)
-        noise_pred = noise_uncond + guidance_scale * (noise_pred - noise_uncond)
+        # CFG in float32 to reduce accumulated precision errors
+        noise_pred = noise_uncond.float() + guidance_scale * (noise_pred.float() - noise_uncond.float())
 
         latents = pipe.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
         elapsed = time.time() - t0
@@ -357,7 +327,8 @@ def phase_denoising(pipe, compiled_models_dir, prompt_embeds, negative_prompt_em
                                                rotary_emb_cos, rotary_emb_sin)
             noise_uncond = run_transformer_step(nxd_model, latent_input, ts, negative_prompt_embeds,
                                                  rotary_emb_cos, rotary_emb_sin)
-            noise_pred = noise_uncond + guidance_scale * (noise_pred - noise_uncond)
+            # CFG in float32 to reduce accumulated precision errors
+            noise_pred = noise_uncond.float() + guidance_scale * (noise_pred.float() - noise_uncond.float())
 
             latents = pipe.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
@@ -380,70 +351,51 @@ def phase_denoising(pipe, compiled_models_dir, prompt_embeds, negative_prompt_em
 # ============================================================
 def phase_vae_decode(pipe, compiled_models_dir, latents):
     """
-    Load post_quant_conv (Neuron) + use CPU decoder, decode latents, return video frames.
-
-    The Wan VAE decoder relies on feat_cache state accumulation across frame-by-frame
-    calls for temporal upsampling (21 latent frames → 81 video frames). The NoCache
-    compiled decoder cannot preserve this state, producing only 42 frames.
-
-    Fix: Use Neuron post_quant_conv (fast, processes all frames at once) but keep the
-    original CPU decoder which correctly handles feat_cache and temporal upsampling.
+    Pure CPU VAE decode with fresh float32 VAE (avoids bfloat16 weight truncation).
     """
     print("\n" + "="*60)
-    print("PHASE 3: VAE Decoding")
+    print("PHASE 3: VAE Decoding (Fresh float32 VAE)")
     print("="*60)
 
-    # Load post_quant_conv to Neuron
-    pqc_path = f"{compiled_models_dir}/post_quant_conv"
-    pqc_config = load_model_config(pqc_path)
-    pqc_world_size = pqc_config.get("world_size", 8)
-
-    print(f"Loading post_quant_conv (world_size={pqc_world_size})...")
-    vae_pqc_wrapper = PostQuantConvWrapperV2(pipe.vae.post_quant_conv)
-    pqc_nxd = NxDModel.load(
-        os.path.join(pqc_path, "nxd_model.pt"),
-        start_rank=0, local_ranks_size=pqc_world_size,
+    # Load a FRESH VAE in float32 to avoid bfloat16 weight truncation
+    # (pipeline.from_pretrained casts all components to bfloat16)
+    print("Loading fresh float32 VAE...")
+    model_id = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
+    vae = AutoencoderKLWan.from_pretrained(
+        model_id, subfolder="vae", torch_dtype=torch.float32,
+        cache_dir=HUGGINGFACE_CACHE_DIR,
     )
-    pqc_weights = load_duplicated_weights(pqc_path, pqc_world_size)
-    pqc_nxd.set_weights(pqc_weights)
-    pqc_nxd.to_neuron()
-    vae_pqc_wrapper.nxd_model = pqc_nxd
-    print("post_quant_conv loaded.")
 
-    # Keep original CPU decoder (handles feat_cache temporal upsampling correctly)
-    # Only replace post_quant_conv with Neuron version
-    original_pqc = pipe.vae.post_quant_conv
-    pipe.vae.post_quant_conv = vae_pqc_wrapper
-    print(f"Using CPU decoder for proper temporal upsampling (21 latent → 81 video frames)")
+    # Denormalize latents
+    latents = latents.to(torch.float32)
+    latents_mean = (
+        torch.tensor(vae.config.latents_mean)
+        .view(1, vae.config.z_dim, 1, 1, 1)
+        .to(latents.device, latents.dtype)
+    )
+    latents_std = 1.0 / torch.tensor(vae.config.latents_std).view(
+        1, vae.config.z_dim, 1, 1, 1
+    ).to(latents.device, latents.dtype)
+    latents = latents / latents_std + latents_mean
 
     # Decode
     print("Decoding latents...")
     decode_start = time.time()
-    latents = latents.to(pipe.vae.dtype)
-    latents_mean = (
-        torch.tensor(pipe.vae.config.latents_mean)
-        .view(1, pipe.vae.config.z_dim, 1, 1, 1)
-        .to(latents.device, latents.dtype)
-    )
-    latents_std = 1.0 / torch.tensor(pipe.vae.config.latents_std).view(
-        1, pipe.vae.config.z_dim, 1, 1, 1
-    ).to(latents.device, latents.dtype)
-    latents = latents / latents_std + latents_mean
     with torch.no_grad():
-        video = pipe.vae.decode(latents, return_dict=False)[0]
+        video = vae.decode(latents, return_dict=False)[0]
     decode_time = time.time() - decode_start
     print(f"  VAE decode completed in {decode_time:.1f}s")
-    video = pipe.video_processor.postprocess_video(video, output_type="np")
-    # postprocess_video returns [batch_of_frames], unwrap batch dim
-    if isinstance(video, list) and len(video) == 1:
-        video = video[0]
-    print(f"Decoded video: {type(video)}, shape/len={getattr(video, 'shape', len(video)) if hasattr(video, 'shape') or hasattr(video, '__len__') else 'unknown'}")
 
-    # Restore and cleanup
-    pipe.vae.post_quant_conv = original_pqc
-    del pqc_nxd, vae_pqc_wrapper, pqc_weights
+    # Post-processing: [B, C, F, H, W] -> numpy [F, H, W, C], float [0,1]
+    # NOTE: export_to_video expects float [0,1] ndarray and does *255 internally.
+    # Do NOT pass uint8, otherwise it double-multiplies by 255!
+    video = video[0]  # [C, F, H, W]
+    video = video.permute(1, 2, 3, 0).float().cpu().numpy()  # [F, H, W, C]
+    video = ((video + 1.0) / 2.0).clip(0, 1)
+    print(f"Decoded video: shape={video.shape}, dtype={video.dtype}")
+
+    del vae
     gc.collect()
-    print("  VAE components unloaded.")
 
     return video
 
@@ -490,40 +442,16 @@ def main(args):
     print(f"\nTotal denoising time: {denoise_time:.2f}s")
     print(f"Per step (including swap): {denoise_time / args.num_inference_steps:.3f}s")
 
+    # Save latents for debugging
+    torch.save(latents, "debug_latents.pt")
+    print(f"Saved debug_latents.pt: shape={latents.shape}, dtype={latents.dtype}, range=[{latents.min():.3f}, {latents.max():.3f}]")
+
     # Phase 3: VAE Decode
     video = phase_vae_decode(pipe, compiled_models_dir, latents)
 
-    # Save video
+    # Save video - video is numpy float [0,1] shape [F, H, W, C]
     output_path = args.output
-    # Handle different video formats from postprocess_video
-    if isinstance(video, np.ndarray):
-        # Squeeze batch dim if present: (1, F, H, W, C) -> (F, H, W, C)
-        if video.ndim == 5:
-            video = video[0]
-        # video is (num_frames, H, W, C), convert to list of frames
-        if video.ndim == 4:
-            # Convert float [0,1] to uint8 [0,255] if needed
-            if video.dtype != np.uint8:
-                video = (video * 255).clip(0, 255).astype(np.uint8)
-            frames = [video[i] for i in range(video.shape[0])]
-        else:
-            frames = [video]
-    elif isinstance(video, list):
-        # May be a list with one ndarray element (batch)
-        if len(video) == 1 and isinstance(video[0], np.ndarray):
-            v = video[0]
-            if v.ndim == 4:
-                if v.dtype != np.uint8:
-                    v = (v * 255).clip(0, 255).astype(np.uint8)
-                frames = [v[i] for i in range(v.shape[0])]
-            else:
-                frames = [v]
-        elif video and hasattr(video[0], 'convert'):
-            frames = [np.array(frame) for frame in video]
-        else:
-            frames = video
-    else:
-        frames = video
+    frames = [video[i] for i in range(video.shape[0])]
     print(f"Exporting {len(frames)} frames, shape={frames[0].shape}, dtype={frames[0].dtype}")
     export_to_video(frames, output_path, fps=24)
     print(f"\nVideo saved to: {output_path} ({len(frames)} frames)")
