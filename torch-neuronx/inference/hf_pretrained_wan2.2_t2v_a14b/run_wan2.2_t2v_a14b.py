@@ -678,8 +678,9 @@ if __name__ == "__main__":
     parser.add_argument("--negative_prompt", type=str,
                         default="Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards")
     parser.add_argument("--output", type=str, default="output_t2v_a14b.mp4")
-    parser.add_argument("--neuron_text_encoder", action="store_true",
-                        help="Use Neuron-compiled text encoder (experimental, default: CPU)")
+    parser.add_argument("--cpu_text_encoder", action="store_true",
+                        help="Use CPU text encoder instead of Neuron (slower but more stable)")
     args = parser.parse_args()
+    args.neuron_text_encoder = not args.cpu_text_encoder
 
     main(args)
