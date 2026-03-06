@@ -25,12 +25,24 @@ Wan2.2-T2V-A14B is a **Mixture-of-Experts (MoE)** text-to-video diffusion model 
 
 ## Pipeline Phases
 
-1. **Text Encoding** (CPU): Encode prompt with UMT5 text encoder
+1. **Text Encoding** (Neuron): Encode prompt with Neuron-compiled UMT5 text encoder (TP=4)
+   - Also supports CPU fallback (default) via `--neuron_text_encoder` flag
 2. **Denoising** (Neuron): 50 steps with MoE transformer switching
-   - Steps 1-6: transformer_1 (high-noise expert)
+   - Steps 1-16: transformer_1 (high-noise expert)
    - Weight swap via `replace_weights()`
-   - Steps 7-50: transformer_2 (low-noise expert)
-3. **VAE Decode** (CPU): Decode latents with float32 VAE → video frames
+   - Steps 17-50: transformer_2 (low-noise expert)
+3. **VAE Decode** (Neuron): Chunked decoder with rolling feat_cache for flicker-free output
+   - Auto-detects rolling cache (`decoder_rolling/`) or NoCache (`decoder_nocache/`) mode
+
+## Performance
+
+| Phase | Time |
+|-------|------|
+| Text Encoding (Neuron) | ~14s (0.2s inference + 13s model load) |
+| Text Encoding (CPU) | ~16s |
+| Denoising (50 steps + MoE swap) | ~547s |
+| VAE Decode (rolling cache) | ~44s (25s decode + 18s model load) |
+| **Total** | **~612s** |
 
 ## Prerequisites
 
@@ -52,8 +64,18 @@ pip install -r requirements.txt
 # Compile all models (~1-2 hours first time)
 bash compile.sh
 
+# Compile rolling cache decoder (optional, for flicker-free VAE decode)
+bash compile_rolling.sh
+
 # Run inference
 python run_wan2.2_t2v_a14b.py \
+    --compiled_models_dir /opt/dlami/nvme/compiled_models_t2v_a14b \
+    --prompt "A cat walks on the grass, realistic" \
+    --output output_t2v.mp4
+
+# With Neuron text encoder (faster text encoding)
+python run_wan2.2_t2v_a14b.py \
+    --neuron_text_encoder \
     --compiled_models_dir /opt/dlami/nvme/compiled_models_t2v_a14b \
     --prompt "A cat walks on the grass, realistic" \
     --output output_t2v.mp4
@@ -69,24 +91,42 @@ python run_wan2.2_t2v_a14b.py \
 | 2 | Text Encoder (TP=4) | `text_encoder/` |
 | 3 | Transformer - high-noise expert (TP=4, CP=2) | `transformer/` |
 | 4 | Transformer_2 - low-noise expert (TP=4, CP=2) | `transformer_2/` |
-| 5 | VAE Decoder | `decoder_nocache/` |
+| 5 | VAE Decoder (NoCache) | `decoder_nocache/` |
 | 6 | Post-quant conv | `post_quant_conv/` |
 
-The script auto-patches `nearest-exact` → `nearest` in diffusers for Trainium2 compatibility.
+`compile_rolling.sh` compiles the rolling cache VAE decoder:
+
+| Step | Component | Output |
+|------|-----------|--------|
+| 1 | VAE Decoder (Rolling Cache) | `decoder_rolling/` |
+
+The scripts auto-patch `nearest-exact` → `nearest` in diffusers for Trainium2 compatibility.
 
 ## Inference Options
 
 ```
---compiled_models_dir   Path to compiled models (default: /opt/dlami/nvme/compiled_models_t2v_a14b)
---height                Video height (default: 480)
---width                 Video width (default: 832)
---num_frames            Number of frames (default: 81)
---num_inference_steps   Denoising steps (default: 50)
---guidance_scale        CFG guidance scale (default: 5.0)
---prompt                Text prompt
---negative_prompt       Negative prompt
---output                Output video path (default: output_t2v_a14b.mp4)
+--compiled_models_dir     Path to compiled models (default: /opt/dlami/nvme/compiled_models_t2v_a14b)
+--height                  Video height (default: 480)
+--width                   Video width (default: 832)
+--num_frames              Number of frames (default: 81)
+--num_inference_steps     Denoising steps (default: 50)
+--guidance_scale          CFG guidance scale (default: 5.0)
+--prompt                  Text prompt
+--negative_prompt         Negative prompt
+--output                  Output video path (default: output_t2v_a14b.mp4)
+--neuron_text_encoder     Use Neuron-compiled text encoder (default: CPU)
 ```
+
+## VAE Decoder Modes
+
+The inference script auto-detects which decoder mode to use:
+
+| Mode | Directory | Flicker | Transfer/chunk | Notes |
+|------|-----------|---------|----------------|-------|
+| **Rolling Cache** | `decoder_rolling/` | No | ~3.6GB (1.8GB in + out) | feat_cache carried between chunks as I/O |
+| **NoCache** | `decoder_nocache/` | Yes | ~300KB | feat_cache as zero buffers, no temporal context |
+
+Rolling cache is preferred. If `decoder_rolling/nxd_model.pt` exists, it is used automatically.
 
 ## File Structure
 
@@ -94,6 +134,7 @@ The script auto-patches `nearest-exact` → `nearest` in diffusers for Trainium2
 hf_pretrained_wan2.2_t2v_a14b/
 ├── README.md
 ├── compile.sh                           # Master compilation script
+├── compile_rolling.sh                   # Rolling cache decoder compilation
 ├── run_wan2.2_t2v_a14b.py              # Main inference script
 ├── requirements.txt
 └── neuron_wan2_2_t2v_a14b/
@@ -101,13 +142,9 @@ hf_pretrained_wan2.2_t2v_a14b/
     ├── cache_hf_model.py               # Download HF model
     ├── compile_transformer.py          # Transformer compilation (TP=4, CP=2)
     ├── compile_text_encoder.py         # UMT5 text encoder compilation
-    ├── compile_decoder_nocache.py      # VAE decoder compilation
+    ├── compile_decoder_nocache.py      # VAE decoder compilation (NoCache)
+    ├── compile_decoder_rolling.py      # VAE decoder compilation (Rolling Cache)
     ├── distributed_rmsnorm.py          # Distributed RMSNorm for TP
     ├── neuron_commons.py               # Wrapper classes for Neuron models
     └── neuron_parallel_utils.py        # TP/CP sharding utilities
 ```
-
-## Known Limitations
-
-- Neuron VAE decode (~10s) has flickering artifacts due to NoCache mode (feat_cache is zero buffers, no temporal context between chunks). CPU VAE decode is flicker-free but ~100s. Rolling feat_cache is WIP.
-- Total inference time ~560s (denoising ~545s + Neuron VAE ~10s) at 480P 81 frames.

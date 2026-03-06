@@ -125,14 +125,8 @@ def prepare_cp_checkpoints(tp_checkpoints, tp_degree, cp_degree):
 # ============================================================
 # Phase 1: Text Encoding
 # ============================================================
-def phase_text_encoding(pipe, compiled_models_dir, seqlen, prompt, negative_prompt):
-    """Encode prompt using CPU text encoder (avoids NeuronCore NEFF residual)."""
-    print("\n" + "="*60)
-    print("PHASE 1: Text Encoding (CPU)")
-    print("="*60)
-
-    # Use CPU text encoder to avoid leaving residual NEFF on NeuronCores
-    # that would conflict with transformer loading (HBM limit)
+def phase_text_encoding_cpu(pipe, seqlen, prompt, negative_prompt):
+    """Encode prompt using CPU text encoder."""
     print("Encoding prompt on CPU...")
     device = torch.device("cpu")
     t0 = time.time()
@@ -146,8 +140,84 @@ def phase_text_encoding(pipe, compiled_models_dir, seqlen, prompt, negative_prom
     )
     print(f"  prompt_embeds: {prompt_embeds.shape}, negative: {negative_prompt_embeds.shape}")
     print(f"  Text encoding done in {time.time() - t0:.1f}s")
+    return prompt_embeds, negative_prompt_embeds
+
+
+def phase_text_encoding_neuron(pipe, compiled_models_dir, seqlen, prompt, negative_prompt):
+    """
+    Encode prompt using Neuron-compiled text encoder (TI2V pattern).
+
+    Uses InferenceTextEncoderWrapperV2 to wrap NxDModel and replaces
+    pipe.text_encoder, then calls pipe.encode_prompt() which handles
+    tokenization and attention mask application correctly.
+    """
+    te_path = f"{compiled_models_dir}/text_encoder"
+    te_config = load_model_config(te_path)
+    te_tp_degree = te_config["tp_degree"]
+    te_world_size = te_config["world_size"]
+
+    # Step 1: Create wrapper (TI2V pattern)
+    text_encoder_wrapper = InferenceTextEncoderWrapperV2(
+        torch.bfloat16, pipe.text_encoder, seqlen
+    )
+
+    # Step 2: Load NxDModel (no start_rank/local_ranks_size, like TI2V)
+    print(f"Loading text encoder (TP={te_tp_degree}, world_size={te_world_size})...")
+    t0 = time.time()
+    te_nxd = NxDModel.load(os.path.join(te_path, "nxd_model.pt"))
+
+    # Step 3: Load weights with prepare_cp_checkpoints (like TI2V)
+    tp_checkpoints = load_sharded_weights(te_path, te_tp_degree)
+    if te_world_size > te_tp_degree:
+        cp_degree = te_world_size // te_tp_degree
+        checkpoints = prepare_cp_checkpoints(tp_checkpoints, te_tp_degree, cp_degree)
+    else:
+        checkpoints = tp_checkpoints
+
+    te_nxd.set_weights(checkpoints)
+    te_nxd.to_neuron()
+    print(f"  Text encoder loaded in {time.time() - t0:.1f}s")
+
+    # Step 4: Replace wrapper's encoder with NxDModel (like TI2V)
+    text_encoder_wrapper.t = te_nxd
+
+    # Step 5: Replace pipe's text encoder (like TI2V)
+    original_text_encoder = pipe.text_encoder
+    pipe.text_encoder = text_encoder_wrapper
+
+    # Step 6: Use pipe.encode_prompt (handles tokenization + mask correctly)
+    t_enc = time.time()
+    prompt_embeds, negative_prompt_embeds = pipe.encode_prompt(
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        do_classifier_free_guidance=True,
+        num_videos_per_prompt=1,
+        max_sequence_length=seqlen,
+        device=torch.device("cpu"),
+    )
+    print(f"  prompt_embeds: {prompt_embeds.shape}, negative: {negative_prompt_embeds.shape}")
+    print(f"  Text encoding done in {time.time() - t_enc:.1f}s (load: {t_enc - t0:.1f}s)")
+
+    # Step 7: Restore and clean up
+    pipe.text_encoder = original_text_encoder
+    del te_nxd, tp_checkpoints, checkpoints, text_encoder_wrapper
+    gc.collect()
 
     return prompt_embeds, negative_prompt_embeds
+
+
+def phase_text_encoding(pipe, compiled_models_dir, seqlen, prompt, negative_prompt,
+                        use_neuron=False):
+    """Encode prompt. Uses CPU by default, Neuron with --neuron_text_encoder flag."""
+    print("\n" + "="*60)
+    mode = "Neuron" if use_neuron else "CPU"
+    print(f"PHASE 1: Text Encoding ({mode})")
+    print("="*60)
+
+    if use_neuron:
+        return phase_text_encoding_neuron(pipe, compiled_models_dir, seqlen, prompt, negative_prompt)
+    else:
+        return phase_text_encoding_cpu(pipe, seqlen, prompt, negative_prompt)
 
 
 # ============================================================
@@ -360,9 +430,10 @@ def phase_vae_decode(pipe, compiled_models_dir, latents, num_frames=81):
        Each chunk produces decoder_frames × 4 video frames (4× temporal upsample)
     4. Concatenate and trim to expected frame count
 
-    NOTE: NoCache mode (feat_cache as zero buffers) causes flickering artifacts
-    because temporal context is not carried between chunks. CPU VAE decode is
-    flicker-free but ~10× slower. TODO: implement rolling feat_cache.
+    Decoder modes (auto-detected based on compiled model):
+    - Rolling cache (decoder_rolling/): feat_cache carried between chunks as I/O.
+      Flicker-free but ~1.8GB extra transfer per chunk.
+    - NoCache (decoder_nocache/): feat_cache as zero buffers. Fast but flickering.
     """
     print("\n" + "="*60)
     print("PHASE 3: VAE Decoding (Neuron)")
@@ -418,16 +489,24 @@ def phase_vae_decode(pipe, compiled_models_dir, latents, num_frames=81):
     del pqc_nxd, pqc_weights
     gc.collect()
 
-    # ---- Step 2: Load and run Neuron decoder (2 frames per chunk) ----
-    # NOTE: NoCache mode (feat_cache as zero buffers) causes flickering because
-    # temporal context is lost between chunks. CPU VAE decode is flicker-free.
-    # TODO: Implement rolling feat_cache to fix Neuron VAE flickering.
-    decoder_path = f"{compiled_models_dir}/decoder_nocache"
+    # ---- Step 2: Load and run Neuron decoder ----
+    # Try rolling cache first (flicker-free), fall back to nocache
+    rolling_path = f"{compiled_models_dir}/decoder_rolling"
+    nocache_path = f"{compiled_models_dir}/decoder_nocache"
+
+    if os.path.exists(os.path.join(rolling_path, "nxd_model.pt")):
+        decoder_path = rolling_path
+        is_rolling = True
+    else:
+        decoder_path = nocache_path
+        is_rolling = False
+
     decoder_config = load_model_config(decoder_path)
     decoder_world_size = decoder_config["world_size"]
     decoder_frames = decoder_config.get("decoder_frames", 2)
+    mode_str = "rolling cache" if is_rolling else "nocache"
 
-    print(f"\nLoading decoder (world_size={decoder_world_size}, compiled_frames={decoder_frames})...")
+    print(f"\nLoading decoder [{mode_str}] (world_size={decoder_world_size}, compiled_frames={decoder_frames})...")
     t0 = time.time()
     decoder_nxd = NxDModel.load(
         os.path.join(decoder_path, "nxd_model.pt"),
@@ -442,10 +521,17 @@ def phase_vae_decode(pipe, compiled_models_dir, latents, num_frames=81):
     num_latent_frames = z_bf16.shape[2]
     decoded_frames = []
 
-    # Process decoder_frames latent frames per chunk
     num_chunks = (num_latent_frames + decoder_frames - 1) // decoder_frames
-    print(f"Decoding {num_latent_frames} latent frames in {num_chunks} chunks of {decoder_frames}...")
+    print(f"Decoding {num_latent_frames} latent frames in {num_chunks} chunks of {decoder_frames} [{mode_str}]...")
     decode_start = time.time()
+
+    # Initialize rolling cache (zero tensors, same shapes as compiled)
+    if is_rolling:
+        from neuron_wan2_2_t2v_a14b.compile_decoder_rolling import get_feat_cache_shapes
+        latent_h, latent_w = z_bf16.shape[3], z_bf16.shape[4]
+        cache_shapes = get_feat_cache_shapes(1, latent_h, latent_w)
+        caches = [torch.zeros(s, dtype=torch.bfloat16) for s in cache_shapes]
+        print(f"  Rolling cache initialized: {len(caches)} tensors")
 
     for chunk_idx in range(num_chunks):
         start = chunk_idx * decoder_frames
@@ -458,9 +544,20 @@ def phase_vae_decode(pipe, compiled_models_dir, latents, num_frames=81):
             padding = chunk[:, :, -1:, :, :].expand(-1, -1, pad_frames, -1, -1)
             chunk = torch.cat([chunk, padding], dim=2)
 
-        output = decoder_nxd(chunk)
-        if isinstance(output, (list, tuple)):
-            output = output[0]
+        if is_rolling:
+            # Rolling mode: pass cache as inputs, get updated cache as outputs
+            results = decoder_nxd(chunk, *caches)
+            if isinstance(results, (tuple, list)):
+                output = results[0]
+                caches = [r.to(torch.bfloat16) for r in results[1:1 + len(cache_shapes)]]
+            else:
+                output = results
+        else:
+            # NoCache mode: just pass x
+            output = decoder_nxd(chunk)
+            if isinstance(output, (list, tuple)):
+                output = output[0]
+
         output = output.to(torch.float32)
 
         # Each chunk of decoder_frames latent frames -> decoder_frames * 4 video frames
@@ -480,7 +577,7 @@ def phase_vae_decode(pipe, compiled_models_dir, latents, num_frames=81):
         print(f"  Trimming {video.shape[2]} -> {num_frames} video frames")
         video = video[:, :, :num_frames]
 
-    print(f"  Total decode time: {decode_time:.1f}s, output: {video.shape}")
+    print(f"  Total decode time: {decode_time:.1f}s, output: {video.shape} [{mode_str}]")
 
     del decoder_nxd, decoder_weights, z, z_bf16, decoded_frames
     gc.collect()
@@ -505,6 +602,7 @@ SEED = 42
 
 
 def main(args):
+    total_start = time.time()
     set_seed(SEED)
 
     DTYPE = torch.bfloat16
@@ -523,34 +621,48 @@ def main(args):
     seqlen = args.max_sequence_length
 
     # Phase 1: Text Encoding
+    t1_start = time.time()
     prompt_embeds, negative_prompt_embeds = phase_text_encoding(
-        pipe, compiled_models_dir, seqlen, args.prompt, args.negative_prompt
+        pipe, compiled_models_dir, seqlen, args.prompt, args.negative_prompt,
+        use_neuron=args.neuron_text_encoder,
     )
+    t1_time = time.time() - t1_start
 
     # Phase 2: Denoising with MoE swap
     print("\nStarting denoising...")
     generator = torch.Generator().manual_seed(SEED)
-    denoise_start = time.time()
+    t2_start = time.time()
     latents = phase_denoising(
         pipe, compiled_models_dir, prompt_embeds, negative_prompt_embeds, args, generator
     )
-    denoise_time = time.time() - denoise_start
-    print(f"\nTotal denoising time: {denoise_time:.2f}s")
-    print(f"Per step (including swap): {denoise_time / args.num_inference_steps:.3f}s")
+    t2_time = time.time() - t2_start
+    print(f"\nTotal denoising time: {t2_time:.2f}s")
+    print(f"Per step (including swap): {t2_time / args.num_inference_steps:.3f}s")
 
     # Save latents for debugging
     torch.save(latents, "debug_latents.pt")
     print(f"Saved debug_latents.pt: shape={latents.shape}, dtype={latents.dtype}, range=[{latents.min():.3f}, {latents.max():.3f}]")
 
     # Phase 3: VAE Decode
+    t3_start = time.time()
     video = phase_vae_decode(pipe, compiled_models_dir, latents, num_frames=args.num_frames)
+    t3_time = time.time() - t3_start
 
     # Save video - video is numpy float [0,1] shape [F, H, W, C]
     output_path = args.output
     frames = [video[i] for i in range(video.shape[0])]
     print(f"Exporting {len(frames)} frames, shape={frames[0].shape}, dtype={frames[0].dtype}")
     export_to_video(frames, output_path, fps=24)
-    print(f"\nVideo saved to: {output_path} ({len(frames)} frames)")
+
+    total_time = time.time() - total_start
+    print(f"\n{'='*60}")
+    print(f"Video saved to: {output_path} ({len(frames)} frames)")
+    print(f"{'='*60}")
+    print(f"  Phase 1 - Text Encoding:  {t1_time:.1f}s")
+    print(f"  Phase 2 - Denoising:      {t2_time:.1f}s")
+    print(f"  Phase 3 - VAE Decode:     {t3_time:.1f}s")
+    print(f"  Total (incl. loading):    {total_time:.1f}s")
+    print(f"{'='*60}")
 
 
 if __name__ == "__main__":
@@ -566,6 +678,8 @@ if __name__ == "__main__":
     parser.add_argument("--negative_prompt", type=str,
                         default="Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards")
     parser.add_argument("--output", type=str, default="output_t2v_a14b.mp4")
+    parser.add_argument("--neuron_text_encoder", action="store_true",
+                        help="Use Neuron-compiled text encoder (experimental, default: CPU)")
     args = parser.parse_args()
 
     main(args)
