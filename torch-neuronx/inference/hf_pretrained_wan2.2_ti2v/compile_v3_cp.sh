@@ -47,14 +47,14 @@ mkdir -p "${COMPILER_WORKDIR}"
 
 # Step 1: Cache HuggingFace model (if not already cached)
 echo ""
-echo "[Step 1/4] Caching HuggingFace model..."
+echo "[Step 1/5] Caching HuggingFace model..."
 python neuron_wan2_2_ti2v/cache_hf_model.py
 
 # Step 2: Compile Text Encoder (V2, TP=4 to match transformer)
 # Note: Must use TP=4 to share parallel state with transformer (TP=4, CP=2)
 # At inference time, the 4 TP checkpoints are duplicated for 2 CP ranks → 8 total
 echo ""
-echo "[Step 2/4] Compiling Text Encoder (V2, TP=${TP_DEGREE}, world_size=${WORLD_SIZE})..."
+echo "[Step 2/5] Compiling Text Encoder (V2, TP=${TP_DEGREE}, world_size=${WORLD_SIZE})..."
 python neuron_wan2_2_ti2v/compile_text_encoder_v2.py \
     --compiled_models_dir "${COMPILED_MODELS_DIR}" \
     --max_sequence_length ${MAX_SEQUENCE_LENGTH} \
@@ -63,7 +63,7 @@ python neuron_wan2_2_ti2v/compile_text_encoder_v2.py \
 
 # Step 3: Compile Transformer (V3 CP, TP=4, CP=2)
 echo ""
-echo "[Step 3/4] Compiling Transformer (V3 CP, TP=${TP_DEGREE}, CP=2)..."
+echo "[Step 3/5] Compiling Transformer (V3 CP, TP=${TP_DEGREE}, CP=2)..."
 python neuron_wan2_2_ti2v/compile_transformer_v3_cp.py \
     --compiled_models_dir "${COMPILED_MODELS_DIR}" \
     --compiler_workdir "${COMPILER_WORKDIR}" \
@@ -74,13 +74,26 @@ python neuron_wan2_2_ti2v/compile_transformer_v3_cp.py \
     --tp_degree ${TP_DEGREE} \
     --world_size ${WORLD_SIZE}
 
-# Step 4: Compile Decoder and post_quant_conv (V3 NoCache)
-# feat_cache internalized as zero buffers on device, eliminates ~960MB/call transfer
-# Decoder per-call: ~0.50s (vs ~0.78s with external feat_cache)
-# V3 uses --model-type=unet-inference (not transformer) and bfloat16 for decoder
-# Decoder doesn't use actual TP sharding (weights duplicated), but must match world_size
+# Step 4: Compile Decoder (V3 Rolling Cache - flicker-free)
+# feat_cache as explicit I/O: 35 inputs (x + 34 caches), 35 outputs (video + 34 caches)
+# Carries temporal context between chunks for flicker-free video
+# Trade-off: ~960MB extra transfer per call, but no flickering artifacts
 echo ""
-echo "[Step 4/4] Compiling Decoder and post_quant_conv (V3 NoCache, bfloat16, world_size=${WORLD_SIZE})..."
+echo "[Step 4/5] Compiling Decoder (V3 Rolling Cache, bfloat16, world_size=${WORLD_SIZE})..."
+python neuron_wan2_2_ti2v/compile_decoder_v3_rolling.py \
+    --compiled_models_dir "${COMPILED_MODELS_DIR}" \
+    --compiler_workdir "${COMPILER_WORKDIR}" \
+    --height ${HEIGHT} \
+    --width ${WIDTH} \
+    --num_frames ${NUM_FRAMES} \
+    --decoder_frames 2 \
+    --tp_degree ${WORLD_SIZE} \
+    --world_size ${WORLD_SIZE}
+
+# Step 5: Compile Decoder (NoCache) and post_quant_conv
+# NoCache decoder is used as fallback; post_quant_conv is always needed
+echo ""
+echo "[Step 5/5] Compiling Decoder (V3 NoCache) and post_quant_conv (bfloat16, world_size=${WORLD_SIZE})..."
 python neuron_wan2_2_ti2v/compile_decoder_v3_nocache.py \
     --compiled_models_dir "${COMPILED_MODELS_DIR}" \
     --compiler_workdir "${COMPILER_WORKDIR}" \

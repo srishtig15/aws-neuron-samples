@@ -41,7 +41,7 @@ from safetensors.torch import load_file
 from neuron_wan2_2_ti2v.neuron_commons_v2 import InferenceTextEncoderWrapperV2
 from neuron_wan2_2_ti2v.neuron_commons import (
     SimpleWrapper, DecoderWrapper, DecoderWrapperV2, DecoderWrapperV3,
-    DecoderWrapperV3NoCache,
+    DecoderWrapperV3NoCache, DecoderWrapperV3Rolling,
     PostQuantConvWrapperV2, EncoderWrapperV3, QuantConvWrapperV3,
 )
 
@@ -365,14 +365,29 @@ def main(args):
     text_encoder_wrapper.t = text_encoder_nxd
     print("Text encoder loaded.")
 
-    # Load Decoder - check for V3 NoCache first, then V3, V2, V1
+    # Load Decoder - check for V3 Rolling first, then NoCache, V3, V2, V1
     # Use --force_v1_decoder to always use V1 decoder
+    decoder_v3_rolling_path = f"{compiled_models_dir}/decoder_v3_rolling"
     decoder_v3_nocache_path = f"{compiled_models_dir}/decoder_v3_nocache"
     decoder_v3_path = f"{compiled_models_dir}/decoder_v3"
     decoder_v2_path = f"{compiled_models_dir}/decoder_v2"
     decoder_v1_path = f"{compiled_models_dir}/decoder/model.pt"
 
-    if os.path.exists(decoder_v3_nocache_path) and not args.force_v1_decoder:
+    if os.path.exists(decoder_v3_rolling_path) and not args.force_v1_decoder:
+        print("\nLoading decoder (V3 Rolling Cache - flicker-free)...")
+        decoder_config = load_model_config(decoder_v3_rolling_path)
+        decoder_frames = decoder_config.get("decoder_frames", 2)
+        vae_decoder_wrapper = DecoderWrapperV3Rolling(pipe.vae.decoder, decoder_frames=decoder_frames)
+        decoder_nxd = NxDModel.load(os.path.join(decoder_v3_rolling_path, "nxd_model.pt"))
+        decoder_world_size = decoder_config.get("world_size", 8)
+
+        decoder_weights = load_duplicated_weights(decoder_v3_rolling_path, decoder_world_size)
+        decoder_nxd.set_weights(decoder_weights)
+        decoder_nxd.to_neuron()
+
+        vae_decoder_wrapper.nxd_model = decoder_nxd
+        print(f"Decoder (V3 Rolling) loaded. decoder_frames={decoder_frames}")
+    elif os.path.exists(decoder_v3_nocache_path) and not args.force_v1_decoder:
         print("\nLoading decoder (V3 NoCache - 1 input arg)...")
         decoder_config = load_model_config(decoder_v3_nocache_path)
         decoder_frames = decoder_config.get("decoder_frames", 2)
@@ -521,6 +536,10 @@ def main(args):
     ).frames[0]
     end = time.time()
     print(f"Warmup time: {end - start:.2f}s")
+
+    # Reset rolling cache between warmup and main inference
+    if hasattr(vae_decoder_wrapper, 'reset_cache'):
+        vae_decoder_wrapper.reset_cache()
 
     # Main inference
     print("\nStarting main inference...")

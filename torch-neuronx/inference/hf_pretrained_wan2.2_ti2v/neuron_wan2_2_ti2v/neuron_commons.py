@@ -774,3 +774,85 @@ class DecoderWrapperV3NoCache(nn.Module):
         pass
 
 
+class DecoderWrapperV3Rolling(nn.Module):
+    """
+    Wrapper for V3 Rolling Cache compiled decoder.
+
+    The compiled model takes x + 34 cache tensors as inputs, and returns
+    video + 34 updated cache tensors as outputs. This carries temporal
+    context between chunks for flicker-free video.
+    """
+
+    def __init__(self, original_decoder, decoder_frames=2):
+        super().__init__()
+        self.original_decoder = original_decoder
+        self.decoder_frames = decoder_frames
+        self.nxd_model = None
+        self.caches = None  # List of 34 cache tensors, initialized on first call
+
+    def _init_caches(self, x):
+        """Initialize rolling cache tensors (zeros) based on input spatial dims."""
+        from neuron_wan2_2_ti2v.compile_decoder_v3_rolling import get_feat_cache_shapes
+        latent_h, latent_w = x.shape[3], x.shape[4]
+        cache_shapes = get_feat_cache_shapes(1, latent_h, latent_w)
+        self.caches = [torch.zeros(s, dtype=torch.bfloat16) for s in cache_shapes]
+        self.num_cache_tensors = len(cache_shapes)
+
+    def forward(self, x, **kwargs):
+        if 'feat_cache' not in kwargs:
+            return self.original_decoder(x)
+
+        _t0 = time.time()
+
+        # Determine original frame count before padding
+        original_frame_count = x.shape[2]
+
+        # Pad temporal dimension to decoder_frames if needed
+        if x.shape[2] < self.decoder_frames:
+            pad_frames = self.decoder_frames - x.shape[2]
+            x = torch.cat([x] + [x[:, :, -1:]] * pad_frames, dim=2)
+
+        # Convert to bfloat16 for the compiled decoder
+        x_bf16 = x.to(torch.bfloat16)
+
+        # Initialize caches on first call
+        if self.caches is None:
+            self._init_caches(x_bf16)
+
+        _t1 = time.time()
+
+        # Rolling: pass x + 34 cache tensors, get video + 34 updated caches
+        results = self.nxd_model(x_bf16, *self.caches)
+
+        _t2 = time.time()
+
+        if isinstance(results, (tuple, list)):
+            output = results[0]
+            self.caches = [r.to(torch.bfloat16) for r in results[1:1 + self.num_cache_tensors]]
+        else:
+            output = results
+
+        # Convert back to float32 and trim to original frame count
+        if isinstance(output, (list, tuple)):
+            output = output[0]
+        output = output.to(torch.float32)
+
+        # Trim padded frames: output temporal = original_frame_count * 4 (due to upsampling)
+        output_frames = original_frame_count * 4
+        if output.shape[2] > output_frames:
+            output = output[:, :, :output_frames]
+
+        _t3 = time.time()
+
+        print(f"[rolling] prep={_t1-_t0:.4f}s nxd_model={_t2-_t1:.4f}s postproc={_t3-_t2:.4f}s total={_t3-_t0:.4f}s frames={original_frame_count}")
+
+        return output
+
+    def reset_cache(self):
+        """Reset rolling cache to zeros for next video generation."""
+        self.caches = None
+
+    def clear_cache(self):
+        self.reset_cache()
+
+
