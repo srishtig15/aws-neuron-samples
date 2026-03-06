@@ -72,10 +72,10 @@ WORLD_SIZE=${WORLD_SIZE} neuron_parallel_compile python neuron_wan2_2_t2v_a14b/c
     --transformer_subfolder transformer_2 \
     --output_dir "${COMPILED_MODELS_DIR}/transformer_2"
 
-echo "[Step 5/6] Compiling VAE Decoder..."
-WORLD_SIZE=${WORLD_SIZE} neuron_parallel_compile python neuron_wan2_2_t2v_a14b/compile_decoder_nocache.py \
+echo "[Step 5/6] Compiling VAE Decoder (Rolling Cache)..."
+WORLD_SIZE=${WORLD_SIZE} neuron_parallel_compile python neuron_wan2_2_t2v_a14b/compile_decoder_rolling.py \
     --compiled_models_dir "${COMPILED_MODELS_DIR}" \
-    --compiler_workdir "${COMPILER_WORKDIR}/decoder" \
+    --compiler_workdir "${COMPILER_WORKDIR}/decoder_rolling" \
     --height ${HEIGHT} \
     --width ${WIDTH} \
     --num_frames ${NUM_FRAMES} \

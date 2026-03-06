@@ -26,7 +26,7 @@ Wan2.2-T2V-A14B is a **Mixture-of-Experts (MoE)** text-to-video diffusion model 
 ## Pipeline Phases
 
 1. **Text Encoding** (Neuron): Encode prompt with Neuron-compiled UMT5 text encoder (TP=4)
-   - Also supports CPU fallback (default) via `--neuron_text_encoder` flag
+   - Also supports CPU fallback via `--cpu_text_encoder` flag
 2. **Denoising** (Neuron): 50 steps with MoE transformer switching
    - Steps 1-16: transformer_1 (high-noise expert)
    - Weight swap via `replace_weights()`
@@ -64,18 +64,15 @@ pip install -r requirements.txt
 # Compile all models (~1-2 hours first time)
 bash compile.sh
 
-# Compile rolling cache decoder (optional, for flicker-free VAE decode)
-bash compile_rolling.sh
-
 # Run inference
 python run_wan2.2_t2v_a14b.py \
     --compiled_models_dir /opt/dlami/nvme/compiled_models_t2v_a14b \
     --prompt "A cat walks on the grass, realistic" \
     --output output_t2v.mp4
 
-# With Neuron text encoder (faster text encoding)
+# With CPU text encoder (slower, use as fallback)
 python run_wan2.2_t2v_a14b.py \
-    --neuron_text_encoder \
+    --cpu_text_encoder \
     --compiled_models_dir /opt/dlami/nvme/compiled_models_t2v_a14b \
     --prompt "A cat walks on the grass, realistic" \
     --output output_t2v.mp4
@@ -91,16 +88,10 @@ python run_wan2.2_t2v_a14b.py \
 | 2 | Text Encoder (TP=4) | `text_encoder/` |
 | 3 | Transformer - high-noise expert (TP=4, CP=2) | `transformer/` |
 | 4 | Transformer_2 - low-noise expert (TP=4, CP=2) | `transformer_2/` |
-| 5 | VAE Decoder (NoCache) | `decoder_nocache/` |
+| 5 | VAE Decoder (Rolling Cache) | `decoder_rolling/` |
 | 6 | Post-quant conv | `post_quant_conv/` |
 
-`compile_rolling.sh` compiles the rolling cache VAE decoder:
-
-| Step | Component | Output |
-|------|-----------|--------|
-| 1 | VAE Decoder (Rolling Cache) | `decoder_rolling/` |
-
-The scripts auto-patch `nearest-exact` → `nearest` in diffusers for Trainium2 compatibility.
+The script auto-patches `nearest-exact` → `nearest` in diffusers for Trainium2 compatibility.
 
 ## Inference Options
 
@@ -114,7 +105,7 @@ The scripts auto-patch `nearest-exact` → `nearest` in diffusers for Trainium2 
 --prompt                  Text prompt
 --negative_prompt         Negative prompt
 --output                  Output video path (default: output_t2v_a14b.mp4)
---neuron_text_encoder     Use Neuron-compiled text encoder (default: CPU)
+--cpu_text_encoder        Use CPU text encoder instead of Neuron (slower)
 ```
 
 ## VAE Decoder Modes
@@ -134,7 +125,6 @@ Rolling cache is preferred. If `decoder_rolling/nxd_model.pt` exists, it is used
 hf_pretrained_wan2.2_t2v_a14b/
 ├── README.md
 ├── compile.sh                           # Master compilation script
-├── compile_rolling.sh                   # Rolling cache decoder compilation
 ├── run_wan2.2_t2v_a14b.py              # Main inference script
 ├── requirements.txt
 └── neuron_wan2_2_t2v_a14b/
