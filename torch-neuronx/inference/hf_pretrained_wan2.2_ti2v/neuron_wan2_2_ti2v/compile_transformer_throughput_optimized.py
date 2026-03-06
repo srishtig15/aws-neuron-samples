@@ -42,7 +42,7 @@ def get_transformer_model():
         "PixArt-alpha/PixArt-Sigma-XL-2-1024-MS",
         torch_dtype=torch.bfloat16,
         local_files_only=True,
-        cache_dir="pixart_sigma_hf_cache_dir_1024")    
+        cache_dir="/opt/dlami/nvme/wan2.2_ti2v_hf_cache_dir")    
     mod_pipe_transformer_f = TracingTransformerWrapper(pipe.transformer)
     return mod_pipe_transformer_f
 

@@ -365,8 +365,8 @@ def main(args):
     text_encoder_wrapper.t = text_encoder_nxd
     print("Text encoder loaded.")
 
-    # Load Decoder - check for V3 Rolling first, then NoCache, V3, V2, V1
-    # Use --force_v1_decoder to always use V1 decoder
+    # Load Decoder - check for V3 Rolling first, then NoCache, V3, V2, V1, then CPU fallback
+    use_cpu_decoder = False
     decoder_v3_rolling_path = f"{compiled_models_dir}/decoder_v3_rolling"
     decoder_v3_nocache_path = f"{compiled_models_dir}/decoder_v3_nocache"
     decoder_v3_path = f"{compiled_models_dir}/decoder_v3"
@@ -427,18 +427,25 @@ def main(args):
 
         vae_decoder_wrapper.nxd_model = decoder_nxd
         print("Decoder (V2) loaded.")
-    else:
+    elif os.path.exists(decoder_v1_path):
         print("\nLoading decoder (V1)...")
         vae_decoder_wrapper = DecoderWrapper(pipe.vae.decoder)
         vae_decoder_wrapper.model = torch.jit.load(decoder_v1_path)
         print("Decoder (V1) loaded.")
+    else:
+        print("\nNo compiled decoder found, using CPU decoder fallback.")
+        use_cpu_decoder = True
+        vae_decoder_wrapper = None
 
     # Load post_quant_conv - check for V3 first, then V2, then V1
     pqc_v3_path = f"{compiled_models_dir}/post_quant_conv_v3"
     pqc_v2_path = f"{compiled_models_dir}/post_quant_conv_v2"
     pqc_v1_path = f"{compiled_models_dir}/post_quant_conv/model.pt"
+    vae_post_quant_conv_wrapper = None
 
-    if os.path.exists(pqc_v3_path) and not args.force_v1_decoder:
+    if use_cpu_decoder:
+        print("Using CPU post_quant_conv (paired with CPU decoder).")
+    elif os.path.exists(pqc_v3_path) and not args.force_v1_decoder:
         print("\nLoading post_quant_conv (V3)...")
         vae_post_quant_conv_wrapper = PostQuantConvWrapperV2(pipe.vae.post_quant_conv)
         pqc_nxd = NxDModel.load(os.path.join(pqc_v3_path, "nxd_model.pt"))
@@ -464,13 +471,15 @@ def main(args):
 
         vae_post_quant_conv_wrapper.nxd_model = pqc_nxd
         print("post_quant_conv (V2) loaded.")
-    else:
+    elif os.path.exists(pqc_v1_path):
         print("\nLoading post_quant_conv (V1)...")
         vae_post_quant_conv_wrapper = SimpleWrapper(pipe.vae.post_quant_conv)
         vae_post_quant_conv_wrapper.model = torch_neuronx.DataParallel(
             torch.jit.load(pqc_v1_path), [0, 1, 2, 3], False
         )
         print("post_quant_conv (V1) loaded.")
+    else:
+        print("No compiled post_quant_conv found, using CPU.")
 
     # Load Encoder and quant_conv for I2V (optional, only if --image is provided)
     if args.image:
@@ -502,8 +511,11 @@ def main(args):
     # Replace pipeline components
     pipe.text_encoder = text_encoder_wrapper
     pipe.transformer = transformer_wrapper
-    pipe.vae.decoder = vae_decoder_wrapper
-    pipe.vae.post_quant_conv = vae_post_quant_conv_wrapper
+    if not use_cpu_decoder:
+        pipe.vae.decoder = vae_decoder_wrapper
+        pipe.vae.post_quant_conv = vae_post_quant_conv_wrapper
+    else:
+        print("VAE decoder/post_quant_conv: using original CPU pipeline (no replacement)")
 
     prompt = args.prompt
     negative_prompt = args.negative_prompt

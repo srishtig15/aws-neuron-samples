@@ -9,7 +9,7 @@ from diffusers import AutoencoderKLWan, WanPipeline
 from neuron_wan2_2_ti2v.neuron_commons import InferenceTextEncoderWrapper, InferenceTransformerWrapper, SimpleWrapper, DecoderWrapper
 
 COMPILED_MODELS_DIR = "compile_workdir_latency_optimized"
-HUGGINGFACE_CACHE_DIR = "wan2.2_ti2v_hf_cache_dir"
+HUGGINGFACE_CACHE_DIR = "/opt/dlami/nvme/wan2.2_ti2v_hf_cache_dir"
 DTYPE = torch.bfloat16
 
 model_id = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"

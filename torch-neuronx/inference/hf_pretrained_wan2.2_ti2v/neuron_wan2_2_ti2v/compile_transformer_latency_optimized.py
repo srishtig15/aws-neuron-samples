@@ -57,8 +57,8 @@ def get_transformer_model(tp_degree: int):
     DTYPE = torch.bfloat16
     
     model_id = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
-    vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32, cache_dir="wan2.2_ti2v_hf_cache_dir")
-    pipe = WanPipeline.from_pretrained(model_id, vae=vae, torch_dtype=DTYPE, cache_dir="wan2.2_ti2v_hf_cache_dir")
+    vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32, cache_dir="/opt/dlami/nvme/wan2.2_ti2v_hf_cache_dir")
+    pipe = WanPipeline.from_pretrained(model_id, vae=vae, torch_dtype=DTYPE, cache_dir="/opt/dlami/nvme/wan2.2_ti2v_hf_cache_dir")
     # print('pipe.transformer:', pipe.transformer)
     
     # upcast_norms_to_f32(pipe.transformer)
@@ -150,8 +150,8 @@ if __name__ == "__main__":
 
 # # --- Compile Transformer and save [PASS]---
 
-# vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32, cache_dir="wan2.2_ti2v_hf_cache_dir")
-# pipe = WanPipeline.from_pretrained(model_id, vae=vae, torch_dtype=DTYPE, cache_dir="wan2.2_ti2v_hf_cache_dir")
+# vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32, cache_dir="/opt/dlami/nvme/wan2.2_ti2v_hf_cache_dir")
+# pipe = WanPipeline.from_pretrained(model_id, vae=vae, torch_dtype=DTYPE, cache_dir="/opt/dlami/nvme/wan2.2_ti2v_hf_cache_dir")
 
 # # upcast_norms_to_f32(pipe.transformer)
 

@@ -50,7 +50,7 @@ def compile_decoder(args):
     in_channels = 48
     
     model_id = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
-    vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32, cache_dir="wan2.2_ti2v_hf_cache_dir")
+    vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32, cache_dir="/opt/dlami/nvme/wan2.2_ti2v_hf_cache_dir")
     
     decoder: Decoder = vae.decoder
     decoder.eval()

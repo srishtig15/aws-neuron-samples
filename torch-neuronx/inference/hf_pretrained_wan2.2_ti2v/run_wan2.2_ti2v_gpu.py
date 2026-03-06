@@ -39,7 +39,7 @@ def set_seed(seed: int):
     print(f"随机种子已设置为: {seed}")
 
 
-HUGGINGFACE_CACHE_DIR = "wan2.2_ti2v_hf_cache_dir"
+HUGGINGFACE_CACHE_DIR = "/opt/dlami/nvme/wan2.2_ti2v_hf_cache_dir"
 SEED = 42  # 与Trainium版本相同的随机种子
 
 if __name__ == "__main__":

@@ -72,7 +72,7 @@ def load_sharded_weights(model_path, tp_degree):
 
 # Defaults - can be overridden via command line
 DEFAULT_COMPILED_MODELS_DIR = "compile_workdir_latency_optimized"  # V2 scripts default to this
-HUGGINGFACE_CACHE_DIR = "wan2.2_ti2v_hf_cache_dir"
+HUGGINGFACE_CACHE_DIR = "/opt/dlami/nvme/wan2.2_ti2v_hf_cache_dir"
 SEED = 42
 
 

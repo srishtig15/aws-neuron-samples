@@ -35,7 +35,7 @@ def set_seed(seed: int):
     print(f"随机种子已设置为: {seed}")
 
 COMPILED_MODELS_DIR = "compile_workdir_latency_optimized"
-HUGGINGFACE_CACHE_DIR = "wan2.2_ti2v_hf_cache_dir"
+HUGGINGFACE_CACHE_DIR = "/opt/dlami/nvme/wan2.2_ti2v_hf_cache_dir"
 SEED = 42  # 固定随机种子，用于对比GPU和Trainium的结果
 
 if __name__ == "__main__":

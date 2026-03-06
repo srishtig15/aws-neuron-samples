@@ -110,7 +110,7 @@ def compile_encoder_v3(args):
         model_id,
         subfolder="vae",
         torch_dtype=torch.float32,
-        cache_dir="wan2.2_ti2v_hf_cache_dir"
+        cache_dir="/opt/dlami/nvme/wan2.2_ti2v_hf_cache_dir"
     )
 
     # ========== Compile Encoder (bfloat16) ==========

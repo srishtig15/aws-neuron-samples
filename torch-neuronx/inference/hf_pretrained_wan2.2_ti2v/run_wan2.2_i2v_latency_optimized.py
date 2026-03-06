@@ -19,7 +19,7 @@ from neuron_wan2_2_ti2v.neuron_commons import DecoderWrapper
 # from neuron_wan2_2_ti2v.neuron_commons import EncoderWrapperNoCache  # Not used - encoder runs on CPU
 
 COMPILED_MODELS_DIR = "compile_workdir_latency_optimized"
-HUGGINGFACE_CACHE_DIR = "wan2.2_ti2v_hf_cache_dir"
+HUGGINGFACE_CACHE_DIR = "/opt/dlami/nvme/wan2.2_ti2v_hf_cache_dir"
 
 def prepare_image_latents(pipe, image, num_frames, height, width, device, dtype, generator=None):
     """

@@ -43,7 +43,7 @@ class TracingUMT5WrapperTP(nn.Module):
 def get_text_encoder(tp_degree: int, sequence_length: int):
     model_id = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
     DTYPE = torch.bfloat16
-    text_encoder = UMT5EncoderModel.from_pretrained(model_id, subfolder="text_encoder", torch_dtype=DTYPE, cache_dir="wan2.2_ti2v_hf_cache_dir")
+    text_encoder = UMT5EncoderModel.from_pretrained(model_id, subfolder="text_encoder", torch_dtype=DTYPE, cache_dir="/opt/dlami/nvme/wan2.2_ti2v_hf_cache_dir")
     text_encoder.eval()
     
     # print('text_encoder:', text_encoder)
@@ -109,7 +109,7 @@ if __name__ == "__main__":
 
 # # --- Compile CLIP text encoder and save [PASS] ---
 
-# # text_encoder = UMT5EncoderModel.from_pretrained(model_id, subfolder="text_encoder", torch_dtype=DTYPE, cache_dir="wan2.2_ti2v_hf_cache_dir")
+# # text_encoder = UMT5EncoderModel.from_pretrained(model_id, subfolder="text_encoder", torch_dtype=DTYPE, cache_dir="/opt/dlami/nvme/wan2.2_ti2v_hf_cache_dir")
 # text_encoder = UMT5EncoderModel.from_pretrained(model_id, subfolder="text_encoder", torch_dtype=DTYPE, cache_dir="wan2.2_ti2v_14b_hf_cache_dir")
 # text_encoder.eval()
 

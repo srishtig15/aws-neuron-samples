@@ -86,6 +86,22 @@ def get_sharded_data(data, dim):
         return data[:, s * tp_rank : s * (tp_rank + 1)].clone()
 
 
+NKI_SEQ_TILE = 128  # NKI attention kernel tile size for sequence dimension
+
+
+def _pad_to_multiple(x, dim, multiple):
+    """Pad tensor along dim to the nearest multiple. Returns (padded, original_len)."""
+    orig_len = x.shape[dim]
+    remainder = orig_len % multiple
+    if remainder == 0:
+        return x, orig_len
+    pad_len = multiple - remainder
+    pad_shape = list(x.shape)
+    pad_shape[dim] = pad_len
+    padding = torch.zeros(pad_shape, dtype=x.dtype, device=x.device)
+    return torch.cat([x, padding], dim=dim), orig_len
+
+
 def nki_flash_attention(query, key, value):
     """
     NKI Flash Attention wrapper.
@@ -102,12 +118,22 @@ def nki_flash_attention(query, key, value):
     k_len = key.shape[2]
     v_len = value.shape[2]
 
-    # Reshape for NKI kernel: (B*H, D, S) for Q/K, (B*H, S, D) for V
-    q = query.clone().permute(0, 1, 3, 2).reshape((bs * n_head, d_head, q_len))
-    k = key.clone().permute(0, 1, 3, 2).reshape((bs * n_head, d_head, k_len))
-    v = value.clone().reshape((bs * n_head, v_len, d_head))
+    # Pad Q seq_len to multiple of NKI_SEQ_TILE to avoid NCC_IBIR158 compiler bug
+    query, orig_q_len = _pad_to_multiple(query, dim=2, multiple=NKI_SEQ_TILE)
+    padded_q_len = query.shape[2]
 
-    attn_output = torch.zeros((bs * n_head, q_len, d_head), dtype=torch.bfloat16, device=q.device)
+    # Pad K/V seq_len to same tile alignment
+    key, _ = _pad_to_multiple(key, dim=2, multiple=NKI_SEQ_TILE)
+    value, _ = _pad_to_multiple(value, dim=2, multiple=NKI_SEQ_TILE)
+    padded_k_len = key.shape[2]
+    padded_v_len = value.shape[2]
+
+    # Reshape for NKI kernel: (B*H, D, S) for Q/K, (B*H, S, D) for V
+    q = query.clone().permute(0, 1, 3, 2).reshape((bs * n_head, d_head, padded_q_len))
+    k = key.clone().permute(0, 1, 3, 2).reshape((bs * n_head, d_head, padded_k_len))
+    v = value.clone().reshape((bs * n_head, padded_v_len, d_head))
+
+    attn_output = torch.zeros((bs * n_head, padded_q_len, d_head), dtype=torch.bfloat16, device=q.device)
     scale = 1 / math.sqrt(d_head)
 
     vc_size = int(os.getenv("NEURON_RT_VIRTUAL_CORE_SIZE", "1"))
@@ -117,7 +143,13 @@ def nki_flash_attention(query, key, value):
     else:
         _flash_fwd_call(q, k, v, scale, attn_output, kernel_name="AttentionMMSoftmaxMMWithoutSwap")
 
-    return attn_output.reshape((bs, n_head, q_len, d_head))
+    attn_output = attn_output.reshape((bs, n_head, padded_q_len, d_head))
+
+    # Slice back to original Q length
+    if padded_q_len != orig_q_len:
+        attn_output = attn_output[:, :, :orig_q_len, :]
+
+    return attn_output
 
 
 def apply_rotary_emb_cp(hidden_states, freqs):
@@ -919,12 +951,12 @@ def compile_transformer_v3_cp(args):
         vae = AutoencoderKLWan.from_pretrained(
             model_id, subfolder="vae",
             torch_dtype=torch.float32,
-            cache_dir="wan2.2_ti2v_hf_cache_dir"
+            cache_dir="/opt/dlami/nvme/wan2.2_ti2v_hf_cache_dir"
         )
         pipe = WanPipeline.from_pretrained(
             model_id, vae=vae,
             torch_dtype=torch.bfloat16,
-            cache_dir="wan2.2_ti2v_hf_cache_dir"
+            cache_dir="/opt/dlami/nvme/wan2.2_ti2v_hf_cache_dir"
         )
 
         # Compute full RoPE

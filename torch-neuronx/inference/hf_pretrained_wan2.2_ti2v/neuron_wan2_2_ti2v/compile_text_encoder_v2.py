@@ -105,7 +105,7 @@ def compile_text_encoder_v2(args):
             model_id,
             subfolder="text_encoder",
             torch_dtype=DTYPE,
-            cache_dir="wan2.2_ti2v_hf_cache_dir"
+            cache_dir="/opt/dlami/nvme/wan2.2_ti2v_hf_cache_dir"
         )
         text_encoder.eval()
 

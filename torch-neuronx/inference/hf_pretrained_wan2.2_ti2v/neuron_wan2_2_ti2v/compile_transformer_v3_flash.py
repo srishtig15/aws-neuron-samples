@@ -686,7 +686,7 @@ if __name__ == "__main__":
     parser.add_argument("--tp_degree", type=int, default=8, help="Tensor parallelism degree")
     parser.add_argument("--compiled_models_dir", type=str, default="compiled_models_v3_flash", help="Output directory")
     parser.add_argument("--compiler_workdir", type=str, default="compiler_workdir_v3_flash", help="Compiler workdir")
-    parser.add_argument("--cache_dir", type=str, default="wan2.2_ti2v_hf_cache_dir", help="HuggingFace cache dir")
+    parser.add_argument("--cache_dir", type=str, default="/opt/dlami/nvme/wan2.2_ti2v_hf_cache_dir", help="HuggingFace cache dir")
     args = parser.parse_args()
 
     compile_transformer_v3_flash(args)

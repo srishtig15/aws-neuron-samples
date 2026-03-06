@@ -17,7 +17,7 @@ def set_seed(seed=42):
 set_seed(42)
 
 COMPILED_MODELS_DIR = "compile_workdir_latency_optimized"
-HUGGINGFACE_CACHE_DIR = "wan2.2_ti2v_hf_cache_dir"
+HUGGINGFACE_CACHE_DIR = "/opt/dlami/nvme/wan2.2_ti2v_hf_cache_dir"
 transformer_model_path = f"{COMPILED_MODELS_DIR}/transformer"
 
 DTYPE=torch.bfloat16

@@ -101,7 +101,7 @@ def compile_decoder_v2(args):
         model_id,
         subfolder="vae",
         torch_dtype=torch.float32,
-        cache_dir="wan2.2_ti2v_hf_cache_dir"
+        cache_dir="/opt/dlami/nvme/wan2.2_ti2v_hf_cache_dir"
     )
 
     # Use NxDParallelState with matching world_size for compatibility with other models
