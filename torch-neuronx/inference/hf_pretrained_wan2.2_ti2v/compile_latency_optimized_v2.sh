@@ -4,6 +4,14 @@
 # pip install -r requirements.txt
 # cp autoencoder_kl_wan.py /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.10/site-packages/diffusers/models/autoencoders/  # Trainium2 doesn't support 'nearest-exact'
 
+# Fix nearest-exact -> nearest for Trainium2 compatibility
+DIFFUSERS_PATH=$(python -c "import diffusers; import os; print(os.path.dirname(diffusers.__file__))")
+VAE_FILE="${DIFFUSERS_PATH}/models/autoencoders/autoencoder_kl_wan.py"
+if grep -q 'nearest-exact' "${VAE_FILE}" 2>/dev/null; then
+    echo "Patching autoencoder_kl_wan.py: nearest-exact -> nearest"
+    sed -i 's/nearest-exact/nearest/g' "${VAE_FILE}"
+fi
+
 export PYTHONPATH=`pwd`:$PYTHONPATH
 
 echo "cache hf model"

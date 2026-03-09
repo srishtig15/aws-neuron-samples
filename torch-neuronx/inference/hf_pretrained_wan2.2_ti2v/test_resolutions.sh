@@ -12,9 +12,17 @@ set -e
 
 export PYTHONPATH=$(pwd):$PYTHONPATH
 
-# Copy custom autoencoder_kl_wan.py
+# # Copy custom autoencoder_kl_wan.py
+# DIFFUSERS_PATH=$(python -c "import diffusers; import os; print(os.path.dirname(diffusers.__file__))")
+# cp autoencoder_kl_wan.py "${DIFFUSERS_PATH}/models/autoencoders/"
+
+# Fix nearest-exact -> nearest for Trainium2 compatibility
 DIFFUSERS_PATH=$(python -c "import diffusers; import os; print(os.path.dirname(diffusers.__file__))")
-cp autoencoder_kl_wan.py "${DIFFUSERS_PATH}/models/autoencoders/"
+VAE_FILE="${DIFFUSERS_PATH}/models/autoencoders/autoencoder_kl_wan.py"
+if grep -q 'nearest-exact' "${VAE_FILE}" 2>/dev/null; then
+    echo "Patching autoencoder_kl_wan.py: nearest-exact -> nearest"
+    sed -i 's/nearest-exact/nearest/g' "${VAE_FILE}"
+fi
 
 BASE_DIR="/opt/dlami/nvme"
 COMPILER_WORKDIR_BASE="${BASE_DIR}/compiler_workdir_test"
@@ -34,12 +42,12 @@ MAX_SEQ_LEN=512
 # Define test configurations: "HEIGHT WIDTH NUM_FRAMES FPS"
 # Wan2.2 frame formula: frames = fps * duration + 1, must satisfy (frames-1) % 4 == 0
 CONFIGS=(
-    "384 512 81 16"    # 512x384 16fps 5s (81 frames)
-    "384 512 121 24"   # 512x384 24fps 5s (121 frames)
-    "480 640 81 16"    # 640x480 16fps 5s
-    "480 640 121 24"   # 640x480 24fps 5s
-    "720 1280 81 16"   # 1280x720 16fps 5s
-    "720 1280 121 24"  # 1280x720 24fps 5s
+    # "384 512 81 16"    # 512x384 16fps 5s (81 frames)
+    # "384 512 121 24"   # 512x384 24fps 5s (121 frames)
+    # "480 640 81 16"    # 640x480 16fps 5s
+    # "480 640 121 24"   # 640x480 24fps 5s
+    "704 1280 81 16"   # 1280x704 16fps 5s (720P, 704=22*32)
+    # "704 1280 121 24"  # 1280x704 24fps 5s (720P, 704=22*32)
 )
 
 echo "=============================================="
@@ -111,7 +119,7 @@ for config in "${CONFIGS[@]}"; do
 
             # Compile decoder
             echo "[${TAG}] Compiling Decoder..."
-            if python neuron_wan2_2_ti2v/compile_decoder_v3_nocache.py \
+            if python neuron_wan2_2_ti2v/compile_decoder_v3_rolling.py \
                 --compiled_models_dir "${COMPILED_DIR}" \
                 --compiler_workdir "${COMPILER_WD}" \
                 --height ${HEIGHT} \

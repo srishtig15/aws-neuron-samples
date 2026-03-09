@@ -18,10 +18,18 @@ set -e
 # Set PYTHONPATH
 export PYTHONPATH=`pwd`:$PYTHONPATH
 
-# Copy custom autoencoder_kl_wan.py to fix 'nearest-exact' interpolation issue on Trainium2
+# # Copy custom autoencoder_kl_wan.py to fix 'nearest-exact' interpolation issue on Trainium2
+# DIFFUSERS_PATH=$(python -c "import diffusers; import os; print(os.path.dirname(diffusers.__file__))")
+# echo "Copying custom autoencoder_kl_wan.py to ${DIFFUSERS_PATH}/models/autoencoders/"
+# cp autoencoder_kl_wan.py "${DIFFUSERS_PATH}/models/autoencoders/"
+
+# Fix nearest-exact -> nearest for Trainium2 compatibility
 DIFFUSERS_PATH=$(python -c "import diffusers; import os; print(os.path.dirname(diffusers.__file__))")
-echo "Copying custom autoencoder_kl_wan.py to ${DIFFUSERS_PATH}/models/autoencoders/"
-cp autoencoder_kl_wan.py "${DIFFUSERS_PATH}/models/autoencoders/"
+VAE_FILE="${DIFFUSERS_PATH}/models/autoencoders/autoencoder_kl_wan.py"
+if grep -q 'nearest-exact' "${VAE_FILE}" 2>/dev/null; then
+    echo "Patching autoencoder_kl_wan.py: nearest-exact -> nearest"
+    sed -i 's/nearest-exact/nearest/g' "${VAE_FILE}"
+fi
 
 # Configuration
 COMPILED_MODELS_DIR="${1:-/opt/dlami/nvme/compiled_models_v3_flash}"
