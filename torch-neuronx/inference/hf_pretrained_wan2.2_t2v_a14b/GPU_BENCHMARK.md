@@ -46,14 +46,13 @@ All results on single H100 80GB, CUDA 13.0, PyTorch 2.9.1+cu130.
 | Resolution | Official (FA3) | SDPA | FA4 |
 |------------|---------------|------|-----|
 | 480P | 326.9s / 41.3GB | 342.8s (8.06s/step) | **322.7s (7.56s/step)** |
-| 720P | 1041.5s / 59.8GB | 1118.4s (27.33s/step) | TBD |
+| 720P | 1041.5s / 59.8GB | 1118.4s (27.33s/step) | **1010.6s (24.63s/step)** |
 
 ### Without offload (all models on GPU)
 
 | Resolution | FA4 | vs Official (offload) |
 |------------|-----|-----------------------|
 | 480P | **277.7s (6.85s/step)** | **-15.0%** |
-| 720P | TBD | — |
 
 ### Impact of offload (FA4, 480P)
 
