@@ -119,14 +119,14 @@ for config in "${CONFIGS[@]}"; do
 
             # Compile decoder
             echo "[${TAG}] Compiling Decoder..."
-            if python neuron_wan2_2_ti2v/compile_decoder_v3_rolling.py \
+            if python neuron_wan2_2_ti2v/compile_decoder_v3_tp_rolling.py \
                 --compiled_models_dir "${COMPILED_DIR}" \
                 --compiler_workdir "${COMPILER_WD}" \
                 --height ${HEIGHT} \
                 --width ${WIDTH} \
                 --num_frames ${NUM_FRAMES} \
                 --decoder_frames 2 \
-                --tp_degree ${WORLD_SIZE} \
+                --tp_degree ${TP_DEGREE} \
                 --world_size ${WORLD_SIZE} 2>&1 | tee "log_compile_decoder_${TAG}.txt"; then
 
                 COMPILE_END=$(date +%s)

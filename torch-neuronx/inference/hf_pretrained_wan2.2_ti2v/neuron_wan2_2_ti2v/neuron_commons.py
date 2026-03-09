@@ -856,3 +856,88 @@ class DecoderWrapperV3Rolling(nn.Module):
         self.reset_cache()
 
 
+class DecoderWrapperV3TPRolling(nn.Module):
+    """
+    Wrapper for TP + Rolling Cache compiled decoder.
+
+    Like DecoderWrapperV3Rolling but loads sharded weights per TP rank
+    instead of duplicated weights. Cache tensors have sharded channel dims.
+    """
+
+    def __init__(self, original_decoder, decoder_frames=2, tp_degree=4):
+        super().__init__()
+        self.original_decoder = original_decoder
+        self.decoder_frames = decoder_frames
+        self.tp_degree = tp_degree
+        self.nxd_model = None
+        self.caches = None
+
+    def _init_caches(self, x):
+        """Initialize rolling cache tensors (zeros) based on input spatial dims."""
+        lh, lw = x.shape[3], x.shape[4]
+        tp = self.tp_degree
+        cache_shapes = [
+            (1, 48, 2, lh, lw),                           # conv_in (full)
+            *[(1, 1024//tp, 2, lh, lw)] * 4,              # mid_block
+            *[(1, 1024//tp, 2, lh, lw)] * 7,              # up_block_0
+            *[(1, 1024//tp, 2, lh*2, lw*2)] * 7,          # up_block_1
+            (1, 1024//tp, 2, lh*4, lw*4),                  # up_block_2 resnet0 conv1
+            *[(1, 512//tp, 2, lh*4, lw*4)] * 5,           # up_block_2 rest
+            (1, 512//tp, 2, lh*8, lw*8),                   # up_block_3 resnet0 conv1
+            *[(1, 256//tp, 2, lh*8, lw*8)] * 5,           # up_block_3 rest
+            (1, 256//tp, 2, lh*8, lw*8),                   # conv_out
+            (1, 256//tp, 2, lh*8, lw*8),                   # placeholder
+            (1, 12, 2, lh*8, lw*8),                        # placeholder
+        ]
+        self.caches = [torch.zeros(s, dtype=torch.bfloat16) for s in cache_shapes]
+        self.num_cache_tensors = len(cache_shapes)
+
+    def forward(self, x, **kwargs):
+        if 'feat_cache' not in kwargs:
+            return self.original_decoder(x)
+
+        _t0 = time.time()
+
+        original_frame_count = x.shape[2]
+
+        if x.shape[2] < self.decoder_frames:
+            pad_frames = self.decoder_frames - x.shape[2]
+            x = torch.cat([x] + [x[:, :, -1:]] * pad_frames, dim=2)
+
+        x_bf16 = x.to(torch.bfloat16)
+
+        if self.caches is None:
+            self._init_caches(x_bf16)
+
+        _t1 = time.time()
+
+        results = self.nxd_model(x_bf16, *self.caches)
+
+        _t2 = time.time()
+
+        if isinstance(results, (tuple, list)):
+            output = results[0]
+            self.caches = [r.to(torch.bfloat16) for r in results[1:1 + self.num_cache_tensors]]
+        else:
+            output = results
+
+        if isinstance(output, (list, tuple)):
+            output = output[0]
+        output = output.to(torch.float32)
+
+        output_frames = original_frame_count * 4
+        if output.shape[2] > output_frames:
+            output = output[:, :, :output_frames]
+
+        _t3 = time.time()
+        print(f"[tp_rolling] prep={_t1-_t0:.4f}s nxd={_t2-_t1:.4f}s post={_t3-_t2:.4f}s total={_t3-_t0:.4f}s frames={original_frame_count}")
+
+        return output
+
+    def reset_cache(self):
+        self.caches = None
+
+    def clear_cache(self):
+        self.reset_cache()
+
+
