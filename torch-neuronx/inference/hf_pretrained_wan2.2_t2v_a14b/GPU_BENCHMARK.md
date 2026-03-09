@@ -41,23 +41,23 @@ Aligned with the [official Wan2.2 repo](https://github.com/Wan-Video/Wan2.2) and
 
 All results on single H100 80GB, CUDA 13.0, PyTorch 2.9.1+cu130.
 
-### Without offload (all models on GPU)
-
-| Resolution | SDPA | FA4 | FA4 vs Official |
-|------------|------|-----|-----------------|
-| 480P | 342.8s (8.06s/step) | **277.7s (6.85s/step)** | **-15.0%** |
-| 720P | 1118.4s (27.33s/step) | TBD | — |
-
 ### With offload (`--offload`, comparable to official)
 
-| Resolution | Official (FA3+offload) | FA4+offload | Gap |
-|------------|----------------------|-------------|-----|
-| 480P | 326.9s / 41.3GB | **322.7s (7.56s/step)** | **-1.3%** |
-| 720P | 1041.5s / 59.8GB | TBD | — |
+| Resolution | Official (FA3) | SDPA | FA4 |
+|------------|---------------|------|-----|
+| 480P | 326.9s / 41.3GB | 342.8s (8.06s/step) | **322.7s (7.56s/step)** |
+| 720P | 1041.5s / 59.8GB | 1118.4s (27.33s/step) | TBD |
 
-### Impact of offload
+### Without offload (all models on GPU)
 
-| Config | 480P | Per-step | Overhead |
+| Resolution | FA4 | vs Official (offload) |
+|------------|-----|-----------------------|
+| 480P | **277.7s (6.85s/step)** | **-15.0%** |
+| 720P | TBD | — |
+
+### Impact of offload (FA4, 480P)
+
+| Config | Time | Per-step | Overhead |
 |--------|------|----------|----------|
 | FA4 no offload | 277.7s | 6.85s/step | — |
 | FA4 + offload | 322.7s | 7.56s/step | **+16.2%** |
@@ -65,7 +65,7 @@ All results on single H100 80GB, CUDA 13.0, PyTorch 2.9.1+cu130.
 Offload adds ~0.71s per denoising step due to diffusers' CPU↔GPU model transfer hooks.
 
 - **Official**: from [Wan2.2 repo](https://github.com/Wan-Video/Wan2.2) `comp_effic.png`, single H100, `--offload_model True --convert_model_dtype`, FlashAttention3
-- **SDPA**: PyTorch `scaled_dot_product_attention` (no flash-attn installed)
+- **SDPA**: PyTorch `scaled_dot_product_attention` (no flash-attn installed), with `--offload`
 - **FA4**: flash-attn-4 4.0.0b4 (CuTeDSL), `DIFFUSERS_ATTN_BACKEND="_flash_4"`
 
 ## Official Wan2.2 Performance Table (All GPUs)
