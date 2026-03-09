@@ -119,65 +119,13 @@ The inference script auto-detects which decoder mode to use:
 
 Rolling cache is preferred. If `decoder_rolling/nxd_model.pt` exists, it is used automatically.
 
-## GPU Baseline Benchmark
-
-For performance comparison, `run_wan2.2_t2v_a14b_gpu.py` runs the same model on NVIDIA GPUs using diffusers.
-
-### Quick Start (GPU)
-
-```bash
-pip install diffusers transformers accelerate
-
-# 480P (official: 326.9s on H100)
-python run_wan2.2_t2v_a14b_gpu.py --resolution 480P
-
-# 720P (official: 1041.5s on H100)
-python run_wan2.2_t2v_a14b_gpu.py --resolution 720P
-
-# With CPU offload (reduces VRAM, needed for <80GB GPUs)
-python run_wan2.2_t2v_a14b_gpu.py --resolution 480P --offload
-```
-
-### H100 Benchmark Results
-
-| Resolution | Official (FA3) | Our Script (SDPA) | Our Script (FA4) | Gap |
-|------------|---------------|-------------------|-------------------|-----|
-| 480P | 326.9s / 41.3GB | 342.8s | TBD | +4.9% |
-| 720P | 1041.5s / 59.8GB | 1118.4s | TBD | +7.4% |
-
-Official numbers from [Wan2.2 repo](https://github.com/Wan-Video/Wan2.2) using FlashAttention3 on H100, single GPU with `--offload_model True --convert_model_dtype`.
-
-### Flash-Attn-4 Support (CUDA 13 + Hopper)
-
-On CUDA 13, the standard `flash-attn` v2 package has no pre-built wheels. `flash-attn-4` uses CuTeDSL for runtime JIT kernel compilation, making it compatible with CUDA 13 without building from source.
-
-```bash
-# 1. Install flash-attn-4
-pip install --pre flash-attn-4
-
-# 2. Patch diffusers to add _flash_4 backend
-python patch_diffusers_fa4.py
-
-# 3. Verify
-python patch_diffusers_fa4.py --check
-
-# 4. Run with flash-attn-4
-DIFFUSERS_ATTN_BACKEND="_flash_4" python run_wan2.2_t2v_a14b_gpu.py --resolution 480P
-```
-
-Note: First run with flash-attn-4 triggers JIT kernel compilation (adds a few minutes to warmup). Subsequent runs use cached kernels.
-
-The patch modifies 3 diffusers files (auto-detected path):
-- `utils/import_utils.py` — detect `flash_attn.cute` availability
-- `utils/__init__.py` — export detection function
-- `models/attention_dispatch.py` — register `_flash_4` attention backend
-
 ## File Structure
 
 ```
 hf_pretrained_wan2.2_t2v_a14b/
-├── README.md
+├── README.md                            # This file (Trainium2 inference)
 ├── ROLLING_CACHE.md                     # Rolling cache design document
+├── GPU_BENCHMARK.md                     # GPU baseline benchmark & flash-attn-4 guide
 ├── compile.sh                           # Master compilation script (Neuron)
 ├── run_wan2.2_t2v_a14b.py              # Neuron inference script
 ├── run_wan2.2_t2v_a14b_gpu.py          # GPU inference benchmark
