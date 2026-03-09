@@ -10,8 +10,14 @@ Usage:
   python run_wan2.2_t2v_a14b_gpu.py --resolution 720P        # 720P
   python run_wan2.2_t2v_a14b_gpu.py --offload                # CPU offload (saves VRAM)
   python run_wan2.2_t2v_a14b_gpu.py --prompt "your prompt"
+
+Flash-attn-4 support (optional, for CUDA 13 + Hopper GPUs):
+  pip install --pre flash-attn-4
+  python patch_diffusers_fa4.py
+  DIFFUSERS_ATTN_BACKEND="_flash_4" python run_wan2.2_t2v_a14b_gpu.py
 """
 import argparse
+import os
 import torch
 import time
 from diffusers import AutoencoderKLWan, WanPipeline
@@ -61,10 +67,13 @@ def main():
     if args.output is None:
         args.output = f"output_t2v_a14b_{args.resolution.lower()}.mp4"
 
+    # Report attention backend
+    attn_backend = os.environ.get("DIFFUSERS_ATTN_BACKEND", "native (PyTorch SDPA)")
     print(f"Resolution: {args.resolution} ({height}x{width})")
     print(f"Frames: {args.num_frames}, Steps: {args.num_inference_steps}")
     print(f"Guidance: {args.guidance_scale} (high-noise), {args.guidance_scale_2} (low-noise)")
     print(f"Offload: {args.offload}")
+    print(f"Attention backend: {attn_backend}")
 
     print("\nLoading pipeline...")
     t0 = time.time()
