@@ -43,6 +43,7 @@ import operator
 from neuronx_distributed import ModelBuilder, NxDParallelState
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.mappings import (
+    gather_from_tensor_model_parallel_region_with_dim,
     reduce_from_tensor_model_parallel_region,
 )
 from safetensors.torch import save_file
@@ -107,22 +108,34 @@ class RowParallelConv3d(nn.Module):
 
 
 class ColumnRowParallelConv3d(nn.Module):
-    """sharded input -> sharded output (no communication)."""
+    """sharded input -> sharded output.
+
+    allgather=True: all-gather input for correct cross-channel conv.
+      Weight: (out/tp, in_full, k, k, k). Exact but needs large scratchpad.
+    allgather=False: group conv approximation (no communication).
+      Weight: (out/tp, in/tp, k, k, k). Approximate but memory-efficient.
+    """
     def __init__(self, in_channels_full, out_channels_full, kernel_size, stride=1, padding=0,
-                 bias=True, tp_degree=1, causal_padding=None):
+                 bias=True, tp_degree=1, causal_padding=None, allgather=True):
         super().__init__()
         self.tp_degree = tp_degree
-        self.sharded_in = in_channels_full // tp_degree
+        self.in_channels_full = in_channels_full
         self.sharded_out = out_channels_full // tp_degree
         self._causal_padding = causal_padding
+        self.allgather = allgather
 
-        self.conv = nn.Conv3d(self.sharded_in, self.sharded_out,
+        in_ch = in_channels_full if allgather else in_channels_full // tp_degree
+        self.conv = nn.Conv3d(in_ch, self.sharded_out,
                               kernel_size=kernel_size, stride=stride,
                               padding=(0, 0, 0), bias=bias)
 
     def forward(self, x, cache_x=None):
+        if self.allgather:
+            x = gather_from_tensor_model_parallel_region_with_dim(x, 1)
         padding = list(self._causal_padding) if self._causal_padding else [0]*6
         if cache_x is not None and padding[4] > 0:
+            if self.allgather:
+                cache_x = gather_from_tensor_model_parallel_region_with_dim(cache_x, 1)
             x = torch.cat([cache_x, x], dim=2)
             padding[4] -= cache_x.shape[2]
         x = F.pad(x, padding)
@@ -130,18 +143,26 @@ class ColumnRowParallelConv3d(nn.Module):
 
 
 class ColumnRowParallelConv2d(nn.Module):
-    """sharded input -> sharded output for 2D conv (no communication)."""
+    """sharded input -> sharded output for 2D conv.
+
+    allgather=True: all-gather for correctness. allgather=False: group conv approx.
+    """
     def __init__(self, in_channels_full, out_channels_full, kernel_size, stride=1,
-                 padding=0, bias=True, tp_degree=1):
+                 padding=0, bias=True, tp_degree=1, allgather=True):
         super().__init__()
         self.tp_degree = tp_degree
-        self.sharded_in = in_channels_full // tp_degree
+        self.in_channels_full = in_channels_full
         self.sharded_out = out_channels_full // tp_degree
-        self.conv = nn.Conv2d(self.sharded_in, self.sharded_out,
+        self.allgather = allgather
+
+        in_ch = in_channels_full if allgather else in_channels_full // tp_degree
+        self.conv = nn.Conv2d(in_ch, self.sharded_out,
                               kernel_size=kernel_size, stride=stride,
                               padding=padding, bias=bias)
 
     def forward(self, x):
+        if self.allgather:
+            x = gather_from_tensor_model_parallel_region_with_dim(x, 1)
         return self.conv(x)
 
 
@@ -212,7 +233,7 @@ class ShardedWanAttentionBlock(nn.Module):
 class ShardedWanResidualBlock(nn.Module):
     """Residual block with sharded convolutions and feat_cache support."""
     def __init__(self, in_dim_full, out_dim_full, tp_degree, in_causal_pad, out_causal_pad,
-                 shortcut_causal_pad=None):
+                 shortcut_causal_pad=None, allgather=True):
         super().__init__()
         self.tp_degree = tp_degree
         self.nonlinearity = nn.SiLU()
@@ -221,16 +242,16 @@ class ShardedWanResidualBlock(nn.Module):
         self.norm1 = ShardedWanRMSNorm(in_dim_full, tp_degree, images=False)
         self.conv1 = ColumnRowParallelConv3d(
             in_dim_full, out_dim_full, kernel_size=3, bias=True,
-            tp_degree=tp_degree, causal_padding=in_causal_pad)
+            tp_degree=tp_degree, causal_padding=in_causal_pad, allgather=allgather)
         self.norm2 = ShardedWanRMSNorm(out_dim_full, tp_degree, images=False)
         self.conv2 = ColumnRowParallelConv3d(
             out_dim_full, out_dim_full, kernel_size=3, bias=True,
-            tp_degree=tp_degree, causal_padding=out_causal_pad)
+            tp_degree=tp_degree, causal_padding=out_causal_pad, allgather=allgather)
 
         if in_dim_full != out_dim_full:
             self.conv_shortcut = ColumnRowParallelConv3d(
-                in_dim_full, out_dim_full, kernel_size=1, bias=False,
-                tp_degree=tp_degree, causal_padding=shortcut_causal_pad)
+                in_dim_full, out_dim_full, kernel_size=1, bias=True,
+                tp_degree=tp_degree, causal_padding=shortcut_causal_pad, allgather=allgather)
         else:
             self.conv_shortcut = nn.Identity()
 
@@ -272,7 +293,8 @@ class ShardedWanUpsample(nn.Module):
 
 class ShardedWanResample(nn.Module):
     """Sharded upsampler with feat_cache support."""
-    def __init__(self, dim_full, mode, tp_degree, upsample_out_dim_full=None):
+    def __init__(self, dim_full, mode, tp_degree, upsample_out_dim_full=None,
+                 allgather_time=True, allgather_spatial=True):
         super().__init__()
         self.tp_degree = tp_degree
         self.mode = mode
@@ -283,14 +305,14 @@ class ShardedWanResample(nn.Module):
             self.spatial_upsample = ShardedWanUpsample(scale_factor=(2.0, 2.0))
             self.spatial_conv = ColumnRowParallelConv2d(
                 dim_full, upsample_out_dim_full, kernel_size=3, padding=1,
-                bias=True, tp_degree=tp_degree)
+                bias=True, tp_degree=tp_degree, allgather=allgather_spatial)
 
         if mode == "upsample3d":
             # time_conv: dim -> dim*2 (both sharded)
             causal_pad = (0, 0, 0, 0, 2, 0)  # WanCausalConv3d with kernel=(3,1,1), padding=(1,0,0)
             self.time_conv = ColumnRowParallelConv3d(
                 dim_full, dim_full * 2, kernel_size=(3, 1, 1), bias=True,
-                tp_degree=tp_degree, causal_padding=causal_pad)
+                tp_degree=tp_degree, causal_padding=causal_pad, allgather=allgather_time)
         else:
             self.time_conv = None
 
@@ -383,7 +405,8 @@ class ShardedWanMidBlock(nn.Module):
 
 class ShardedWanResidualUpBlock(nn.Module):
     def __init__(self, in_dim_full, out_dim_full, tp_degree,
-                 upsample_mode=None, temporal_upsample=False):
+                 upsample_mode=None, temporal_upsample=False,
+                 allgather_resnets=True, allgather_time=True, allgather_spatial=True):
         super().__init__()
         self.tp_degree = tp_degree
 
@@ -396,14 +419,17 @@ class ShardedWanResidualUpBlock(nn.Module):
                 ShardedWanResidualBlock(
                     current_dim, out_dim_full, tp_degree,
                     CAUSAL_PAD_3, CAUSAL_PAD_3,
-                    shortcut_causal_pad=shortcut_pad if current_dim != out_dim_full else None)
+                    shortcut_causal_pad=shortcut_pad if current_dim != out_dim_full else None,
+                    allgather=allgather_resnets)
             )
             current_dim = out_dim_full
 
         if upsample_mode is not None:
             self.upsampler = ShardedWanResample(
                 out_dim_full, upsample_mode, tp_degree,
-                upsample_out_dim_full=out_dim_full)
+                upsample_out_dim_full=out_dim_full,
+                allgather_time=allgather_time,
+                allgather_spatial=allgather_spatial)
         else:
             self.upsampler = None
 
@@ -447,20 +473,24 @@ class ShardedWanDecoder(nn.Module):
         # mid_block: sharded 1024
         self.mid_block = ShardedWanMidBlock(1024, tp_degree)
 
-        # up_blocks
-        # up_block_0: 1024->1024, upsample3d (temporal=True)
-        # up_block_1: 1024->1024, upsample3d (temporal=True)
-        # up_block_2: 1024->512,  upsample2d (temporal=False)
-        # up_block_3: 512->256,   no upsample
+        # up_blocks - allgather for early blocks (small spatial), group conv for later (large spatial)
+        # up_block_0: 1024->1024, upsample3d — small spatial, allgather everywhere
+        # up_block_1: 1024->1024, upsample3d — allgather resnets+time, skip spatial (too large after temporal 2x)
+        # up_block_2: 1024->512,  upsample2d — large spatial, no allgather
+        # up_block_3: 512->256,   no upsample — largest spatial, no allgather
         self.up_blocks = nn.ModuleList([
             ShardedWanResidualUpBlock(1024, 1024, tp_degree,
-                                     upsample_mode="upsample3d", temporal_upsample=True),
+                                     upsample_mode="upsample3d", temporal_upsample=True,
+                                     allgather_resnets=True, allgather_time=True, allgather_spatial=True),
             ShardedWanResidualUpBlock(1024, 1024, tp_degree,
-                                     upsample_mode="upsample3d", temporal_upsample=True),
+                                     upsample_mode="upsample3d", temporal_upsample=True,
+                                     allgather_resnets=True, allgather_time=True, allgather_spatial=False),
             ShardedWanResidualUpBlock(1024, 512, tp_degree,
-                                     upsample_mode="upsample2d", temporal_upsample=False),
+                                     upsample_mode="upsample2d", temporal_upsample=False,
+                                     allgather_resnets=False, allgather_time=False, allgather_spatial=False),
             ShardedWanResidualUpBlock(512, 256, tp_degree,
-                                     upsample_mode=None),
+                                     upsample_mode=None,
+                                     allgather_resnets=False),
         ])
 
         # norm_out + conv_out: sharded 256 -> full 12
@@ -611,7 +641,13 @@ def create_sharded_checkpoint(original_decoder, wrapper, tp_degree, rank, dtype=
 
     # Helper: shard conv3d weight/bias
     def shard_conv(prefix_sharded, prefix_orig, shard_type):
-        """shard_type: 'column' (out), 'row' (in), 'column_row' (both), 'none'"""
+        """shard_type:
+        'column': shard output dim only (ColumnParallel)
+        'row': shard input dim only (RowParallel)
+        'column_row': shard output only, input all-gathered at runtime (allgather=True)
+        'column_row_grouped': shard both dims, group conv approx (allgather=False)
+        'none': no sharding
+        """
         w = orig_sd[f"{prefix_orig}.weight"].to(dtype)
         key_w = f"{prefix_sharded}.conv.weight"
         if shard_type == "column":
@@ -619,6 +655,10 @@ def create_sharded_checkpoint(original_decoder, wrapper, tp_degree, rank, dtype=
         elif shard_type == "row":
             sharded_sd[key_w] = _shard(w, 1, tp_degree, rank)
         elif shard_type == "column_row":
+            # allgather=True: shard output only, input all-gathered at runtime
+            sharded_sd[key_w] = _shard(w, 0, tp_degree, rank)
+        elif shard_type == "column_row_grouped":
+            # allgather=False: shard both dims (group conv approximation)
             sharded_sd[key_w] = _shard(_shard(w, 0, tp_degree, rank), 1, tp_degree, rank)
         else:
             sharded_sd[key_w] = w
@@ -627,7 +667,7 @@ def create_sharded_checkpoint(original_decoder, wrapper, tp_degree, rank, dtype=
         bias_key_sharded = f"{prefix_sharded}.conv.bias"
         if bias_key_orig in orig_sd and bias_key_sharded in sharded_sd:
             b = orig_sd[bias_key_orig].to(dtype)
-            if shard_type in ("column", "column_row"):
+            if shard_type in ("column", "column_row", "column_row_grouped"):
                 sharded_sd[bias_key_sharded] = _shard(b, 0, tp_degree, rank)
             elif shard_type == "row":
                 sharded_sd[bias_key_sharded] = b / tp_degree
@@ -639,6 +679,8 @@ def create_sharded_checkpoint(original_decoder, wrapper, tp_degree, rank, dtype=
         w = orig_sd[f"{prefix_orig}.weight"].to(dtype)
         key_w = f"{prefix_sharded}.conv.weight"
         if shard_type == "column_row":
+            sharded_sd[key_w] = _shard(w, 0, tp_degree, rank)
+        elif shard_type == "column_row_grouped":
             sharded_sd[key_w] = _shard(_shard(w, 0, tp_degree, rank), 1, tp_degree, rank)
         else:
             sharded_sd[key_w] = w
@@ -647,7 +689,7 @@ def create_sharded_checkpoint(original_decoder, wrapper, tp_degree, rank, dtype=
         bias_key_sharded = f"{prefix_sharded}.conv.bias"
         if bias_key_orig in orig_sd and bias_key_sharded in sharded_sd:
             b = orig_sd[bias_key_orig].to(dtype)
-            if shard_type == "column_row":
+            if shard_type in ("column_row", "column_row_grouped"):
                 sharded_sd[bias_key_sharded] = _shard(b, 0, tp_degree, rank)
             else:
                 sharded_sd[bias_key_sharded] = b
@@ -666,14 +708,14 @@ def create_sharded_checkpoint(original_decoder, wrapper, tp_degree, rank, dtype=
             sharded_sd[f"{prefix_sharded}.{sub}.bias"] = _shard(b, 0, tp_degree, rank)
         shard_norm(f"{prefix_sharded}.norm", f"{prefix_orig}.norm")
 
-    def shard_resblock(prefix_sharded, prefix_orig, in_dim, out_dim):
+    def shard_resblock(prefix_sharded, prefix_orig, in_dim, out_dim, shard_type="column_row"):
         """Shard a WanResidualBlock."""
         shard_norm(f"{prefix_sharded}.norm1", f"{prefix_orig}.norm1")
-        shard_conv(f"{prefix_sharded}.conv1", f"{prefix_orig}.conv1", "column_row")
+        shard_conv(f"{prefix_sharded}.conv1", f"{prefix_orig}.conv1", shard_type)
         shard_norm(f"{prefix_sharded}.norm2", f"{prefix_orig}.norm2")
-        shard_conv(f"{prefix_sharded}.conv2", f"{prefix_orig}.conv2", "column_row")
+        shard_conv(f"{prefix_sharded}.conv2", f"{prefix_orig}.conv2", shard_type)
         if in_dim != out_dim:
-            shard_conv(f"{prefix_sharded}.conv_shortcut", f"{prefix_orig}.conv_shortcut", "column_row")
+            shard_conv(f"{prefix_sharded}.conv_shortcut", f"{prefix_orig}.conv_shortcut", shard_type)
 
     # --- conv_in: ColumnParallel ---
     shard_conv("decoder.conv_in", "conv_in", "column")
@@ -684,29 +726,34 @@ def create_sharded_checkpoint(original_decoder, wrapper, tp_degree, rank, dtype=
     shard_attn("decoder.mid_block.attentions.0", "mid_block.attentions.0")
 
     # --- up_blocks ---
+    # Hybrid allgather strategy: allgather for small spatial (early blocks),
+    # grouped conv for large spatial (later blocks) to avoid OOM.
+    # column_row = allgather (correct but memory-intensive)
+    # column_row_grouped = shard both dims (approximation but memory-safe)
     block_configs = [
-        (1024, 1024, True),   # up_block_0: has upsampler (upsample3d)
-        (1024, 1024, True),   # up_block_1: has upsampler (upsample3d)
-        (1024, 512, True),    # up_block_2: has upsampler (upsample2d)
-        (512, 256, False),    # up_block_3: no upsampler
+        # (in_dim, out_dim, has_upsample, resnet_shard, time_shard, spatial_shard)
+        (1024, 1024, True, "column_row", "column_row", "column_row"),           # up_block_0: all allgather
+        (1024, 1024, True, "column_row", "column_row", "column_row_grouped"),   # up_block_1: spatial grouped
+        (1024, 512, True, "column_row_grouped", "column_row_grouped", "column_row_grouped"),  # up_block_2: all grouped
+        (512, 256, False, "column_row_grouped", None, None),                     # up_block_3: all grouped
     ]
 
-    for bi, (in_dim, out_dim, has_upsample) in enumerate(block_configs):
+    for bi, (in_dim, out_dim, has_upsample, resnet_shard, time_shard, spatial_shard) in enumerate(block_configs):
         sp = f"decoder.up_blocks.{bi}"
         op = f"up_blocks.{bi}"
 
         current_dim = in_dim
         for ri in range(3):
-            shard_resblock(f"{sp}.resnets.{ri}", f"{op}.resnets.{ri}", current_dim, out_dim)
+            shard_resblock(f"{sp}.resnets.{ri}", f"{op}.resnets.{ri}", current_dim, out_dim, resnet_shard)
             current_dim = out_dim
 
         if has_upsample:
             # upsampler resample Conv2d
-            shard_conv2d(f"{sp}.upsampler.spatial_conv", f"{op}.upsampler.resample.1", "column_row")
+            shard_conv2d(f"{sp}.upsampler.spatial_conv", f"{op}.upsampler.resample.1", spatial_shard)
             # upsampler time_conv (upsample3d only)
             time_conv_key = f"{op}.upsampler.time_conv.weight"
             if time_conv_key in orig_sd:
-                shard_conv(f"{sp}.upsampler.time_conv", f"{op}.upsampler.time_conv", "column_row")
+                shard_conv(f"{sp}.upsampler.time_conv", f"{op}.upsampler.time_conv", time_shard)
 
     # --- norm_out ---
     shard_norm("decoder.norm_out", "norm_out")
