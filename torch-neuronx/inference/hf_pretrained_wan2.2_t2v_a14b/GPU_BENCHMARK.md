@@ -39,14 +39,14 @@ Aligned with the [official Wan2.2 repo](https://github.com/Wan-Video/Wan2.2) and
 
 ## H100 Benchmark Results
 
-| Resolution | Official (FA3) | Our Script (SDPA) | Our Script (FA4) | Gap (SDPA) |
-|------------|---------------|-------------------|-------------------|------------|
-| 480P | 326.9s / 41.3GB | 342.8s | TBD | +4.9% |
-| 720P | 1041.5s / 59.8GB | 1118.4s | TBD | +7.4% |
+| Resolution | Official (FA3) | Our Script (SDPA) | Our Script (FA4) |
+|------------|---------------|-------------------|-------------------|
+| 480P | 326.9s / 41.3GB | 342.8s (+4.9%) | **277.7s (-15.0%)** |
+| 720P | 1041.5s / 59.8GB | 1118.4s (+7.4%) | TBD |
 
 - **Official**: from [Wan2.2 repo](https://github.com/Wan-Video/Wan2.2) `comp_effic.png`, single H100, `--offload_model True --convert_model_dtype`, FlashAttention3
 - **SDPA**: PyTorch `scaled_dot_product_attention` (no flash-attn installed), CUDA 13.0, PyTorch 2.9.1+cu130
-- **FA4**: flash-attn-4 (CuTeDSL), pending results
+- **FA4**: flash-attn-4 4.0.0b4 (CuTeDSL), CUDA 13.0, PyTorch 2.9.1+cu130, `DIFFUSERS_ATTN_BACKEND="_flash_4"`
 
 ## Official Wan2.2 Performance Table (All GPUs)
 
