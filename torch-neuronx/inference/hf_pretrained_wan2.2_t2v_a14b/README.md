@@ -27,10 +27,10 @@ Wan2.2-T2V-A14B is a **Mixture-of-Experts (MoE)** text-to-video diffusion model 
 
 1. **Text Encoding** (Neuron): Encode prompt with Neuron-compiled UMT5 text encoder (TP=4)
    - Also supports CPU fallback via `--cpu_text_encoder` flag
-2. **Denoising** (Neuron): 50 steps with MoE transformer switching
-   - Steps 1-16: transformer_1 (high-noise expert)
+2. **Denoising** (Neuron): 40 steps with MoE transformer switching
+   - Steps 1-13: transformer_1 (high-noise expert, guidance_scale=4.0)
    - Weight swap via `replace_weights()`
-   - Steps 17-50: transformer_2 (low-noise expert)
+   - Steps 14-40: transformer_2 (low-noise expert, guidance_scale_2=3.0)
 3. **VAE Decode** (Neuron): Chunked decoder with rolling feat_cache for flicker-free output
    - Auto-detects rolling cache (`decoder_rolling/`) or NoCache (`decoder_nocache/`) mode
 
@@ -38,11 +38,11 @@ Wan2.2-T2V-A14B is a **Mixture-of-Experts (MoE)** text-to-video diffusion model 
 
 | Phase | Time |
 |-------|------|
-| Text Encoding (Neuron) | ~14s (0.2s inference + 13s model load) |
+| Text Encoding (Neuron) | ~14s (0.4s inference + 12s model load) |
 | Text Encoding (CPU) | ~16s |
-| Denoising (50 steps + MoE swap) | ~547s |
-| VAE Decode (rolling cache) | ~44s (25s decode + 18s model load) |
-| **Total** | **~612s** |
+| Denoising (40 steps + MoE swap) | ~465s |
+| VAE Decode (rolling cache) | ~45s (24s decode + 18s model load) |
+| **Inference time** | **~525s** |
 
 ## Prerequisites
 
@@ -100,8 +100,9 @@ The script auto-patches `nearest-exact` → `nearest` in diffusers for Trainium2
 --height                  Video height (default: 480)
 --width                   Video width (default: 832)
 --num_frames              Number of frames (default: 81)
---num_inference_steps     Denoising steps (default: 50)
---guidance_scale          CFG guidance scale (default: 5.0)
+--num_inference_steps     Denoising steps (default: 40)
+--guidance_scale          High-noise guidance scale (default: 4.0)
+--guidance_scale_2        Low-noise guidance scale (default: 3.0)
 --prompt                  Text prompt
 --negative_prompt         Negative prompt
 --output                  Output video path (default: output_t2v_a14b.mp4)

@@ -11,13 +11,13 @@ Architecture:
 - Both transformers share the SAME compiled NEFF (identical architecture)
 - MoE weight swap uses NxDModel.replace_weights() (no unload/reload needed)
 - Staged pipeline:
-  Phase 1: Text Encoder → encode prompt → unload
-  Phase 2: Load 1 NxDModel → high-noise steps → replace_weights → low-noise steps
-  Phase 3: Decoder + PostQuantConv → decode latents → save video
+  Phase 1: Text Encoder -> encode prompt -> unload
+  Phase 2: Load 1 NxDModel -> high-noise steps -> replace_weights -> low-noise steps
+  Phase 3: PostQuantConv + Decoder -> decode latents -> save video
 
 Usage:
-    python run_wan2.2_t2v_a14b.py \
-        --compiled_models_dir /opt/dlami/nvme/compiled_models_t2v_a14b \
+    python run_wan2.2_t2v_a14b.py \\
+        --compiled_models_dir /opt/dlami/nvme/compiled_models_t2v_a14b \\
         --prompt "A cat walking on the grass"
 """
 # IMPORTANT: Set environment variables BEFORE any imports
@@ -110,7 +110,6 @@ def load_duplicated_weights(model_path, world_size):
 
 
 def prepare_cp_checkpoints(tp_checkpoints, tp_degree, cp_degree):
-    world_size = tp_degree * cp_degree
     sharded_checkpoints = []
     for cp_rank in range(cp_degree):
         for tp_rank in range(tp_degree):
@@ -144,29 +143,28 @@ def phase_text_encoding_cpu(pipe, seqlen, prompt, negative_prompt):
 
 
 def phase_text_encoding_neuron(pipe, compiled_models_dir, seqlen, prompt, negative_prompt):
-    """
-    Encode prompt using Neuron-compiled text encoder (TI2V pattern).
+    """Encode prompt using Neuron-compiled text encoder (load -> run -> unload).
 
-    Uses InferenceTextEncoderWrapperV2 to wrap NxDModel and replaces
-    pipe.text_encoder, then calls pipe.encode_prompt() which handles
-    tokenization and attention mask application correctly.
+    Uses InferenceTextEncoderWrapperV2 to wrap NxDModel and temporarily replaces
+    pipe.text_encoder, then calls pipe.encode_prompt() which handles tokenization
+    and attention mask application correctly.
     """
     te_path = f"{compiled_models_dir}/text_encoder"
     te_config = load_model_config(te_path)
     te_tp_degree = te_config["tp_degree"]
     te_world_size = te_config["world_size"]
 
-    # Step 1: Create wrapper (TI2V pattern)
+    # Create wrapper
     text_encoder_wrapper = InferenceTextEncoderWrapperV2(
         torch.bfloat16, pipe.text_encoder, seqlen
     )
 
-    # Step 2: Load NxDModel (no start_rank/local_ranks_size, like TI2V)
+    # Load NxDModel
     print(f"Loading text encoder (TP={te_tp_degree}, world_size={te_world_size})...")
     t0 = time.time()
     te_nxd = NxDModel.load(os.path.join(te_path, "nxd_model.pt"))
 
-    # Step 3: Load weights with prepare_cp_checkpoints (like TI2V)
+    # Load weights (with CP expansion if needed)
     tp_checkpoints = load_sharded_weights(te_path, te_tp_degree)
     if te_world_size > te_tp_degree:
         cp_degree = te_world_size // te_tp_degree
@@ -178,14 +176,12 @@ def phase_text_encoding_neuron(pipe, compiled_models_dir, seqlen, prompt, negati
     te_nxd.to_neuron()
     print(f"  Text encoder loaded in {time.time() - t0:.1f}s")
 
-    # Step 4: Replace wrapper's encoder with NxDModel (like TI2V)
+    # Replace pipe's text encoder with NxDModel wrapper
     text_encoder_wrapper.t = te_nxd
-
-    # Step 5: Replace pipe's text encoder (like TI2V)
     original_text_encoder = pipe.text_encoder
     pipe.text_encoder = text_encoder_wrapper
 
-    # Step 6: Use pipe.encode_prompt (handles tokenization + mask correctly)
+    # Run encoding via pipe.encode_prompt (handles tokenization + mask correctly)
     t_enc = time.time()
     prompt_embeds, negative_prompt_embeds = pipe.encode_prompt(
         prompt=prompt,
@@ -198,17 +194,18 @@ def phase_text_encoding_neuron(pipe, compiled_models_dir, seqlen, prompt, negati
     print(f"  prompt_embeds: {prompt_embeds.shape}, negative: {negative_prompt_embeds.shape}")
     print(f"  Text encoding done in {time.time() - t_enc:.1f}s (load: {t_enc - t0:.1f}s)")
 
-    # Step 7: Restore and clean up
+    # Restore and clean up
     pipe.text_encoder = original_text_encoder
     del te_nxd, tp_checkpoints, checkpoints, text_encoder_wrapper
     gc.collect()
+    print(f"  Text encoder unloaded")
 
     return prompt_embeds, negative_prompt_embeds
 
 
 def phase_text_encoding(pipe, compiled_models_dir, seqlen, prompt, negative_prompt,
-                        use_neuron=False):
-    """Encode prompt. Uses CPU by default, Neuron with --neuron_text_encoder flag."""
+                        use_neuron=True):
+    """Encode prompt. Uses Neuron by default, CPU with --cpu_text_encoder."""
     print("\n" + "="*60)
     mode = "Neuron" if use_neuron else "CPU"
     print(f"PHASE 1: Text Encoding ({mode})")
@@ -410,7 +407,7 @@ def phase_denoising(pipe, compiled_models_dir, prompt_embeds, negative_prompt_em
 
         print(f"Low-noise phase done. {remaining_steps} steps in {time.time() - t0:.1f}s")
 
-    # Cleanup
+    # Cleanup transformer (free ~23.9GB/NC of HBM)
     del nxd_model, t2_weights
     gc.collect()
 
@@ -421,14 +418,13 @@ def phase_denoising(pipe, compiled_models_dir, prompt_embeds, negative_prompt_em
 # Phase 3: VAE Decoding (Neuron)
 # ============================================================
 def phase_vae_decode(pipe, compiled_models_dir, latents, num_frames=81):
-    """
-    Decode latents using compiled Neuron VAE (post_quant_conv + chunked decoder).
+    """Decode latents using compiled Neuron VAE (post_quant_conv + chunked decoder).
 
     Pipeline:
     1. Denormalize latents using VAE config (latents_mean/latents_std)
     2. Run Neuron post_quant_conv on full latent volume (float32, all 21 frames)
     3. Run Neuron decoder in chunks of decoder_frames (default 2) latent frames
-       Each chunk produces decoder_frames × 4 video frames (4× temporal upsample)
+       Each chunk produces decoder_frames x 4 video frames (4x temporal upsample)
     4. Concatenate and trim to expected frame count
 
     Decoder modes (auto-detected based on compiled model):
@@ -440,30 +436,21 @@ def phase_vae_decode(pipe, compiled_models_dir, latents, num_frames=81):
     print("PHASE 3: VAE Decoding (Neuron)")
     print("="*60)
 
-    # Load VAE config for denormalization constants
-    model_id = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
-    vae = AutoencoderKLWan.from_pretrained(
-        model_id, subfolder="vae", torch_dtype=torch.float32,
-        cache_dir=HUGGINGFACE_CACHE_DIR,
-    )
-
-    # Denormalize latents
+    # Denormalize latents using pipe's VAE config (already loaded in memory)
+    vae_config = pipe.vae.config
     latents = latents.to(torch.float32)
     latents_mean = (
-        torch.tensor(vae.config.latents_mean)
-        .view(1, vae.config.z_dim, 1, 1, 1)
+        torch.tensor(vae_config.latents_mean)
+        .view(1, vae_config.z_dim, 1, 1, 1)
         .to(latents.device, latents.dtype)
     )
-    latents_std = 1.0 / torch.tensor(vae.config.latents_std).view(
-        1, vae.config.z_dim, 1, 1, 1
+    latents_std = 1.0 / torch.tensor(vae_config.latents_std).view(
+        1, vae_config.z_dim, 1, 1, 1
     ).to(latents.device, latents.dtype)
     latents = latents / latents_std + latents_mean
     print(f"Denormalized latents: {latents.shape}, range=[{latents.min():.3f}, {latents.max():.3f}]")
 
-    del vae
-    gc.collect()
-
-    # ---- Step 1: Load and run Neuron post_quant_conv ----
+    # ---- Load and run post_quant_conv ----
     pqc_path = f"{compiled_models_dir}/post_quant_conv"
     pqc_config = load_model_config(pqc_path)
     pqc_world_size = pqc_config["world_size"]
@@ -490,7 +477,7 @@ def phase_vae_decode(pipe, compiled_models_dir, latents, num_frames=81):
     del pqc_nxd, pqc_weights
     gc.collect()
 
-    # ---- Step 2: Load and run Neuron decoder ----
+    # ---- Load and run decoder ----
     # Try rolling cache first (flicker-free), fall back to nocache
     rolling_path = f"{compiled_models_dir}/decoder_rolling"
     nocache_path = f"{compiled_models_dir}/decoder_nocache"
@@ -621,11 +608,13 @@ def main(args):
     compiled_models_dir = args.compiled_models_dir
     seqlen = args.max_sequence_length
 
+    inference_start = time.time()
+
     # Phase 1: Text Encoding
     t1_start = time.time()
     prompt_embeds, negative_prompt_embeds = phase_text_encoding(
         pipe, compiled_models_dir, seqlen, args.prompt, args.negative_prompt,
-        use_neuron=args.neuron_text_encoder,
+        use_neuron=not args.cpu_text_encoder,
     )
     t1_time = time.time() - t1_start
 
@@ -649,7 +638,9 @@ def main(args):
     video = phase_vae_decode(pipe, compiled_models_dir, latents, num_frames=args.num_frames)
     t3_time = time.time() - t3_start
 
-    # Save video - video is numpy float [0,1] shape [F, H, W, C]
+    inference_time = time.time() - inference_start
+
+    # Export video
     output_path = args.output
     frames = [video[i] for i in range(video.shape[0])]
     print(f"Exporting {len(frames)} frames, shape={frames[0].shape}, dtype={frames[0].dtype}")
@@ -662,7 +653,8 @@ def main(args):
     print(f"  Phase 1 - Text Encoding:  {t1_time:.1f}s")
     print(f"  Phase 2 - Denoising:      {t2_time:.1f}s")
     print(f"  Phase 3 - VAE Decode:     {t3_time:.1f}s")
-    print(f"  Total (incl. loading):    {total_time:.1f}s")
+    print(f"  Inference time:           {inference_time:.1f}s")
+    print(f"  Total (incl. pipeline):   {total_time:.1f}s")
     print(f"{'='*60}")
 
 
@@ -685,6 +677,5 @@ if __name__ == "__main__":
     parser.add_argument("--cpu_text_encoder", action="store_true",
                         help="Use CPU text encoder instead of Neuron (slower but more stable)")
     args = parser.parse_args()
-    args.neuron_text_encoder = not args.cpu_text_encoder
 
     main(args)
