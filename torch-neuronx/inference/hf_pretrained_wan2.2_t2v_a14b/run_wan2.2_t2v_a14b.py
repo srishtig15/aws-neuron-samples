@@ -293,7 +293,8 @@ def phase_denoising(pipe, compiled_models_dir, prompt_embeds, negative_prompt_em
 
     # MoE boundary
     boundary_timestep = 0.875 * 1000  # 875.0
-    guidance_scale = args.guidance_scale
+    guidance_scale_high = args.guidance_scale    # high-noise expert (transformer_1)
+    guidance_scale_low = args.guidance_scale_2   # low-noise expert (transformer_2)
 
     # Determine switch point
     switch_idx = None
@@ -359,7 +360,7 @@ def phase_denoising(pipe, compiled_models_dir, prompt_embeds, negative_prompt_em
         noise_uncond = run_transformer_step(nxd_model, latent_input, ts, negative_prompt_embeds,
                                              rotary_emb_cos, rotary_emb_sin)
         # CFG in float32 to reduce accumulated precision errors
-        noise_pred = noise_uncond.float() + guidance_scale * (noise_pred.float() - noise_uncond.float())
+        noise_pred = noise_uncond.float() + guidance_scale_high * (noise_pred.float() - noise_uncond.float())
 
         latents = pipe.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
         elapsed = time.time() - t0
@@ -398,7 +399,7 @@ def phase_denoising(pipe, compiled_models_dir, prompt_embeds, negative_prompt_em
             noise_uncond = run_transformer_step(nxd_model, latent_input, ts, negative_prompt_embeds,
                                                  rotary_emb_cos, rotary_emb_sin)
             # CFG in float32 to reduce accumulated precision errors
-            noise_pred = noise_uncond.float() + guidance_scale * (noise_pred.float() - noise_uncond.float())
+            noise_pred = noise_uncond.float() + guidance_scale_low * (noise_pred.float() - noise_uncond.float())
 
             latents = pipe.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
@@ -652,7 +653,7 @@ def main(args):
     output_path = args.output
     frames = [video[i] for i in range(video.shape[0])]
     print(f"Exporting {len(frames)} frames, shape={frames[0].shape}, dtype={frames[0].dtype}")
-    export_to_video(frames, output_path, fps=24)
+    export_to_video(frames, output_path, fps=16)
 
     total_time = time.time() - total_start
     print(f"\n{'='*60}")
@@ -672,8 +673,11 @@ if __name__ == "__main__":
     parser.add_argument("--width", type=int, default=832)
     parser.add_argument("--num_frames", type=int, default=81)
     parser.add_argument("--max_sequence_length", type=int, default=512)
-    parser.add_argument("--num_inference_steps", type=int, default=50)
-    parser.add_argument("--guidance_scale", type=float, default=5.0)
+    parser.add_argument("--num_inference_steps", type=int, default=40)
+    parser.add_argument("--guidance_scale", type=float, default=4.0,
+                        help="High-noise guidance scale (transformer_1)")
+    parser.add_argument("--guidance_scale_2", type=float, default=3.0,
+                        help="Low-noise guidance scale (transformer_2)")
     parser.add_argument("--prompt", type=str, default="A cat walks on the grass, realistic")
     parser.add_argument("--negative_prompt", type=str,
                         default="Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards")
