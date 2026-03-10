@@ -143,7 +143,7 @@ def main(args):
     print(f"Output frames: {len(output)}")
 
     # Save video
-    export_to_video(output, args.output, fps=24)
+    export_to_video(output, args.output, fps=args.fps)
     print(f"Video saved: {args.output}")
 
     # Print machine-readable result line
@@ -161,6 +161,7 @@ if __name__ == "__main__":
     parser.add_argument("--guidance_scale", type=float, default=5.0)
     parser.add_argument("--max_sequence_length", type=int, default=512)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--fps", type=int, default=16)
     parser.add_argument("--output", type=str, default="output_gpu.mp4")
     parser.add_argument("--do_warmup", action="store_true")
     args = parser.parse_args()
@@ -196,6 +197,7 @@ for config in "${CONFIGS[@]}"; do
         --guidance_scale ${GUIDANCE_SCALE} \
         --max_sequence_length ${MAX_SEQ_LEN} \
         --seed ${SEED} \
+        --fps ${FPS} \
         --output "${OUTPUT_FILE}" \
         ${WARMUP_FLAG} 2>&1 | tee "${LOG_FILE}"; then
 

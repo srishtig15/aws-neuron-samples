@@ -187,6 +187,12 @@ def compile_decoder_rolling(args):
 
         print("Compiling...")
         compile_args = "--model-type=unet-inference -O1 --auto-cast=none"
+        if args.max_instruction_limit:
+            # Raise instruction count limit in both hlo2penguin (NeuronHloVerifier)
+            # and walrus backend to allow large Conv3D decoders
+            compile_args += f" --internal-hlo2tensorizer-options='--tiled-inst-limit={args.max_instruction_limit}'"
+            compile_args += f" --internal-backend-options='--max-instruction-limit={args.max_instruction_limit}'"
+            print(f"  Max instruction limit: {args.max_instruction_limit}")
         traced = builder.compile(
             compiler_args=compile_args,
             compiler_workdir=args.compiler_workdir,
@@ -238,6 +244,8 @@ if __name__ == "__main__":
     parser.add_argument("--compiled_models_dir", type=str, default="compiled_models")
     parser.add_argument("--compiler_workdir", type=str, default="compiler_workdir")
     parser.add_argument("--cache_dir", type=str, default="/opt/dlami/nvme/wan2.2_ti2v_hf_cache_dir")
+    parser.add_argument("--max_instruction_limit", type=int, default=None,
+                        help="Override max instruction limit (default: compiler default ~5M)")
     args = parser.parse_args()
 
     compile_decoder_rolling(args)

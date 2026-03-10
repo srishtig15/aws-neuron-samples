@@ -18,9 +18,9 @@ Architecture (Wan2.2-TI2V-5B VAE decoder):
   norm_out:   256               (ShardedRMSNorm)
   conv_out:   256 -> 12         (RowParallel, all-reduce)
 
-Hybrid TP strategy:
-  - Blocks 0-1 (1024ch, small spatial): allgather for exact computation.
-  - Blocks 2-3 (512/256ch, large spatial): group conv (memory-constrained).
+All blocks use allgather for exact computation (no quality loss).
+Suitable for resolutions up to 640x480. For 720P+, allgather buffers
+exceed available HBM — use non-TP decoder or CPU fallback instead.
 Cache tensors have sharded channel dimensions (except conv_in cache = 48 ch).
 """
 import os
@@ -503,19 +503,17 @@ class ShardedWanDecoder(nn.Module):
         # mid_block: sharded 1024
         self.mid_block = ShardedWanMidBlock(1024, tp_degree)
 
-        # up_blocks - hybrid TP strategy based on memory constraints:
-        # 1. allgather (exact): gather full input → conv(in_full, out/tp). Best quality.
-        # 2. group conv (approx): conv(in/tp, out/tp). No communication, fits any memory.
+        # up_blocks - all allgather for exact computation.
+        # Each conv gathers full input: conv(in_full, out/tp). Mathematically exact.
         #
-        # Memory analysis (1280x704, decoder_frames=2, TP=4):
-        #   up_block_0: spatial 44x80,  T=2  → allgather ~231 MB ✓
-        #   up_block_1: spatial 88x160, T=4  → allgather ~924 MB ✓
-        #   up_block_2: spatial 176x320, T=8 → allgather would need ~3.7 GB ✗ → group conv
-        #   up_block_3: spatial 352x640, T=8 → allgather would need ~7.4 GB ✗ → group conv
+        # Memory analysis (640x480, decoder_frames=2, TP=4):
+        #   up_block_0: spatial 30x40,  T=2  → allgather ~5 MB ✓
+        #   up_block_1: spatial 60x80,  T=4  → allgather ~39 MB ✓
+        #   up_block_2: spatial 120x160, T=8 → allgather ~314 MB ✓
+        #   up_block_3: spatial 240x320, T=8 → allgather ~629 MB ✓
         #
-        # Blocks 0-1 (1024ch, early pipeline) are exact via allgather.
-        # Blocks 2-3 (512/256ch, late pipeline) use group conv — acceptable quality
-        # trade-off since these blocks refine high-res details with fewer channels.
+        # Note: For 720P (1280x704), blocks 2-3 allgather buffers exceed available
+        # HBM (~3.7-7.4 GB). Use non-TP decoder or CPU fallback for 720P.
         self.up_blocks = nn.ModuleList([
             ShardedWanResidualUpBlock(1024, 1024, tp_degree,
                                      upsample_mode="upsample3d", temporal_upsample=True,
@@ -525,10 +523,10 @@ class ShardedWanDecoder(nn.Module):
                                      allgather_resnets=True, allgather_time=True, allgather_spatial=True),
             ShardedWanResidualUpBlock(1024, 512, tp_degree,
                                      upsample_mode="upsample2d", temporal_upsample=False,
-                                     allgather_resnets=False, allgather_spatial=False),
+                                     allgather_resnets=True, allgather_spatial=True),
             ShardedWanResidualUpBlock(512, 256, tp_degree,
                                      upsample_mode=None,
-                                     allgather_resnets=False),
+                                     allgather_resnets=True),
         ])
 
         # norm_out + conv_out: sharded 256 -> full 12
@@ -772,15 +770,14 @@ def create_sharded_checkpoint(original_decoder, wrapper, tp_degree, rank, dtype=
     shard_attn("decoder.mid_block.attentions.0", "mid_block.attentions.0")
 
     # --- up_blocks ---
-    # Hybrid strategy: allgather for small spatial (exact), group conv for large spatial.
-    # column_row = allgather input (shard output only in weight)
-    # column_row_grouped = shard both dims (group conv approximation, no communication)
+    # All blocks use allgather (column_row) for exact computation.
+    # column_row = allgather input, shard output only in weight. Exact.
     block_configs = [
         # (in_dim, out_dim, has_upsample, resnet_shard, time_shard, spatial_shard)
-        (1024, 1024, True, "column_row", "column_row", "column_row"),           # up_block_0: allgather
-        (1024, 1024, True, "column_row", "column_row", "column_row"),           # up_block_1: allgather
-        (1024, 512, True, "column_row_grouped", None, "column_row_grouped"),    # up_block_2: group conv
-        (512, 256, False, "column_row_grouped", None, None),                     # up_block_3: group conv
+        (1024, 1024, True, "column_row", "column_row", "column_row"),           # up_block_0
+        (1024, 1024, True, "column_row", "column_row", "column_row"),           # up_block_1
+        (1024, 512, True, "column_row", None, "column_row"),                     # up_block_2
+        (512, 256, False, "column_row", None, None),                             # up_block_3
     ]
 
     for bi, (in_dim, out_dim, has_upsample, resnet_shard, time_shard, spatial_shard) in enumerate(block_configs):

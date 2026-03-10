@@ -648,7 +648,7 @@ def main(args):
 
     # Save video
     output_path = args.output
-    export_to_video(output, output_path, fps=24)
+    export_to_video(output, output_path, fps=args.fps)
     print(f"\nVideo saved to: {output_path}")
 
 
@@ -668,6 +668,7 @@ if __name__ == "__main__":
                         help="Negative prompt")
     parser.add_argument("--image", type=str, default=None, help="Input image for I2V (omit for T2V)")
     parser.add_argument("--output", type=str, default="output_v3_cp.mp4", help="Output video path")
+    parser.add_argument("--fps", type=int, default=16, help="Output video FPS (default: 16)")
     parser.add_argument("--force_v1_decoder", action="store_true", help="Force use V1 decoder (faster)")
     args = parser.parse_args()
 

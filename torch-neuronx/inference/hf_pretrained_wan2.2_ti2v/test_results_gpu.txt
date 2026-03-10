@@ -1,0 +1,13 @@
+Wan2.2 TI2V GPU Benchmark Results
+GPU: NVIDIA H100 80GB HBM3
+Date: Tue Mar 10 05:23:10 UTC 2026
+Steps: 50, Guidance: 5.0, Seed: 42
+==========================================
+Resolution   FPS      Frames   Warmup(s)    Inference(s) Status    
+----------------------------------------------------------
+512x384      16       81       17.34        16.13        ok        
+512x384      24       121      24.86        24.48        ok        
+640x480      16       81       26.42        26.06        ok        
+640x480      24       121      39.96        39.67        ok        
+1280x704     16       81       88.07        87.66        ok        
+1280x704     24       121      143.80       143.20       ok        
