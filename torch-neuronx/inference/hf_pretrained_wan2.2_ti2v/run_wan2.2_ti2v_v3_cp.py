@@ -540,6 +540,26 @@ def main(args):
     if not use_cpu_decoder:
         pipe.vae.decoder = vae_decoder_wrapper
         pipe.vae.post_quant_conv = vae_post_quant_conv_wrapper
+
+        # Override _decode to use rolling-cache decode_latents directly,
+        # bypassing diffusers' per-frame loop which causes cache pollution.
+        if hasattr(vae_decoder_wrapper, 'decode_latents'):
+            original_post_quant_conv = pipe.vae.post_quant_conv
+            vae_config = pipe.vae.config
+            def _decode_override(z, return_dict=True):
+                from diffusers.models.autoencoders.vae import DecoderOutput
+                from diffusers.models.autoencoders.autoencoder_kl_wan import unpatchify
+                vae_decoder_wrapper.reset_cache()
+                x = original_post_quant_conv(z)
+                out = vae_decoder_wrapper.decode_latents(x)
+                if vae_config.patch_size is not None:
+                    out = unpatchify(out, patch_size=vae_config.patch_size)
+                out = torch.clamp(out, min=-1.0, max=1.0)
+                if not return_dict:
+                    return (out,)
+                return DecoderOutput(sample=out)
+            pipe.vae._decode = _decode_override
+            print("VAE _decode overridden to use rolling-cache decode_latents directly.")
     else:
         print("VAE decoder/post_quant_conv: using original CPU pipeline (no replacement)")
 

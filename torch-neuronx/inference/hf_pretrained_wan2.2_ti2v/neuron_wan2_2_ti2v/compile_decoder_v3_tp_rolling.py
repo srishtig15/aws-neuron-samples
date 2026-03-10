@@ -18,7 +18,9 @@ Architecture (Wan2.2-TI2V-5B VAE decoder):
   norm_out:   256               (ShardedRMSNorm)
   conv_out:   256 -> 12         (RowParallel, all-reduce)
 
-All internal activations stay sharded. Only conv_out gathers via all-reduce.
+Hybrid TP strategy:
+  - Blocks 0-1 (1024ch, small spatial): allgather for exact computation.
+  - Blocks 2-3 (512/256ch, large spatial): group conv (memory-constrained).
 Cache tensors have sharded channel dimensions (except conv_in cache = 48 ch).
 """
 import os
@@ -45,6 +47,7 @@ from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.mappings import (
     gather_from_tensor_model_parallel_region_with_dim,
     reduce_from_tensor_model_parallel_region,
+    reduce_scatter_to_tensor_model_parallel_region_with_dim,
 )
 from safetensors.torch import save_file
 
@@ -110,22 +113,28 @@ class RowParallelConv3d(nn.Module):
 class ColumnRowParallelConv3d(nn.Module):
     """sharded input -> sharded output.
 
-    allgather=True: all-gather input for correct cross-channel conv.
-      Weight: (out/tp, in_full, k, k, k). Exact but needs large scratchpad.
-    allgather=False: group conv approximation (no communication).
-      Weight: (out/tp, in/tp, k, k, k). Approximate but memory-efficient.
+    allgather=True: all-gather input, conv with (out/tp, in_full) weight.
+      Exact. Scratchpad = gathered input tensor.
+    reduce_scatter=True: conv with (out_full, in/tp) weight, reduce-scatter output.
+      Exact. Scratchpad = full output tensor (before scatter).
+    Both False: group conv approximation (no communication).
+      Weight: (out/tp, in/tp). Approximate — loses cross-channel info.
     """
     def __init__(self, in_channels_full, out_channels_full, kernel_size, stride=1, padding=0,
-                 bias=True, tp_degree=1, causal_padding=None, allgather=True):
+                 bias=True, tp_degree=1, causal_padding=None,
+                 allgather=True, reduce_scatter=False):
         super().__init__()
         self.tp_degree = tp_degree
         self.in_channels_full = in_channels_full
+        self.out_channels_full = out_channels_full
         self.sharded_out = out_channels_full // tp_degree
         self._causal_padding = causal_padding
         self.allgather = allgather
+        self.reduce_scatter = reduce_scatter
 
         in_ch = in_channels_full if allgather else in_channels_full // tp_degree
-        self.conv = nn.Conv3d(in_ch, self.sharded_out,
+        out_ch = out_channels_full if reduce_scatter else out_channels_full // tp_degree
+        self.conv = nn.Conv3d(in_ch, out_ch,
                               kernel_size=kernel_size, stride=stride,
                               padding=(0, 0, 0), bias=bias)
 
@@ -139,31 +148,43 @@ class ColumnRowParallelConv3d(nn.Module):
             x = torch.cat([cache_x, x], dim=2)
             padding[4] -= cache_x.shape[2]
         x = F.pad(x, padding)
-        return self.conv(x)
+        output = self.conv(x)
+        if self.reduce_scatter:
+            output = reduce_scatter_to_tensor_model_parallel_region_with_dim(output, 1)
+        return output
 
 
 class ColumnRowParallelConv2d(nn.Module):
     """sharded input -> sharded output for 2D conv.
 
-    allgather=True: all-gather for correctness. allgather=False: group conv approx.
+    allgather=True: all-gather input for correctness.
+    reduce_scatter=True: conv with (out_full, in/tp), reduce-scatter output. Exact.
+    Both False: group conv approximation.
     """
     def __init__(self, in_channels_full, out_channels_full, kernel_size, stride=1,
-                 padding=0, bias=True, tp_degree=1, allgather=True):
+                 padding=0, bias=True, tp_degree=1,
+                 allgather=True, reduce_scatter=False):
         super().__init__()
         self.tp_degree = tp_degree
         self.in_channels_full = in_channels_full
+        self.out_channels_full = out_channels_full
         self.sharded_out = out_channels_full // tp_degree
         self.allgather = allgather
+        self.reduce_scatter = reduce_scatter
 
         in_ch = in_channels_full if allgather else in_channels_full // tp_degree
-        self.conv = nn.Conv2d(in_ch, self.sharded_out,
+        out_ch = out_channels_full if reduce_scatter else out_channels_full // tp_degree
+        self.conv = nn.Conv2d(in_ch, out_ch,
                               kernel_size=kernel_size, stride=stride,
                               padding=padding, bias=bias)
 
     def forward(self, x):
         if self.allgather:
             x = gather_from_tensor_model_parallel_region_with_dim(x, 1)
-        return self.conv(x)
+        output = self.conv(x)
+        if self.reduce_scatter:
+            output = reduce_scatter_to_tensor_model_parallel_region_with_dim(output, 1)
+        return output
 
 
 # ============================================================================
@@ -233,7 +254,7 @@ class ShardedWanAttentionBlock(nn.Module):
 class ShardedWanResidualBlock(nn.Module):
     """Residual block with sharded convolutions and feat_cache support."""
     def __init__(self, in_dim_full, out_dim_full, tp_degree, in_causal_pad, out_causal_pad,
-                 shortcut_causal_pad=None, allgather=True):
+                 shortcut_causal_pad=None, allgather=True, reduce_scatter=False):
         super().__init__()
         self.tp_degree = tp_degree
         self.nonlinearity = nn.SiLU()
@@ -242,16 +263,19 @@ class ShardedWanResidualBlock(nn.Module):
         self.norm1 = ShardedWanRMSNorm(in_dim_full, tp_degree, images=False)
         self.conv1 = ColumnRowParallelConv3d(
             in_dim_full, out_dim_full, kernel_size=3, bias=True,
-            tp_degree=tp_degree, causal_padding=in_causal_pad, allgather=allgather)
+            tp_degree=tp_degree, causal_padding=in_causal_pad,
+            allgather=allgather, reduce_scatter=reduce_scatter)
         self.norm2 = ShardedWanRMSNorm(out_dim_full, tp_degree, images=False)
         self.conv2 = ColumnRowParallelConv3d(
             out_dim_full, out_dim_full, kernel_size=3, bias=True,
-            tp_degree=tp_degree, causal_padding=out_causal_pad, allgather=allgather)
+            tp_degree=tp_degree, causal_padding=out_causal_pad,
+            allgather=allgather, reduce_scatter=reduce_scatter)
 
         if in_dim_full != out_dim_full:
             self.conv_shortcut = ColumnRowParallelConv3d(
                 in_dim_full, out_dim_full, kernel_size=1, bias=True,
-                tp_degree=tp_degree, causal_padding=shortcut_causal_pad, allgather=allgather)
+                tp_degree=tp_degree, causal_padding=shortcut_causal_pad,
+                allgather=allgather, reduce_scatter=reduce_scatter)
         else:
             self.conv_shortcut = nn.Identity()
 
@@ -294,7 +318,8 @@ class ShardedWanUpsample(nn.Module):
 class ShardedWanResample(nn.Module):
     """Sharded upsampler with feat_cache support."""
     def __init__(self, dim_full, mode, tp_degree, upsample_out_dim_full=None,
-                 allgather_time=True, allgather_spatial=True):
+                 allgather_time=True, allgather_spatial=True,
+                 rs_time=False, rs_spatial=False):
         super().__init__()
         self.tp_degree = tp_degree
         self.mode = mode
@@ -305,14 +330,16 @@ class ShardedWanResample(nn.Module):
             self.spatial_upsample = ShardedWanUpsample(scale_factor=(2.0, 2.0))
             self.spatial_conv = ColumnRowParallelConv2d(
                 dim_full, upsample_out_dim_full, kernel_size=3, padding=1,
-                bias=True, tp_degree=tp_degree, allgather=allgather_spatial)
+                bias=True, tp_degree=tp_degree,
+                allgather=allgather_spatial, reduce_scatter=rs_spatial)
 
         if mode == "upsample3d":
             # time_conv: dim -> dim*2 (both sharded)
             causal_pad = (0, 0, 0, 0, 2, 0)  # WanCausalConv3d with kernel=(3,1,1), padding=(1,0,0)
             self.time_conv = ColumnRowParallelConv3d(
                 dim_full, dim_full * 2, kernel_size=(3, 1, 1), bias=True,
-                tp_degree=tp_degree, causal_padding=causal_pad, allgather=allgather_time)
+                tp_degree=tp_degree, causal_padding=causal_pad,
+                allgather=allgather_time, reduce_scatter=rs_time)
         else:
             self.time_conv = None
 
@@ -406,7 +433,8 @@ class ShardedWanMidBlock(nn.Module):
 class ShardedWanResidualUpBlock(nn.Module):
     def __init__(self, in_dim_full, out_dim_full, tp_degree,
                  upsample_mode=None, temporal_upsample=False,
-                 allgather_resnets=True, allgather_time=True, allgather_spatial=True):
+                 allgather_resnets=True, allgather_time=True, allgather_spatial=True,
+                 rs_resnets=False, rs_time=False, rs_spatial=False):
         super().__init__()
         self.tp_degree = tp_degree
 
@@ -420,7 +448,7 @@ class ShardedWanResidualUpBlock(nn.Module):
                     current_dim, out_dim_full, tp_degree,
                     CAUSAL_PAD_3, CAUSAL_PAD_3,
                     shortcut_causal_pad=shortcut_pad if current_dim != out_dim_full else None,
-                    allgather=allgather_resnets)
+                    allgather=allgather_resnets, reduce_scatter=rs_resnets)
             )
             current_dim = out_dim_full
 
@@ -429,7 +457,9 @@ class ShardedWanResidualUpBlock(nn.Module):
                 out_dim_full, upsample_mode, tp_degree,
                 upsample_out_dim_full=out_dim_full,
                 allgather_time=allgather_time,
-                allgather_spatial=allgather_spatial)
+                allgather_spatial=allgather_spatial,
+                rs_time=rs_time,
+                rs_spatial=rs_spatial)
         else:
             self.upsampler = None
 
@@ -473,21 +503,29 @@ class ShardedWanDecoder(nn.Module):
         # mid_block: sharded 1024
         self.mid_block = ShardedWanMidBlock(1024, tp_degree)
 
-        # up_blocks - allgather for early blocks (small spatial), group conv for later (large spatial)
-        # up_block_0: 1024->1024, upsample3d — small spatial, allgather everywhere
-        # up_block_1: 1024->1024, upsample3d — allgather resnets+time, skip spatial (too large after temporal 2x)
-        # up_block_2: 1024->512,  upsample2d — large spatial, no allgather
-        # up_block_3: 512->256,   no upsample — largest spatial, no allgather
+        # up_blocks - hybrid TP strategy based on memory constraints:
+        # 1. allgather (exact): gather full input → conv(in_full, out/tp). Best quality.
+        # 2. group conv (approx): conv(in/tp, out/tp). No communication, fits any memory.
+        #
+        # Memory analysis (1280x704, decoder_frames=2, TP=4):
+        #   up_block_0: spatial 44x80,  T=2  → allgather ~231 MB ✓
+        #   up_block_1: spatial 88x160, T=4  → allgather ~924 MB ✓
+        #   up_block_2: spatial 176x320, T=8 → allgather would need ~3.7 GB ✗ → group conv
+        #   up_block_3: spatial 352x640, T=8 → allgather would need ~7.4 GB ✗ → group conv
+        #
+        # Blocks 0-1 (1024ch, early pipeline) are exact via allgather.
+        # Blocks 2-3 (512/256ch, late pipeline) use group conv — acceptable quality
+        # trade-off since these blocks refine high-res details with fewer channels.
         self.up_blocks = nn.ModuleList([
             ShardedWanResidualUpBlock(1024, 1024, tp_degree,
                                      upsample_mode="upsample3d", temporal_upsample=True,
                                      allgather_resnets=True, allgather_time=True, allgather_spatial=True),
             ShardedWanResidualUpBlock(1024, 1024, tp_degree,
                                      upsample_mode="upsample3d", temporal_upsample=True,
-                                     allgather_resnets=True, allgather_time=True, allgather_spatial=False),
+                                     allgather_resnets=True, allgather_time=True, allgather_spatial=True),
             ShardedWanResidualUpBlock(1024, 512, tp_degree,
                                      upsample_mode="upsample2d", temporal_upsample=False,
-                                     allgather_resnets=False, allgather_time=False, allgather_spatial=False),
+                                     allgather_resnets=False, allgather_spatial=False),
             ShardedWanResidualUpBlock(512, 256, tp_degree,
                                      upsample_mode=None,
                                      allgather_resnets=False),
@@ -646,19 +684,21 @@ def create_sharded_checkpoint(original_decoder, wrapper, tp_degree, rank, dtype=
         'row': shard input dim only (RowParallel)
         'column_row': shard output only, input all-gathered at runtime (allgather=True)
         'column_row_grouped': shard both dims, group conv approx (allgather=False)
+        'reduce_scatter': shard input only, reduce-scatter output (exact)
         'none': no sharding
         """
         w = orig_sd[f"{prefix_orig}.weight"].to(dtype)
         key_w = f"{prefix_sharded}.conv.weight"
         if shard_type == "column":
             sharded_sd[key_w] = _shard(w, 0, tp_degree, rank)
-        elif shard_type == "row":
+        elif shard_type in ("row", "reduce_scatter"):
+            # shard input dim only: (O_full, C/tp, ...)
             sharded_sd[key_w] = _shard(w, 1, tp_degree, rank)
         elif shard_type == "column_row":
             # allgather=True: shard output only, input all-gathered at runtime
             sharded_sd[key_w] = _shard(w, 0, tp_degree, rank)
         elif shard_type == "column_row_grouped":
-            # allgather=False: shard both dims (group conv approximation)
+            # shard both dims (group conv approximation)
             sharded_sd[key_w] = _shard(_shard(w, 0, tp_degree, rank), 1, tp_degree, rank)
         else:
             sharded_sd[key_w] = w
@@ -669,7 +709,8 @@ def create_sharded_checkpoint(original_decoder, wrapper, tp_degree, rank, dtype=
             b = orig_sd[bias_key_orig].to(dtype)
             if shard_type in ("column", "column_row", "column_row_grouped"):
                 sharded_sd[bias_key_sharded] = _shard(b, 0, tp_degree, rank)
-            elif shard_type == "row":
+            elif shard_type in ("row", "reduce_scatter"):
+                # reduce sums bias across ranks, so divide by tp. Bias is full-size.
                 sharded_sd[bias_key_sharded] = b / tp_degree
             else:
                 sharded_sd[bias_key_sharded] = b
@@ -682,6 +723,9 @@ def create_sharded_checkpoint(original_decoder, wrapper, tp_degree, rank, dtype=
             sharded_sd[key_w] = _shard(w, 0, tp_degree, rank)
         elif shard_type == "column_row_grouped":
             sharded_sd[key_w] = _shard(_shard(w, 0, tp_degree, rank), 1, tp_degree, rank)
+        elif shard_type == "reduce_scatter":
+            # shard input dim only: (O_full, C/tp, ...)
+            sharded_sd[key_w] = _shard(w, 1, tp_degree, rank)
         else:
             sharded_sd[key_w] = w
 
@@ -691,6 +735,8 @@ def create_sharded_checkpoint(original_decoder, wrapper, tp_degree, rank, dtype=
             b = orig_sd[bias_key_orig].to(dtype)
             if shard_type in ("column_row", "column_row_grouped"):
                 sharded_sd[bias_key_sharded] = _shard(b, 0, tp_degree, rank)
+            elif shard_type == "reduce_scatter":
+                sharded_sd[bias_key_sharded] = b / tp_degree
             else:
                 sharded_sd[bias_key_sharded] = b
 
@@ -726,16 +772,15 @@ def create_sharded_checkpoint(original_decoder, wrapper, tp_degree, rank, dtype=
     shard_attn("decoder.mid_block.attentions.0", "mid_block.attentions.0")
 
     # --- up_blocks ---
-    # Hybrid allgather strategy: allgather for small spatial (early blocks),
-    # grouped conv for large spatial (later blocks) to avoid OOM.
-    # column_row = allgather (correct but memory-intensive)
-    # column_row_grouped = shard both dims (approximation but memory-safe)
+    # Hybrid strategy: allgather for small spatial (exact), group conv for large spatial.
+    # column_row = allgather input (shard output only in weight)
+    # column_row_grouped = shard both dims (group conv approximation, no communication)
     block_configs = [
         # (in_dim, out_dim, has_upsample, resnet_shard, time_shard, spatial_shard)
-        (1024, 1024, True, "column_row", "column_row", "column_row"),           # up_block_0: all allgather
-        (1024, 1024, True, "column_row", "column_row", "column_row_grouped"),   # up_block_1: spatial grouped
-        (1024, 512, True, "column_row_grouped", "column_row_grouped", "column_row_grouped"),  # up_block_2: all grouped
-        (512, 256, False, "column_row_grouped", None, None),                     # up_block_3: all grouped
+        (1024, 1024, True, "column_row", "column_row", "column_row"),           # up_block_0: allgather
+        (1024, 1024, True, "column_row", "column_row", "column_row"),           # up_block_1: allgather
+        (1024, 512, True, "column_row_grouped", None, "column_row_grouped"),    # up_block_2: group conv
+        (512, 256, False, "column_row_grouped", None, None),                     # up_block_3: group conv
     ]
 
     for bi, (in_dim, out_dim, has_upsample, resnet_shard, time_shard, spatial_shard) in enumerate(block_configs):

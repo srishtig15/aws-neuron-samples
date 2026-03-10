@@ -860,8 +860,9 @@ class DecoderWrapperV3TPRolling(nn.Module):
     """
     Wrapper for TP + Rolling Cache compiled decoder.
 
-    Like DecoderWrapperV3Rolling but loads sharded weights per TP rank
-    instead of duplicated weights. Cache tensors have sharded channel dims.
+    Accumulates latent frames from diffusers' per-frame _decode loop and
+    processes them in chunks of decoder_frames to avoid cache pollution
+    from padded/repeated frames.
     """
 
     def __init__(self, original_decoder, decoder_frames=2, tp_degree=4):
@@ -871,6 +872,11 @@ class DecoderWrapperV3TPRolling(nn.Module):
         self.tp_degree = tp_degree
         self.nxd_model = None
         self.caches = None
+        # Frame accumulation buffer for batching
+        self._frame_buffer = []
+        self._output_buffer = []
+        self._total_frames = None
+        self._first_chunk = False
 
     def _init_caches(self, x):
         """Initialize rolling cache tensors (zeros) based on input spatial dims."""
@@ -892,50 +898,112 @@ class DecoderWrapperV3TPRolling(nn.Module):
         self.caches = [torch.zeros(s, dtype=torch.bfloat16) for s in cache_shapes]
         self.num_cache_tensors = len(cache_shapes)
 
-    def forward(self, x, **kwargs):
-        if 'feat_cache' not in kwargs:
-            return self.original_decoder(x)
-
-        _t0 = time.time()
-
-        original_frame_count = x.shape[2]
-
-        if x.shape[2] < self.decoder_frames:
-            pad_frames = self.decoder_frames - x.shape[2]
-            x = torch.cat([x] + [x[:, :, -1:]] * pad_frames, dim=2)
-
-        x_bf16 = x.to(torch.bfloat16)
-
-        if self.caches is None:
-            self._init_caches(x_bf16)
-
-        _t1 = time.time()
-
+    def _run_chunk(self, chunk_latent):
+        """Run one chunk through the NxD model and return video output."""
+        x_bf16 = chunk_latent.to(torch.bfloat16)
         results = self.nxd_model(x_bf16, *self.caches)
-
-        _t2 = time.time()
-
         if isinstance(results, (tuple, list)):
             output = results[0]
             self.caches = [r.to(torch.bfloat16) for r in results[1:1 + self.num_cache_tensors]]
         else:
             output = results
-
         if isinstance(output, (list, tuple)):
             output = output[0]
-        output = output.to(torch.float32)
+        return output.to(torch.float32)
 
-        output_frames = original_frame_count * 4
-        if output.shape[2] > output_frames:
-            output = output[:, :, :output_frames]
+    def forward(self, x, **kwargs):
+        if 'feat_cache' not in kwargs:
+            return self.original_decoder(x)
 
-        _t3 = time.time()
-        print(f"[tp_rolling] prep={_t1-_t0:.4f}s nxd={_t2-_t1:.4f}s post={_t3-_t2:.4f}s total={_t3-_t0:.4f}s frames={original_frame_count}")
+        first_chunk = kwargs.get('first_chunk', False)
 
-        return output
+        # On first_chunk, reset state and note we're accumulating
+        if first_chunk:
+            self._frame_buffer = []
+            self._output_buffer = []
+            self._first_chunk = True
+
+        # Accumulate this frame (diffusers sends 1 latent frame at a time)
+        self._frame_buffer.append(x)
+
+        # Check if we have enough frames to run a chunk
+        if len(self._frame_buffer) >= self.decoder_frames:
+            chunk = torch.cat(self._frame_buffer[:self.decoder_frames], dim=2)
+            self._frame_buffer = self._frame_buffer[self.decoder_frames:]
+
+            if self.caches is None:
+                self._init_caches(chunk)
+
+            _t0 = time.time()
+            output = self._run_chunk(chunk)
+            _t1 = time.time()
+            print(f"[tp_rolling] chunk nxd={_t1-_t0:.4f}s out_shape={output.shape}")
+
+            self._output_buffer.append(output)
+
+            # Return the video frames for this chunk's latent frames
+            # Each latent frame -> 4 video frames (2x temporal upsample twice)
+            return output
+        else:
+            # Not enough frames yet, return empty placeholder
+            # diffusers concatenates outputs, so return 0-frame tensor
+            return torch.zeros(x.shape[0], 3, 0, 1, 1, device=x.device, dtype=torch.float32)
+
+    def decode_latents(self, z):
+        """
+        Decode all latent frames at once, bypassing diffusers' per-frame loop.
+        This is the preferred entry point for correct rolling cache behavior.
+
+        Args:
+            z: latent tensor of shape (B, C, T, H, W) after post_quant_conv
+        Returns:
+            video tensor of shape (B, 3, T*4, H*8, W*8)
+        """
+        _t_start = time.time()
+        num_latent_frames = z.shape[2]
+
+        if self.caches is None:
+            self._init_caches(z)
+
+        outputs = []
+        i = 0
+        chunk_idx = 0
+        while i < num_latent_frames:
+            end = min(i + self.decoder_frames, num_latent_frames)
+            chunk = z[:, :, i:end]
+
+            # Pad last chunk if needed
+            actual_frames = chunk.shape[2]
+            if actual_frames < self.decoder_frames:
+                pad_frames = self.decoder_frames - actual_frames
+                chunk = torch.cat([chunk] + [chunk[:, :, -1:]] * pad_frames, dim=2)
+
+            _t0 = time.time()
+            output = self._run_chunk(chunk)
+            _t1 = time.time()
+
+            # Only keep frames for actual (non-padded) latent frames
+            output_frames = actual_frames * 4  # 2x temporal upsample twice
+            if output.shape[2] > output_frames:
+                output = output[:, :, :output_frames]
+
+            outputs.append(output)
+            print(f"[tp_rolling] chunk {chunk_idx}: latent_frames={actual_frames} "
+                  f"nxd={_t1-_t0:.4f}s out={output.shape}")
+            chunk_idx += 1
+            i = end
+
+        result = torch.cat(outputs, dim=2)
+        _t_end = time.time()
+        print(f"[tp_rolling] total: {num_latent_frames} latent frames -> "
+              f"{result.shape[2]} video frames in {_t_end-_t_start:.2f}s "
+              f"({chunk_idx} chunks)")
+        return result
 
     def reset_cache(self):
         self.caches = None
+        self._frame_buffer = []
+        self._output_buffer = []
 
     def clear_cache(self):
         self.reset_cache()

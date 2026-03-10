@@ -42,12 +42,12 @@ MAX_SEQ_LEN=512
 # Define test configurations: "HEIGHT WIDTH NUM_FRAMES FPS"
 # Wan2.2 frame formula: frames = fps * duration + 1, must satisfy (frames-1) % 4 == 0
 CONFIGS=(
-    # "384 512 81 16"    # 512x384 16fps 5s (81 frames)
-    # "384 512 121 24"   # 512x384 24fps 5s (121 frames)
-    # "480 640 81 16"    # 640x480 16fps 5s
-    # "480 640 121 24"   # 640x480 24fps 5s
+    "384 512 81 16"    # 512x384 16fps 5s (81 frames)
+    "384 512 121 24"   # 512x384 24fps 5s (121 frames)
+    "480 640 81 16"    # 640x480 16fps 5s
+    "480 640 121 24"   # 640x480 24fps 5s
     "704 1280 81 16"   # 1280x704 16fps 5s (720P, 704=22*32)
-    # "704 1280 121 24"  # 1280x704 24fps 5s (720P, 704=22*32)
+    "704 1280 121 24"  # 1280x704 24fps 5s (720P, 704=22*32)
 )
 
 echo "=============================================="
