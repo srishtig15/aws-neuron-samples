@@ -7,32 +7,79 @@ that are selected based on the denoising timestep:
 - transformer_2 (low-noise expert): used when timestep < 875 (~87.5% of steps)
 
 Architecture:
-- TP=4, CP=2 (world_size=8) for each transformer
+- TP=4, CP=N for each transformer (CP auto-detected from compiled model config)
+  - 480P: CP=2 (world_size=8)
+  - 720P: CP=4 (world_size=16)
 - Both transformers share the SAME compiled NEFF (identical architecture)
 - MoE weight swap uses NxDModel.replace_weights() (no unload/reload needed)
 - Staged pipeline:
   Phase 1: Text Encoder -> encode prompt -> unload
   Phase 2: Load 1 NxDModel -> high-noise steps -> replace_weights -> low-noise steps
-  Phase 3: PostQuantConv + Decoder -> decode latents -> save video
+  Phase 3: VAE Decode -> Neuron (chunked) or CPU fallback -> save video
 
 Usage:
+    # 480P (default)
     python run_wan2.2_t2v_a14b.py \\
         --compiled_models_dir /opt/dlami/nvme/compiled_models_t2v_a14b \\
         --prompt "A cat walking on the grass"
+
+    # 720P
+    python run_wan2.2_t2v_a14b.py \\
+        --compiled_models_dir /opt/dlami/nvme/compiled_models_t2v_a14b_720p \\
+        --height 720 --width 1280 \\
+        --prompt "A cat walking on the grass"
 """
-# IMPORTANT: Set environment variables BEFORE any imports
+# IMPORTANT: Set environment variables BEFORE any imports.
+# Auto-detect world_size from compiled transformer config.
+import json
 import os
-os.environ["NEURON_RT_NUM_CORES"] = "8"
-os.environ["LOCAL_WORLD_SIZE"] = "8"
+import sys
+
+def _detect_world_size():
+    """Read world_size from compiled transformer config before Neuron init."""
+    compiled_dir = None
+    for i, arg in enumerate(sys.argv):
+        if arg == "--compiled_models_dir" and i + 1 < len(sys.argv):
+            compiled_dir = sys.argv[i + 1]
+            break
+    if compiled_dir is None:
+        compiled_dir = "/opt/dlami/nvme/compiled_models_t2v_a14b"
+    config_path = os.path.join(compiled_dir, "transformer", "config.json")
+    if os.path.exists(config_path):
+        with open(config_path) as f:
+            return json.load(f)["world_size"]
+    return 8
+
+_world_size = _detect_world_size()
+# On trn2.48xlarge with logical-neuroncore-config=2 (LNC=2):
+#   - NEURON_RT_VIRTUAL_CORE_SIZE=2: each NEC device uses 2 logical NCs (48GB HBM/rank)
+#   - NEURON_RT_NUM_CORES = world_size * 2: number of logical NCs needed
+# IMPORTANT: When world_size differs between models (e.g., text_encoder=8 vs transformer=16),
+# the first model loaded initializes the NRT communicator. Use --cpu_text_encoder for 720P
+# to ensure the transformer (world_size=16) initializes the communicator at the right size.
+_num_cores = _world_size * 2
+os.environ["NEURON_RT_NUM_CORES"] = str(_num_cores)
 os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "2"
-os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2"
+# Pin to specific logical NCs. For 720P (32 cores), use the last 32 cores (32-63)
+# to avoid conflicts with other processes (e.g., vLLM) on the first cores.
+# For 480P (16 cores), use cores 0-15 (default).
+_core_start = int(os.environ.get("NEURON_CORE_START", "0"))
+if _core_start == 0 and _num_cores > 16:
+    # Auto-offset for 720P to avoid conflicts with other processes
+    _core_start = 64 - _num_cores  # e.g., 32 for 720P
+os.environ["NEURON_RT_VISIBLE_CORES"] = f"{_core_start}-{_core_start + _num_cores - 1}"
+# Disable profiler/inspection buffers to free ~124MB/NC for 720P HBM-tight NEFFs
+os.environ.setdefault("NEURON_RT_INSPECT_ENABLE", "0")
+os.environ.setdefault("NEURON_RT_INSPECT_DEVICE_PROFILE", "0")
+os.environ.setdefault("NEURON_RT_INSPECT_SYSTEM_PROFILE", "0")
+os.environ.setdefault("NEURON_RT_PROFILING_MODE", "0")
+print(f"Auto-detected world_size={_world_size}, NEURON_RT_NUM_CORES={_num_cores}, VCS=2, cores={_core_start}-{_core_start + _num_cores - 1}")
 
 from diffusers import AutoencoderKLWan, WanPipeline
 from diffusers.utils import export_to_video
 
 import argparse
 import gc
-import json
 import numpy as np
 import random
 import time
@@ -262,11 +309,93 @@ def run_transformer_step(nxd_model, hidden_states, timestep, encoder_hidden_stat
     return output
 
 
+def _run_denoising_subprocess(phase_label, transformer_path, latents, prompt_embeds,
+                                negative_prompt_embeds, timesteps, step_start, step_end,
+                                guidance_scale, expand_timesteps, mask, scheduler_config,
+                                scheduler_state):
+    """Run a denoising phase in a subprocess for clean HBM lifecycle."""
+    import subprocess
+    import tempfile
+
+    tmpdir = tempfile.mkdtemp(prefix="denoise_")
+    input_path = os.path.join(tmpdir, "input.pt")
+    output_path = os.path.join(tmpdir, "output.pt")
+    env_config_path = os.path.join(tmpdir, "env.json")
+
+    # Save env config for subprocess
+    env_config = {
+        "NEURON_RT_NUM_CORES": os.environ.get("NEURON_RT_NUM_CORES", "32"),
+        "NEURON_RT_VIRTUAL_CORE_SIZE": os.environ.get("NEURON_RT_VIRTUAL_CORE_SIZE", "2"),
+        "NEURON_RT_VISIBLE_CORES": os.environ.get("NEURON_RT_VISIBLE_CORES", "0-31"),
+        "NEURON_RT_INSPECT_ENABLE": "0",
+        "NEURON_RT_INSPECT_DEVICE_PROFILE": "0",
+        "NEURON_RT_INSPECT_SYSTEM_PROFILE": "0",
+        "NEURON_RT_PROFILING_MODE": "0",
+    }
+    with open(env_config_path, "w") as f:
+        json.dump(env_config, f)
+
+    # Save phase input data
+    phase_data = {
+        "latents": latents,
+        "prompt_embeds": prompt_embeds,
+        "negative_prompt_embeds": negative_prompt_embeds,
+        "timesteps": timesteps,
+        "step_start": step_start,
+        "step_end": step_end,
+        "guidance_scale": guidance_scale,
+        "transformer_path": transformer_path,
+        "expand_timesteps": expand_timesteps,
+        "mask": mask,
+        "scheduler_config": scheduler_config,
+    }
+    phase_data.update(scheduler_state)
+    torch.save(phase_data, input_path)
+
+    print(f"\n[Subprocess] Running {phase_label} (steps {step_start}-{step_end-1}) in separate process...")
+    t0 = time.time()
+
+    cwd = os.path.dirname(os.path.abspath(__file__))
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    # Remove Neuron env vars so subprocess sets its own
+    for k in list(env.keys()):
+        if k.startswith("NEURON_RT_") or k == "NEURON_LOGICAL_NC_CONFIG":
+            del env[k]
+    if "PYTHONPATH" not in env:
+        env["PYTHONPATH"] = cwd
+    elif cwd not in env["PYTHONPATH"]:
+        env["PYTHONPATH"] = cwd + ":" + env["PYTHONPATH"]
+
+    result = subprocess.run(
+        [sys.executable, "-m", "neuron_wan2_2_t2v_a14b.denoise_worker",
+         input_path, output_path, env_config_path],
+        cwd=cwd, env=env,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Denoising subprocess for {phase_label} failed with code {result.returncode}")
+
+    # Load output
+    output_data = torch.load(output_path, weights_only=False)
+    elapsed = time.time() - t0
+    print(f"[Subprocess] {phase_label} done in {elapsed:.1f}s (load: {output_data['load_time']:.1f}s, denoise: {output_data['phase_time']:.1f}s)")
+
+    # Cleanup temp files
+    import shutil
+    shutil.rmtree(tmpdir, ignore_errors=True)
+
+    return output_data["latents"], output_data
+
+
 def phase_denoising(pipe, compiled_models_dir, prompt_embeds, negative_prompt_embeds,
                      args, generator=None):
-    """Run the denoising loop with MoE transformer swap using replace_weights()."""
+    """Run the denoising loop with MoE transformer swap.
+
+    For 480P (world_size=8): uses replace_weights() in-process (fast swap).
+    For 720P (world_size>8): runs each phase in a subprocess to ensure clean HBM.
+    """
     print("\n" + "="*60)
-    print("PHASE 2: Denoising (MoE via replace_weights)")
+    print("PHASE 2: Denoising (MoE)")
     print("="*60)
 
     DTYPE = torch.bfloat16
@@ -311,77 +440,88 @@ def phase_denoising(pipe, compiled_models_dir, prompt_embeds, negative_prompt_em
 
     # Load config from transformer_1
     config = load_model_config(transformer_1_path)
-    tp_degree = config["tp_degree"]
-    cp_degree = config["cp_degree"]
     world_size = config["world_size"]
+    hbm_tight = (world_size > 8)  # 720P NEFF uses 23.94/24GB per HBM bank
 
-    # Load RoPE (same for both transformers - same architecture)
-    rope_cache = torch.load(os.path.join(transformer_1_path, "rope_cache.pt"))
-    rotary_emb_cos = rope_cache["rotary_emb_cos"].to(torch.bfloat16)
-    rotary_emb_sin = rope_cache["rotary_emb_sin"].to(torch.bfloat16)
+    if hbm_tight:
+        # ============================================================
+        # SUBPROCESS MODE: Run each phase in a separate process to
+        # ensure clean HBM lifecycle (required for 720P).
+        # ============================================================
+        print(f"\nUsing subprocess mode for HBM-tight NEFFs (world_size={world_size})")
 
-    # Prepare weights for both transformers
-    t1_weights = load_and_prepare_weights(
-        transformer_1_path, pipe.transformer, tp_degree, cp_degree, "transformer_1"
-    )
-    t2_weights = load_and_prepare_weights(
-        transformer_2_path, pipe.transformer_2, tp_degree, cp_degree, "transformer_2"
-    )
+        scheduler_config = dict(pipe.scheduler.config)
+        scheduler_state_initial = {
+            "scheduler_order_list": getattr(pipe.scheduler, 'order_list', None),
+            "scheduler_model_outputs": getattr(pipe.scheduler, 'model_outputs', None),
+            "scheduler_timestep_list": getattr(pipe.scheduler, 'timestep_list', None),
+            "scheduler_lower_order_nums": getattr(pipe.scheduler, 'lower_order_nums', None),
+            "scheduler_sample": getattr(pipe.scheduler, 'sample', None),
+        }
 
-    # Load ONE NxDModel (from transformer_1's NEFF)
-    nxd_model_path = os.path.join(transformer_1_path, "nxd_model.pt")
-    nxd_model = NxDModel.load(nxd_model_path, start_rank=0, local_ranks_size=world_size)
+        # Phase 2a: High-noise steps with transformer_1
+        latents, out1 = _run_denoising_subprocess(
+            "transformer_1 (high-noise)", transformer_1_path,
+            latents, prompt_embeds, negative_prompt_embeds, timesteps,
+            0, switch_idx, guidance_scale_high,
+            pipe.config.expand_timesteps, mask, scheduler_config,
+            scheduler_state_initial,
+        )
 
-    # Initialize with transformer_1 weights
-    print(f"\nLoading NxDModel with transformer_1 weights (TP={tp_degree}, CP={cp_degree})...")
-    nxd_model.set_weights(t1_weights)
-    t0 = time.time()
-    nxd_model.to_neuron()
-    print(f"  NxDModel loaded to NeuronCores in {time.time() - t0:.1f}s")
+        # Phase 2b: Low-noise steps with transformer_2
+        remaining_steps = len(timesteps) - switch_idx
+        if remaining_steps > 0:
+            scheduler_state_after_phase1 = {
+                "scheduler_order_list": out1.get("scheduler_order_list"),
+                "scheduler_model_outputs": out1.get("scheduler_model_outputs"),
+                "scheduler_timestep_list": out1.get("scheduler_timestep_list"),
+                "scheduler_lower_order_nums": out1.get("scheduler_lower_order_nums"),
+                "scheduler_sample": out1.get("scheduler_sample"),
+            }
+            latents, out2 = _run_denoising_subprocess(
+                "transformer_2 (low-noise)", transformer_2_path,
+                latents, prompt_embeds, negative_prompt_embeds, timesteps,
+                switch_idx, len(timesteps), guidance_scale_low,
+                pipe.config.expand_timesteps, mask, scheduler_config,
+                scheduler_state_after_phase1,
+            )
 
-    # ---- Run high-noise steps with transformer_1 weights ----
-    print(f"\nRunning {switch_idx} high-noise denoising steps (transformer_1)...")
-    t0 = time.time()
-    for i in range(switch_idx):
-        t = timesteps[i]
-        latent_input = latents.to(DTYPE)
+    else:
+        # ============================================================
+        # IN-PROCESS MODE: Use replace_weights() for fast MoE swap.
+        # Works for 480P where NEFF has HBM headroom.
+        # ============================================================
+        tp_degree = config["tp_degree"]
+        cp_degree = config["cp_degree"]
 
-        if pipe.config.expand_timesteps:
-            temp_ts = (mask[0][0][:, ::2, ::2] * t).flatten()
-            ts = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
-        else:
-            ts = t.expand(latents.shape[0])
+        # Load RoPE (same for both transformers - same architecture)
+        rope_cache = torch.load(os.path.join(transformer_1_path, "rope_cache.pt"))
+        rotary_emb_cos = rope_cache["rotary_emb_cos"].to(torch.bfloat16)
+        rotary_emb_sin = rope_cache["rotary_emb_sin"].to(torch.bfloat16)
 
-        noise_pred = run_transformer_step(nxd_model, latent_input, ts, prompt_embeds,
-                                           rotary_emb_cos, rotary_emb_sin)
-        noise_uncond = run_transformer_step(nxd_model, latent_input, ts, negative_prompt_embeds,
-                                             rotary_emb_cos, rotary_emb_sin)
-        # CFG in float32 to reduce accumulated precision errors
-        noise_pred = noise_uncond.float() + guidance_scale_high * (noise_pred.float() - noise_uncond.float())
+        # Prepare weights for both transformers
+        t1_weights = load_and_prepare_weights(
+            transformer_1_path, pipe.transformer, tp_degree, cp_degree, "transformer_1"
+        )
+        t2_weights = load_and_prepare_weights(
+            transformer_2_path, pipe.transformer_2, tp_degree, cp_degree, "transformer_2"
+        )
 
-        latents = pipe.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-        elapsed = time.time() - t0
-        print(f"  Step {i+1}/{switch_idx} (t={t.item():.0f}) - {elapsed:.1f}s elapsed")
+        # Load ONE NxDModel (from transformer_1's NEFF)
+        nxd_model_path = os.path.join(transformer_1_path, "nxd_model.pt")
+        nxd_model = NxDModel.load(nxd_model_path, start_rank=0, local_ranks_size=world_size)
 
-    print(f"High-noise phase done. {switch_idx} steps in {time.time() - t0:.1f}s")
-
-    # ---- Swap weights to transformer_2 using replace_weights() ----
-    remaining_steps = len(timesteps) - switch_idx
-    if remaining_steps > 0:
-        print(f"\nSwapping weights to transformer_2 via replace_weights()...")
-        t_swap = time.time()
-        nxd_model.replace_weights(t2_weights)
-        swap_time = time.time() - t_swap
-        print(f"  Weight swap completed in {swap_time:.1f}s")
-
-        # Free transformer_1 weights from CPU
-        del t1_weights
-        gc.collect()
-
-        # ---- Run low-noise steps with transformer_2 weights ----
-        print(f"\nRunning {remaining_steps} low-noise denoising steps (transformer_2)...")
+        # Initialize with transformer_1 weights
+        print(f"\nLoading NxDModel with transformer_1 weights (TP={tp_degree}, CP={cp_degree})...")
+        nxd_model.set_weights(t1_weights)
         t0 = time.time()
-        for i in range(switch_idx, len(timesteps)):
+        nxd_model.to_neuron()
+        print(f"  NxDModel loaded to NeuronCores in {time.time() - t0:.1f}s")
+
+        # ---- Run high-noise steps with transformer_1 weights ----
+        print(f"\nRunning {switch_idx} high-noise denoising steps (transformer_1)...")
+        t0 = time.time()
+        for i in range(switch_idx):
             t = timesteps[i]
             latent_input = latents.to(DTYPE)
 
@@ -395,21 +535,55 @@ def phase_denoising(pipe, compiled_models_dir, prompt_embeds, negative_prompt_em
                                                rotary_emb_cos, rotary_emb_sin)
             noise_uncond = run_transformer_step(nxd_model, latent_input, ts, negative_prompt_embeds,
                                                  rotary_emb_cos, rotary_emb_sin)
-            # CFG in float32 to reduce accumulated precision errors
-            noise_pred = noise_uncond.float() + guidance_scale_low * (noise_pred.float() - noise_uncond.float())
-
+            noise_pred = noise_uncond.float() + guidance_scale_high * (noise_pred.float() - noise_uncond.float())
             latents = pipe.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+            elapsed = time.time() - t0
+            print(f"  Step {i+1}/{switch_idx} (t={t.item():.0f}) - {elapsed:.1f}s elapsed")
 
-            step_num = i - switch_idx + 1
-            if step_num % 10 == 0 or i == len(timesteps) - 1:
-                elapsed = time.time() - t0
-                print(f"  Step {step_num}/{remaining_steps} (t={t.item():.0f}) - {elapsed:.1f}s elapsed")
+        print(f"High-noise phase done. {switch_idx} steps in {time.time() - t0:.1f}s")
 
-        print(f"Low-noise phase done. {remaining_steps} steps in {time.time() - t0:.1f}s")
+        # ---- Swap weights to transformer_2 using replace_weights() ----
+        remaining_steps = len(timesteps) - switch_idx
+        if remaining_steps > 0:
+            print(f"\nSwapping weights to transformer_2 via replace_weights()...")
+            t_swap = time.time()
+            nxd_model.replace_weights(t2_weights)
+            swap_time = time.time() - t_swap
+            print(f"  Weight swap completed in {swap_time:.1f}s")
 
-    # Cleanup transformer (free ~23.9GB/NC of HBM)
-    del nxd_model, t2_weights
-    gc.collect()
+            del t1_weights
+            gc.collect()
+
+            # ---- Run low-noise steps with transformer_2 weights ----
+            print(f"\nRunning {remaining_steps} low-noise denoising steps (transformer_2)...")
+            t0 = time.time()
+            for i in range(switch_idx, len(timesteps)):
+                t = timesteps[i]
+                latent_input = latents.to(DTYPE)
+
+                if pipe.config.expand_timesteps:
+                    temp_ts = (mask[0][0][:, ::2, ::2] * t).flatten()
+                    ts = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
+                else:
+                    ts = t.expand(latents.shape[0])
+
+                noise_pred = run_transformer_step(nxd_model, latent_input, ts, prompt_embeds,
+                                                   rotary_emb_cos, rotary_emb_sin)
+                noise_uncond = run_transformer_step(nxd_model, latent_input, ts, negative_prompt_embeds,
+                                                     rotary_emb_cos, rotary_emb_sin)
+                noise_pred = noise_uncond.float() + guidance_scale_low * (noise_pred.float() - noise_uncond.float())
+                latents = pipe.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+                step_num = i - switch_idx + 1
+                if step_num % 10 == 0 or i == len(timesteps) - 1:
+                    elapsed = time.time() - t0
+                    print(f"  Step {step_num}/{remaining_steps} (t={t.item():.0f}) - {elapsed:.1f}s elapsed")
+
+            print(f"Low-noise phase done. {remaining_steps} steps in {time.time() - t0:.1f}s")
+
+        # Cleanup
+        del nxd_model, t2_weights
+        gc.collect()
 
     return latents
 
@@ -582,6 +756,58 @@ def phase_vae_decode(pipe, compiled_models_dir, latents, num_frames=81):
 
 
 # ============================================================
+# Phase 3 (CPU fallback): VAE Decoding on CPU
+# ============================================================
+def phase_vae_decode_cpu(pipe, latents, num_frames=81):
+    """Decode latents using CPU VAE (fallback when Neuron decoder not available).
+
+    Uses pipe.vae.decode() which handles post_quant_conv + decoder internally.
+    Slower than Neuron but works for any resolution without compilation.
+    """
+    print("\n" + "="*60)
+    print("PHASE 3: VAE Decoding (CPU fallback)")
+    print("="*60)
+
+    t0 = time.time()
+    latents = latents.to(torch.float32)
+
+    # Denormalize latents (same as Neuron path and diffusers pipeline)
+    vae_config = pipe.vae.config
+    latents_mean = (
+        torch.tensor(vae_config.latents_mean)
+        .view(1, vae_config.z_dim, 1, 1, 1)
+        .to(latents.device, latents.dtype)
+    )
+    latents_std = 1.0 / torch.tensor(vae_config.latents_std).view(
+        1, vae_config.z_dim, 1, 1, 1
+    ).to(latents.device, latents.dtype)
+    latents = latents / latents_std + latents_mean
+    print(f"Denormalized latents: {latents.shape}, range=[{latents.min():.3f}, {latents.max():.3f}]")
+
+    # Decode on CPU using pipe.vae
+    print("Running VAE decode on CPU (this may take a while for high resolutions)...")
+    pipe.vae.to(torch.float32)
+    with torch.no_grad():
+        video = pipe.vae.decode(latents).sample
+    decode_time = time.time() - t0
+
+    # Trim to expected frame count
+    if video.shape[2] > num_frames:
+        print(f"  Trimming {video.shape[2]} -> {num_frames} video frames")
+        video = video[:, :, :num_frames]
+
+    print(f"  CPU decode time: {decode_time:.1f}s, output: {video.shape}")
+
+    # Post-processing: [B, C, F, H, W] -> numpy [F, H, W, C], float [0,1]
+    video = video[0]  # [C, F, H, W]
+    video = video.permute(1, 2, 3, 0).float().cpu().numpy()  # [F, H, W, C]
+    video = ((video + 1.0) / 2.0).clip(0, 1)
+    print(f"Output video: shape={video.shape}, dtype={video.dtype}")
+
+    return video
+
+
+# ============================================================
 # Main
 # ============================================================
 DEFAULT_COMPILED_MODELS_DIR = "/opt/dlami/nvme/compiled_models_t2v_a14b"
@@ -633,9 +859,22 @@ def main(args):
     torch.save(latents, "debug_latents.pt")
     print(f"Saved debug_latents.pt: shape={latents.shape}, dtype={latents.dtype}, range=[{latents.min():.3f}, {latents.max():.3f}]")
 
-    # Phase 3: VAE Decode
+    # Phase 3: VAE Decode (Neuron or CPU fallback)
     t3_start = time.time()
-    video = phase_vae_decode(pipe, compiled_models_dir, latents, num_frames=args.num_frames)
+    # Auto-detect: use Neuron decoder if available, otherwise CPU
+    has_neuron_decoder = (
+        not args.cpu_vae_decoder
+        and (
+            os.path.exists(os.path.join(compiled_models_dir, "decoder_rolling", "nxd_model.pt"))
+            or os.path.exists(os.path.join(compiled_models_dir, "decoder_nocache", "nxd_model.pt"))
+        )
+    )
+    if has_neuron_decoder:
+        video = phase_vae_decode(pipe, compiled_models_dir, latents, num_frames=args.num_frames)
+    else:
+        if not args.cpu_vae_decoder:
+            print("\nNo compiled Neuron decoder found, using CPU fallback.")
+        video = phase_vae_decode_cpu(pipe, latents, num_frames=args.num_frames)
     t3_time = time.time() - t3_start
 
     inference_time = time.time() - inference_start
@@ -676,6 +915,8 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=str, default="output_t2v_a14b.mp4")
     parser.add_argument("--cpu_text_encoder", action="store_true",
                         help="Use CPU text encoder instead of Neuron (slower but more stable)")
+    parser.add_argument("--cpu_vae_decoder", action="store_true",
+                        help="Force CPU VAE decoder (auto-detected if no Neuron decoder compiled)")
     args = parser.parse_args()
 
     main(args)

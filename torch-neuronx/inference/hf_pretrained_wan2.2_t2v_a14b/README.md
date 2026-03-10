@@ -14,35 +14,54 @@ Wan2.2-T2V-A14B is a **Mixture-of-Experts (MoE)** text-to-video diffusion model 
 | MoE switch | timestep ≥ 875 → transformer_1 (high-noise), < 875 → transformer_2 (low-noise) |
 | Text encoder | UMT5-XXL (4096 dim) |
 | VAE | AutoencoderKLWan (z_dim=16) |
-| Resolution | 480×832, 81 frames |
+| Resolution | 480×832 / 720×1280, 81 frames |
 
 ## Parallelism Strategy
 
-- **TP=4**: Tensor Parallelism splits each transformer across 4 NeuronCores
-- **CP=2**: Context Parallelism splits the sequence (32,760 tokens → 16,380/rank)
-- **world_size=8**: Uses all 8 NeuronCores on trn2.48xlarge
-- **MoE weight swap**: Both transformers share one compiled NEFF; weights are swapped via `NxDModel.replace_weights()` at the timestep boundary
+| | 480P | 720P |
+|---|---|---|
+| **TP** | 4 | 4 |
+| **CP** | 2 | 4 |
+| **world_size** | 8 | 16 |
+| **Tokens/rank** | 16,380 | 18,900 |
+| **NeuronCores** | 8 (16 logical NCs) | 16 (32 logical NCs) |
+
+- **MoE weight swap**:
+  - 480P: `replace_weights()` in-process (fast, ~63s)
+  - 720P: Subprocess-based reload (NEFF uses 23.94/24GB HBM, no headroom for in-place swap)
 
 ## Pipeline Phases
 
-1. **Text Encoding** (Neuron): Encode prompt with Neuron-compiled UMT5 text encoder (TP=4)
+1. **Text Encoding** (Neuron or CPU): Encode prompt with Neuron-compiled UMT5 text encoder (TP=4)
    - Also supports CPU fallback via `--cpu_text_encoder` flag
+   - 720P requires `--cpu_text_encoder` (text encoder world_size=8 conflicts with transformer world_size=16)
 2. **Denoising** (Neuron): 40 steps with MoE transformer switching
    - Steps 1-13: transformer_1 (high-noise expert, guidance_scale=4.0)
-   - Weight swap via `replace_weights()`
+   - Weight swap via `replace_weights()` (480P) or subprocess reload (720P)
    - Steps 14-40: transformer_2 (low-noise expert, guidance_scale_2=3.0)
-3. **VAE Decode** (Neuron): Chunked decoder with rolling feat_cache for flicker-free output
-   - Auto-detects rolling cache (`decoder_rolling/`) or NoCache (`decoder_nocache/`) mode
+3. **VAE Decode** (Neuron or CPU): Chunked decoder with rolling feat_cache for flicker-free output
+   - 480P: Auto-detects rolling cache (`decoder_rolling/`) or NoCache (`decoder_nocache/`) mode
+   - 720P: CPU fallback (Neuron decoder exceeds instruction limit at this resolution)
 
 ## Performance
+
+### 480P (480×832, 81 frames)
 
 | Phase | Time |
 |-------|------|
 | Text Encoding (Neuron) | ~14s (0.4s inference + 12s model load) |
-| Text Encoding (CPU) | ~16s |
-| Denoising (40 steps + MoE swap) | ~465s |
+| Denoising (40 steps + MoE swap) | ~465s (~8.2s/step) |
 | VAE Decode (rolling cache) | ~45s (24s decode + 18s model load) |
 | **Inference time** | **~525s** |
+
+### 720P (720×1280, 81 frames)
+
+| Phase | Time |
+|-------|------|
+| Text Encoding (CPU) | ~5s |
+| Denoising (40 steps, subprocess mode) | ~1069s (~16.1s/step + 2×188s model load) |
+| VAE Decode (CPU fallback) | ~585s |
+| **Inference time** | **~1659s (~27.6min)** |
 
 ## Prerequisites
 
@@ -64,18 +83,18 @@ pip install -r requirements.txt
 # Compile all models (~1-2 hours first time)
 bash compile.sh
 
-# Run inference
+# Run 480P inference
 python run_wan2.2_t2v_a14b.py \
     --compiled_models_dir /opt/dlami/nvme/compiled_models_t2v_a14b \
     --prompt "A cat walks on the grass, realistic" \
-    --output output_t2v.mp4
+    --output output_t2v_480p.mp4
 
-# With CPU text encoder (slower, use as fallback)
+# Run 720P inference (requires separate compilation with --height 720 --width 1280)
 python run_wan2.2_t2v_a14b.py \
-    --cpu_text_encoder \
-    --compiled_models_dir /opt/dlami/nvme/compiled_models_t2v_a14b \
+    --compiled_models_dir /opt/dlami/nvme/compiled_models_t2v_a14b_720p \
+    --height 720 --width 1280 --cpu_text_encoder \
     --prompt "A cat walks on the grass, realistic" \
-    --output output_t2v.mp4
+    --output output_t2v_720p.mp4
 ```
 
 ## Compilation
@@ -86,10 +105,12 @@ python run_wan2.2_t2v_a14b.py \
 |------|-----------|--------|
 | 1 | Cache HuggingFace model (~126GB) | HF cache dir |
 | 2 | Text Encoder (TP=4) | `text_encoder/` |
-| 3 | Transformer - high-noise expert (TP=4, CP=2) | `transformer/` |
-| 4 | Transformer_2 - low-noise expert (TP=4, CP=2) | `transformer_2/` |
-| 5 | VAE Decoder (Rolling Cache) | `decoder_rolling/` |
+| 3 | Transformer - high-noise expert (TP=4, CP=N) | `transformer/` |
+| 4 | Transformer_2 - low-noise expert (TP=4, CP=N) | `transformer_2/` |
+| 5 | VAE Decoder (Rolling Cache, 480P only) | `decoder_rolling/` |
 | 6 | Post-quant conv | `post_quant_conv/` |
+
+For 720P, compile with `--height 720 --width 1280` which sets CP=4 (world_size=16). The VAE decoder is not compiled for 720P (instruction limit exceeded); CPU fallback is used automatically.
 
 The script auto-patches `nearest-exact` → `nearest` in diffusers for Trainium2 compatibility.
 
@@ -106,7 +127,8 @@ The script auto-patches `nearest-exact` → `nearest` in diffusers for Trainium2
 --prompt                  Text prompt
 --negative_prompt         Negative prompt
 --output                  Output video path (default: output_t2v_a14b.mp4)
---cpu_text_encoder        Use CPU text encoder instead of Neuron (slower)
+--cpu_text_encoder        Use CPU text encoder instead of Neuron (required for 720P)
+--cpu_vae_decoder         Force CPU VAE decoder (auto-detected if no Neuron decoder compiled)
 ```
 
 ## VAE Decoder Modes
@@ -135,10 +157,11 @@ hf_pretrained_wan2.2_t2v_a14b/
 └── neuron_wan2_2_t2v_a14b/
     ├── __init__.py
     ├── cache_hf_model.py               # Download HF model
-    ├── compile_transformer.py          # Transformer compilation (TP=4, CP=2)
+    ├── compile_transformer.py          # Transformer compilation (TP=4, CP=N)
     ├── compile_text_encoder.py         # UMT5 text encoder compilation
     ├── compile_decoder_nocache.py      # VAE decoder compilation (NoCache)
     ├── compile_decoder_rolling.py      # VAE decoder compilation (Rolling Cache)
+    ├── denoise_worker.py              # Subprocess worker for HBM-tight denoising (720P)
     ├── distributed_rmsnorm.py          # Distributed RMSNorm for TP
     ├── neuron_commons.py               # Wrapper classes for Neuron models
     └── neuron_parallel_utils.py        # TP/CP sharding utilities
