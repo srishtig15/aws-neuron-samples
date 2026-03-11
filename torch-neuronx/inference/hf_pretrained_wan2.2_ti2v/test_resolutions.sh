@@ -42,12 +42,12 @@ MAX_SEQ_LEN=512
 # Define test configurations: "HEIGHT WIDTH NUM_FRAMES FPS"
 # Wan2.2 frame formula: frames = fps * duration + 1, must satisfy (frames-1) % 4 == 0
 CONFIGS=(
-    "384 512 81 16"    # 512x384 16fps 5s (81 frames)
-    "384 512 121 24"   # 512x384 24fps 5s (121 frames)
-    "480 640 81 16"    # 640x480 16fps 5s
-    "480 640 121 24"   # 640x480 24fps 5s
-    # "704 1280 81 16"   # 1280x704 16fps 5s (720P, ~16.7M instructions)
-    # "704 1280 121 24"  # 1280x704 24fps 5s (720P)
+    # "384 512 81 16"    # 512x384 16fps 5s (81 frames)
+    # "384 512 121 24"   # 512x384 24fps 5s (121 frames)
+    # "480 640 81 16"    # 640x480 16fps 5s
+    # "480 640 121 24"   # 640x480 24fps 5s
+    "704 1280 81 16"   # 1280x704 16fps 5s (720P, ~16.7M instructions)
+    "704 1280 121 24"  # 1280x704 24fps 5s (720P)
 )
 
 echo "=============================================="
@@ -119,32 +119,87 @@ for config in "${CONFIGS[@]}"; do
 
     # Compile decoder (skip if already exists)
     # Always use non-TP rolling decoder for exact quality (TP sharding causes blurry output).
-    # For resolutions exceeding default 5M instruction limit, raise it via --max-instruction-limit.
-    if [[ -d "${COMPILED_DIR}/decoder_v3_rolling" ]] && [[ "$SKIP_COMPILE" == false ]]; then
-        echo "[${TAG}] Decoder already compiled, skipping."
-    elif [[ "$SKIP_COMPILE" == false ]]; then
-        LATENT_PIXELS=$(( (HEIGHT / 16) * (WIDTH / 16) ))
-        # Estimate instruction count: ~6.5 instructions per latent pixel (empirical)
-        # 512x384 (768 px) -> ~5M, 640x480 (1200 px) -> ~5.7M, 1280x704 (3520 px) -> ~16.7M
-        INST_LIMIT_ARG=""
-        if [[ ${LATENT_PIXELS} -gt 800 ]]; then
-            # Add 30% margin over estimated instruction count
-            EST_INSTRUCTIONS=$(( LATENT_PIXELS * 6500 * 130 / 100 ))
-            INST_LIMIT_ARG="--max_instruction_limit ${EST_INSTRUCTIONS}"
-            echo "[${TAG}] Compiling Decoder (non-TP rolling, latent=${LATENT_PIXELS}px, max_inst=${EST_INSTRUCTIONS})..."
-        else
-            echo "[${TAG}] Compiling Decoder (non-TP rolling, latent=${LATENT_PIXELS}px)..."
+    # For resolutions exceeding per-operator instruction limit (720P+), use tiled spatial decoder:
+    #   compile a small tile-size decoder, then tile at inference time with overlap blending.
+    LATENT_H=$(( HEIGHT / 16 ))
+    LATENT_W=$(( WIDTH / 16 ))
+    LATENT_PIXELS=$(( LATENT_H * LATENT_W ))
+
+    # Tiled decode threshold: 720P (44x80=3520) hits per-operator limit (NCC_EXTP003)
+    USE_TILED=false
+    TILE_H=384    # tile resolution in pixels
+    TILE_W=512
+    OVERLAP=4     # overlap in latent pixels
+    if [[ ${LATENT_PIXELS} -gt 2000 ]]; then
+        USE_TILED=true
+    fi
+
+    if [[ "$USE_TILED" == true ]]; then
+        # Tiled decoder: compile for small tile resolution, save as decoder_v3_tiled
+        if [[ -d "${COMPILED_DIR}/decoder_v3_tiled" ]] && [[ "$SKIP_COMPILE" == false ]]; then
+            echo "[${TAG}] Tiled decoder already compiled, skipping."
+        elif [[ "$SKIP_COMPILE" == false ]]; then
+            echo "[${TAG}] Compiling Tiled Decoder (tile=${TILE_W}x${TILE_H}, overlap=${OVERLAP})..."
+            TILE_LATENT_PIXELS=$(( (TILE_H / 16) * (TILE_W / 16) ))
+            INST_LIMIT_ARG=""
+            if [[ ${TILE_LATENT_PIXELS} -gt 800 ]]; then
+                EST_INSTRUCTIONS=$(( TILE_LATENT_PIXELS * 6500 * 130 / 100 ))
+                INST_LIMIT_ARG="--max_instruction_limit ${EST_INSTRUCTIONS}"
+            fi
+            # Compile decoder at tile resolution
+            python neuron_wan2_2_ti2v/compile_decoder_v3_rolling.py \
+                --compiled_models_dir "${COMPILED_DIR}" \
+                --compiler_workdir "${COMPILER_WD}" \
+                --height ${TILE_H} \
+                --width ${TILE_W} \
+                --num_frames ${NUM_FRAMES} \
+                --decoder_frames 2 \
+                --tp_degree ${WORLD_SIZE} \
+                --world_size ${WORLD_SIZE} \
+                ${INST_LIMIT_ARG} 2>&1 | tee "log_compile_decoder_${TAG}.txt"
+            # Rename to decoder_v3_tiled and add tiling config
+            if [[ -d "${COMPILED_DIR}/decoder_v3_rolling" ]]; then
+                mv "${COMPILED_DIR}/decoder_v3_rolling" "${COMPILED_DIR}/decoder_v3_tiled"
+                # Update config with tiling parameters
+                python3 -c "
+import json
+config_path = '${COMPILED_DIR}/decoder_v3_tiled/config.json'
+with open(config_path) as f:
+    config = json.load(f)
+config['overlap_latent'] = ${OVERLAP}
+config['tiled'] = True
+config['target_height'] = ${HEIGHT}
+config['target_width'] = ${WIDTH}
+with open(config_path, 'w') as f:
+    json.dump(config, f, indent=4)
+print(f'Tiled config saved: tile={config[\"height\"]}x{config[\"width\"]}, overlap=${OVERLAP}')
+"
+            fi
         fi
-        python neuron_wan2_2_ti2v/compile_decoder_v3_rolling.py \
-            --compiled_models_dir "${COMPILED_DIR}" \
-            --compiler_workdir "${COMPILER_WD}" \
-            --height ${HEIGHT} \
-            --width ${WIDTH} \
-            --num_frames ${NUM_FRAMES} \
-            --decoder_frames 2 \
-            --tp_degree ${WORLD_SIZE} \
-            --world_size ${WORLD_SIZE} \
-            ${INST_LIMIT_ARG} 2>&1 | tee "log_compile_decoder_${TAG}.txt"
+    else
+        # Direct decoder: compile at full resolution
+        if [[ -d "${COMPILED_DIR}/decoder_v3_rolling" ]] && [[ "$SKIP_COMPILE" == false ]]; then
+            echo "[${TAG}] Decoder already compiled, skipping."
+        elif [[ "$SKIP_COMPILE" == false ]]; then
+            INST_LIMIT_ARG=""
+            if [[ ${LATENT_PIXELS} -gt 800 ]]; then
+                EST_INSTRUCTIONS=$(( LATENT_PIXELS * 6500 * 130 / 100 ))
+                INST_LIMIT_ARG="--max_instruction_limit ${EST_INSTRUCTIONS}"
+                echo "[${TAG}] Compiling Decoder (non-TP rolling, latent=${LATENT_PIXELS}px, max_inst=${EST_INSTRUCTIONS})..."
+            else
+                echo "[${TAG}] Compiling Decoder (non-TP rolling, latent=${LATENT_PIXELS}px)..."
+            fi
+            python neuron_wan2_2_ti2v/compile_decoder_v3_rolling.py \
+                --compiled_models_dir "${COMPILED_DIR}" \
+                --compiler_workdir "${COMPILER_WD}" \
+                --height ${HEIGHT} \
+                --width ${WIDTH} \
+                --num_frames ${NUM_FRAMES} \
+                --decoder_frames 2 \
+                --tp_degree ${WORLD_SIZE} \
+                --world_size ${WORLD_SIZE} \
+                ${INST_LIMIT_ARG} 2>&1 | tee "log_compile_decoder_${TAG}.txt"
+        fi
     fi
 
     COMPILE_END=$(date +%s)

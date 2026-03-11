@@ -42,6 +42,7 @@ from neuron_wan2_2_ti2v.neuron_commons_v2 import InferenceTextEncoderWrapperV2
 from neuron_wan2_2_ti2v.neuron_commons import (
     SimpleWrapper, DecoderWrapper, DecoderWrapperV2, DecoderWrapperV3,
     DecoderWrapperV3NoCache, DecoderWrapperV3Rolling, DecoderWrapperV3TPRolling,
+    DecoderWrapperV3Tiled,
     PostQuantConvWrapperV2, EncoderWrapperV3, QuantConvWrapperV3,
 )
 
@@ -365,8 +366,9 @@ def main(args):
     text_encoder_wrapper.t = text_encoder_nxd
     print("Text encoder loaded.")
 
-    # Load Decoder - check for TP Rolling first, then Rolling, NoCache, V3, V2, V1, CPU fallback
+    # Load Decoder - check for Tiled, TP Rolling, Rolling, NoCache, V3, V2, V1, CPU fallback
     use_cpu_decoder = False
+    decoder_v3_tiled_path = f"{compiled_models_dir}/decoder_v3_tiled"
     decoder_v3_tp_rolling_path = f"{compiled_models_dir}/decoder_v3_tp_rolling"
     decoder_v3_rolling_path = f"{compiled_models_dir}/decoder_v3_rolling"
     decoder_v3_nocache_path = f"{compiled_models_dir}/decoder_v3_nocache"
@@ -374,7 +376,27 @@ def main(args):
     decoder_v2_path = f"{compiled_models_dir}/decoder_v2"
     decoder_v1_path = f"{compiled_models_dir}/decoder/model.pt"
 
-    if os.path.exists(decoder_v3_tp_rolling_path) and not args.force_v1_decoder:
+    if os.path.exists(decoder_v3_tiled_path) and not args.force_v1_decoder:
+        print("\nLoading decoder (V3 Tiled - spatial tiling for large resolutions)...")
+        decoder_config = load_model_config(decoder_v3_tiled_path)
+        decoder_frames = decoder_config.get("decoder_frames", 2)
+        tile_h = decoder_config["height"] // 16   # tile latent height
+        tile_w = decoder_config["width"] // 16     # tile latent width
+        overlap = decoder_config.get("overlap_latent", 4)
+        vae_decoder_wrapper = DecoderWrapperV3Tiled(
+            pipe.vae.decoder, decoder_frames=decoder_frames,
+            tile_h_latent=tile_h, tile_w_latent=tile_w, overlap_latent=overlap)
+        decoder_nxd = NxDModel.load(os.path.join(decoder_v3_tiled_path, "nxd_model.pt"))
+        decoder_world_size = decoder_config.get("world_size", 8)
+
+        decoder_weights = load_duplicated_weights(decoder_v3_tiled_path, decoder_world_size)
+        decoder_nxd.set_weights(decoder_weights)
+        decoder_nxd.to_neuron()
+
+        vae_decoder_wrapper.nxd_model = decoder_nxd
+        print(f"Decoder (V3 Tiled) loaded. tile={tile_h}x{tile_w} latent, "
+              f"overlap={overlap}, decoder_frames={decoder_frames}")
+    elif os.path.exists(decoder_v3_tp_rolling_path) and not args.force_v1_decoder:
         print("\nLoading decoder (V3 TP Rolling Cache)...")
         decoder_config = load_model_config(decoder_v3_tp_rolling_path)
         decoder_frames = decoder_config.get("decoder_frames", 2)
@@ -539,11 +561,13 @@ def main(args):
     pipe.transformer = transformer_wrapper
     if not use_cpu_decoder:
         pipe.vae.decoder = vae_decoder_wrapper
-        pipe.vae.post_quant_conv = vae_post_quant_conv_wrapper
+        if vae_post_quant_conv_wrapper is not None:
+            pipe.vae.post_quant_conv = vae_post_quant_conv_wrapper
 
         # Override _decode to use rolling-cache decode_latents directly,
         # bypassing diffusers' per-frame loop which causes cache pollution.
         if hasattr(vae_decoder_wrapper, 'decode_latents'):
+            # Use compiled PQC if available, otherwise keep the original CPU PQC
             original_post_quant_conv = pipe.vae.post_quant_conv
             vae_config = pipe.vae.config
             def _decode_override(z, return_dict=True):

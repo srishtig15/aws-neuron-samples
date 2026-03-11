@@ -1009,3 +1009,216 @@ class DecoderWrapperV3TPRolling(nn.Module):
         self.reset_cache()
 
 
+class DecoderWrapperV3Tiled(nn.Module):
+    """
+    Tiled spatial decoder for large resolutions (e.g., 720P) that exceed
+    the per-operator instruction limit (NCC_EXTP003, 300K per tile).
+
+    Uses a small-resolution compiled decoder (e.g., 512x384 = 24x32 latent)
+    as a tile decoder. The full-resolution latent is split into overlapping
+    spatial tiles, each decoded independently with its own rolling cache,
+    then blended with linear overlap weights to eliminate seam artifacts.
+
+    The feat_cache in Wan VAE is purely temporal (CACHE_T=2), so spatial
+    tiling is mathematically exact in the interior and only approximate
+    at tile boundaries where the spatial receptive field is truncated.
+    Linear blending smooths these boundary effects.
+    """
+
+    def __init__(self, original_decoder, decoder_frames=2,
+                 tile_h_latent=24, tile_w_latent=32, overlap_latent=4):
+        super().__init__()
+        self.original_decoder = original_decoder
+        self.decoder_frames = decoder_frames
+        self.tile_h = tile_h_latent
+        self.tile_w = tile_w_latent
+        self.overlap = overlap_latent
+        self.nxd_model = None
+        self.num_cache_tensors = 34
+
+    def _get_tile_positions(self, full_size, tile_size, overlap):
+        """Calculate tile start positions ensuring full coverage with overlap."""
+        if full_size <= tile_size:
+            return [0]
+        stride = tile_size - 2 * overlap
+        positions = []
+        pos = 0
+        while pos + tile_size < full_size:
+            positions.append(pos)
+            pos += stride
+        # Last tile aligned to end
+        positions.append(full_size - tile_size)
+        return positions
+
+    def _init_tile_caches(self):
+        """Initialize rolling cache tensors (zeros) for one tile."""
+        from neuron_wan2_2_ti2v.compile_decoder_v3_rolling import get_feat_cache_shapes
+        cache_shapes = get_feat_cache_shapes(1, self.tile_h, self.tile_w)
+        return [torch.zeros(s, dtype=torch.bfloat16) for s in cache_shapes]
+
+    def _make_blend_weight_1d(self, size, overlap_pixels, has_left, has_right):
+        """Create 1D blend weight: linear ramp at interior edges, 1 at image boundary."""
+        w = torch.ones(size)
+        if overlap_pixels <= 0:
+            return w
+        ramp = torch.linspace(0, 1, overlap_pixels + 2)[1:-1]
+        if has_left:
+            w[:overlap_pixels] *= ramp
+        if has_right:
+            w[-overlap_pixels:] *= ramp.flip(0)
+        return w
+
+    def decode_latents(self, z):
+        """
+        Decode full-resolution latents using spatial tiling with overlap blending.
+
+        Args:
+            z: (B, C, T_latent, H_latent, W_latent) after post_quant_conv
+        Returns:
+            (B, 12, T_out, H_latent*8, W_latent*8) float32 (before unpatchify)
+        """
+        import time as _time
+        _t_start = _time.time()
+
+        B, C, T_latent, H, W = z.shape
+        out_h = H * 8
+        out_w = W * 8
+        pixel_overlap = self.overlap * 8
+
+        h_positions = self._get_tile_positions(H, self.tile_h, self.overlap)
+        w_positions = self._get_tile_positions(W, self.tile_w, self.overlap)
+        num_tiles = len(h_positions) * len(w_positions)
+
+        if num_tiles == 1 and H <= self.tile_h and W <= self.tile_w:
+            return self._decode_single(z)
+
+        print(f"[tiled] {H}x{W} latent -> {len(h_positions)}x{len(w_positions)}={num_tiles} tiles "
+              f"(tile={self.tile_h}x{self.tile_w}, overlap={self.overlap})")
+
+        # Pre-compute 2D blend weights per tile position
+        tile_weights = {}
+        for hi, h_start in enumerate(h_positions):
+            for wi, w_start in enumerate(w_positions):
+                h_end = h_start + self.tile_h
+                w_end = w_start + self.tile_w
+                ph = self.tile_h * 8
+                pw = self.tile_w * 8
+                wh = self._make_blend_weight_1d(ph, pixel_overlap, h_start > 0, h_end < H)
+                ww = self._make_blend_weight_1d(pw, pixel_overlap, w_start > 0, w_end < W)
+                w2d = wh.unsqueeze(1) * ww.unsqueeze(0)
+                tile_weights[(hi, wi)] = w2d.unsqueeze(0).unsqueeze(0).unsqueeze(0)
+
+        num_temporal_chunks = (T_latent + self.decoder_frames - 1) // self.decoder_frames
+
+        # Initialize rolling caches for all tiles
+        all_caches = {}
+        for hi in range(len(h_positions)):
+            for wi in range(len(w_positions)):
+                all_caches[(hi, wi)] = self._init_tile_caches()
+
+        blended_chunks = []
+        t = 0
+        chunk_idx = 0
+        while t < T_latent:
+            t_end = min(t + self.decoder_frames, T_latent)
+            actual_frames = t_end - t
+
+            z_chunk = z[:, :, t:t_end]
+            if actual_frames < self.decoder_frames:
+                pad = self.decoder_frames - actual_frames
+                z_chunk = torch.cat([z_chunk] + [z_chunk[:, :, -1:]] * pad, dim=2)
+
+            output_temporal = actual_frames * 4
+
+            chunk_out = torch.zeros(B, 12, output_temporal, out_h, out_w)
+            chunk_weight = torch.zeros(1, 1, 1, out_h, out_w)
+
+            for hi, h_start in enumerate(h_positions):
+                for wi, w_start in enumerate(w_positions):
+                    h_end = h_start + self.tile_h
+                    w_end = w_start + self.tile_w
+                    tile_input = z_chunk[:, :, :, h_start:h_end, w_start:w_end].to(torch.bfloat16)
+
+                    caches = all_caches[(hi, wi)]
+                    results = self.nxd_model(tile_input, *caches)
+
+                    if isinstance(results, (tuple, list)):
+                        tile_out = results[0]
+                        all_caches[(hi, wi)] = [r.to(torch.bfloat16) for r in results[1:1 + self.num_cache_tensors]]
+                    else:
+                        tile_out = results
+                    if isinstance(tile_out, (list, tuple)):
+                        tile_out = tile_out[0]
+                    tile_out = tile_out.to(torch.float32)
+                    if tile_out.shape[2] > output_temporal:
+                        tile_out = tile_out[:, :, :output_temporal]
+
+                    ph_s, pw_s = h_start * 8, w_start * 8
+                    ph_e, pw_e = h_end * 8, w_end * 8
+                    w2d = tile_weights[(hi, wi)]
+                    chunk_out[:, :, :, ph_s:ph_e, pw_s:pw_e] += tile_out * w2d
+                    chunk_weight[:, :, :, ph_s:ph_e, pw_s:pw_e] += w2d
+
+            chunk_out = chunk_out / chunk_weight.clamp(min=1e-6)
+            blended_chunks.append(chunk_out)
+
+            _t_now = _time.time()
+            print(f"[tiled] chunk {chunk_idx}/{num_temporal_chunks}: "
+                  f"latent_t={actual_frames} -> {output_temporal}f, "
+                  f"elapsed={_t_now - _t_start:.1f}s")
+            chunk_idx += 1
+            t = t_end
+
+        result = torch.cat(blended_chunks, dim=2)
+        _t_end = _time.time()
+        print(f"[tiled] Done: {T_latent} latent -> {result.shape[2]} frames, "
+              f"{num_tiles} tiles x {chunk_idx} chunks = {num_tiles * chunk_idx} NxD calls, "
+              f"total={_t_end - _t_start:.1f}s")
+        return result
+
+    def _decode_single(self, z):
+        """Decode without tiling (input fits in one tile)."""
+        import time as _time
+        _t_start = _time.time()
+        T_latent = z.shape[2]
+        caches = self._init_tile_caches()
+        outputs = []
+        t = 0
+        while t < T_latent:
+            t_end = min(t + self.decoder_frames, T_latent)
+            chunk = z[:, :, t:t_end]
+            actual = chunk.shape[2]
+            if actual < self.decoder_frames:
+                pad = self.decoder_frames - actual
+                chunk = torch.cat([chunk] + [chunk[:, :, -1:]] * pad, dim=2)
+            results = self.nxd_model(chunk.to(torch.bfloat16), *caches)
+            if isinstance(results, (tuple, list)):
+                output = results[0]
+                caches = [r.to(torch.bfloat16) for r in results[1:1 + self.num_cache_tensors]]
+            else:
+                output = results
+            if isinstance(output, (list, tuple)):
+                output = output[0]
+            output = output.to(torch.float32)
+            out_frames = actual * 4
+            if output.shape[2] > out_frames:
+                output = output[:, :, :out_frames]
+            outputs.append(output)
+            t = t_end
+        result = torch.cat(outputs, dim=2)
+        print(f"[tiled] single-tile: {T_latent} -> {result.shape[2]} frames "
+              f"in {_time.time() - _t_start:.1f}s")
+        return result
+
+    def forward(self, x, **kwargs):
+        if 'feat_cache' not in kwargs:
+            return self.original_decoder(x)
+        return self.original_decoder(x, **kwargs)
+
+    def reset_cache(self):
+        pass
+
+    def clear_cache(self):
+        pass
+
+

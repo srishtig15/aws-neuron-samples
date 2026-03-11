@@ -1,5 +1,5 @@
 Wan2.2 TI2V Multi-Resolution Test Results (Trainium2, non-TP rolling decoder)
-Date: Tue Mar 10 2026
+Date: Wed Mar 11 2026
 ==========================================
 Resolution   FPS      Frames   Compile    Inference(s)   Per-step(s)
 --------------------------------------------------------------
@@ -7,3 +7,5 @@ Resolution   FPS      Frames   Compile    Inference(s)   Per-step(s)
 512x384      24       121      0s         49.24          0.985
 640x480      16       81       0s         55.38          1.108
 640x480      24       121      0s         81.50          1.630
+1280x704     16       81       1222s      163.88         3.278
+1280x704     24       121      1487s      260.01         5.200

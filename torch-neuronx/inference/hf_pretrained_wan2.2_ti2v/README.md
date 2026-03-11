@@ -1,6 +1,19 @@
 # Wan2.2 Text/Image-to-Video Inference on AWS Trainium2
 
-This project implements [Wan2.2-TI2V-5B](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B-Diffusers) video generation on AWS Trainium2 (trn2.48xlarge) using the AWS Neuron SDK. It generates 512x512, 81-frame (3.4s @ 24fps) videos from text prompts or input images.
+This project implements [Wan2.2-TI2V-5B](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B-Diffusers) video generation on AWS Trainium2 (trn2.48xlarge) using the AWS Neuron SDK. Supports multiple resolutions from 512x384 up to 1280x704 (720P) with text-to-video and image-to-video generation.
+
+## Multi-Resolution Performance (trn2.48xlarge vs H100)
+
+| Resolution | FPS | Frames | Trn2 (s) | H100 (s) | Decoder |
+|-----------|-----|--------|-----------|-----------|---------|
+| 512x384 | 16 | 81 | 32.70 | 16.13 | rolling |
+| 512x384 | 24 | 121 | 49.24 | 24.48 | rolling |
+| 640x480 | 16 | 81 | 55.38 | 26.06 | rolling |
+| 640x480 | 24 | 121 | 81.50 | 39.67 | rolling |
+| 1280x704 | 16 | 81 | 163.88 | 87.66 | tiled |
+| 1280x704 | 24 | 121 | 260.01 | 143.20 | tiled |
+
+Timing is pure inference (excludes model loading and warmup). See `test_results.txt` and `test_results_gpu.txt`.
 
 ## Quick Start (Recommended: V3 CP)
 
@@ -182,6 +195,30 @@ The VAE decoder processes latent frames in chunks of 2 (CACHE_T=2) with causal t
 
 This is implemented in the custom `autoencoder_kl_wan.py` which replaces the diffusers default.
 
+### 7. Tiled Spatial Decode (720P+)
+
+At 720P (1280x704), the VAE decoder's Conv3D operators exceed the Neuron compiler's per-operator instruction limit (`NCC_EXTP003`: 1.2M instructions vs 300K limit). This is different from the total NEFF instruction limit (`NCC_EVRF007`) which can be bypassed with `--tiled-inst-limit`.
+
+**Solution**: Compile the decoder at a small tile resolution (e.g., 384x512), then tile the full-resolution latent at inference time with overlap blending.
+
+**Key design points**:
+- The VAE's `feat_cache` is purely temporal (dim=2, CACHE_T=2) with no spatial context, so spatial tiles are fully independent
+- All Conv3D kernels use 3x3x3 with padding=1 (same-padding), so spatial tiling introduces no boundary artifacts beyond the overlap region
+- Each tile maintains its own independent rolling cache (34 tensors per tile)
+- Memory-efficient: processes all tiles for one temporal chunk before moving to the next chunk
+
+**Tiling parameters** (for 1280x704 with 384x512 tiles):
+- Latent space: 44x80 → tiled with 24x32 tiles, overlap=4 latent pixels
+- Produces 3x3 = 9 tiles per temporal chunk
+- Overlap regions use linear ramp blending weights
+
+**Blending**: Each tile gets a 2D weight mask with linear ramps in overlap regions:
+- Interior pixels: weight = 1.0
+- Overlap pixels: linear ramp from 0.0 to 1.0
+- Image boundary pixels: weight = 1.0 (no ramp at edges)
+
+Implementation: `DecoderWrapperV3Tiled` in `neuron_wan2_2_ti2v/neuron_commons.py`
+
 ## File Structure
 
 ### Core Compilation Scripts (`neuron_wan2_2_ti2v/`)
@@ -192,6 +229,7 @@ This is implemented in the custom `autoencoder_kl_wan.py` which replaces the dif
 | `compile_transformer_v3_flash.py` | V3 Flash transformer (TP=8, NKI Flash Attention) |
 | `compile_text_encoder_v2.py` | Text encoder (ModelBuilder API) |
 | `compile_decoder_v3_nocache.py` | VAE decoder (bfloat16, NoCache, `--model-type=unet-inference`) |
+| `compile_decoder_v3_rolling.py` | VAE decoder with rolling cache (non-TP, for tiled decode) |
 | `compile_decoder_v3.py` | VAE decoder with external feat_cache (legacy) |
 | `compile_encoder_v3.py` | VAE encoder + quant_conv (for I2V) |
 | `cache_hf_model.py` | Download and cache HuggingFace model |
@@ -208,7 +246,7 @@ This is implemented in the custom `autoencoder_kl_wan.py` which replaces the dif
 
 | File | Description |
 |------|-------------|
-| `neuron_commons.py` | Runtime wrappers: `DecoderWrapperV3NoCache`, `DecoderWrapperV3`, `EncoderWrapperV3`, `QuantConvWrapperV3`, attention utilities |
+| `neuron_commons.py` | Runtime wrappers: `DecoderWrapperV3NoCache`, `DecoderWrapperV3Tiled`, `DecoderWrapperV3`, `EncoderWrapperV3`, `QuantConvWrapperV3`, attention utilities |
 | `neuron_commons_v2.py` | `InferenceTextEncoderWrapperV2` for NxDModel text encoder |
 | `neuron_parallel_utils.py` | Tensor parallel utilities for UMT5 sharding |
 | `distributed_rmsnorm.py` | Distributed RMSNorm (reference, not used in V3 due to compiler bug) |
@@ -220,6 +258,7 @@ This is implemented in the custom `autoencoder_kl_wan.py` which replaces the dif
 | `compile_v3_cp.sh` | **Recommended**: Full V3 CP compilation pipeline |
 | `compile_v3_flash.sh` | V3 Flash compilation pipeline |
 | `compile_latency_optimized_v2.sh` | V2 compilation pipeline (legacy) |
+| `test_resolutions.sh` | Multi-resolution test suite (auto-tiling for 720P+) |
 
 ## Inference Options
 
