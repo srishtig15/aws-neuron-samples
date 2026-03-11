@@ -85,7 +85,6 @@ The compilation script compiles all components:
 - **Text Encoder**: UMT5, TP=4, world_size=8
 - **Transformer**: TP=4, CP=2 (Context Parallel), world_size=8
 - **Decoder (Rolling Cache)**: bfloat16, `--model-type=unet-inference`, flicker-free temporal caching
-- **Decoder (NoCache)**: bfloat16, fallback with zero-buffer feat_cache
 - **post_quant_conv**: float32
 
 For multi-resolution compilation (including 720P with tiled decoder), use `test_resolutions.sh`.
@@ -284,4 +283,4 @@ If you see errors about replica groups `[[0,1,2,3]]` vs expected `[[0,1,2,3],[4,
 - The decoder uses bfloat16 to reduce memory
 
 ### Decoder fallback
-The run script supports automatic fallback: Tiled -> Rolling -> NoCache -> V3. If a decoder variant wasn't compiled, it will automatically use whatever version is available.
+The run script supports automatic fallback: Tiled -> Rolling -> NoCache -> fallback. If a decoder variant wasn't compiled, it will automatically use whatever version is available.

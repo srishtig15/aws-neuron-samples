@@ -49,13 +49,13 @@ mkdir -p "${COMPILER_WORKDIR}"
 
 # Step 1: Cache HuggingFace model (if not already cached)
 echo ""
-echo "[Step 1/5] Caching HuggingFace model..."
+echo "[Step 1/4] Caching HuggingFace model..."
 python neuron_wan2_2_ti2v/cache_hf_model.py
 
 # Step 2: Compile Text Encoder (TP=4 to match transformer)
 # At inference time, the 4 TP checkpoints are duplicated for 2 CP ranks → 8 total
 echo ""
-echo "[Step 2/5] Compiling Text Encoder (TP=${TP_DEGREE}, world_size=${WORLD_SIZE})..."
+echo "[Step 2/4] Compiling Text Encoder (TP=${TP_DEGREE}, world_size=${WORLD_SIZE})..."
 python neuron_wan2_2_ti2v/compile_text_encoder.py \
     --compiled_models_dir "${COMPILED_MODELS_DIR}" \
     --max_sequence_length ${MAX_SEQUENCE_LENGTH} \
@@ -64,7 +64,7 @@ python neuron_wan2_2_ti2v/compile_text_encoder.py \
 
 # Step 3: Compile Transformer (TP=4, CP=2)
 echo ""
-echo "[Step 3/5] Compiling Transformer (TP=${TP_DEGREE}, CP=2)..."
+echo "[Step 3/4] Compiling Transformer (TP=${TP_DEGREE}, CP=2)..."
 python neuron_wan2_2_ti2v/compile_transformer.py \
     --compiled_models_dir "${COMPILED_MODELS_DIR}" \
     --compiler_workdir "${COMPILER_WORKDIR}" \
@@ -75,26 +75,12 @@ python neuron_wan2_2_ti2v/compile_transformer.py \
     --tp_degree ${TP_DEGREE} \
     --world_size ${WORLD_SIZE}
 
-# Step 4: Compile Decoder (Rolling Cache - flicker-free)
-# feat_cache as explicit I/O: 35 inputs (x + 34 caches), 35 outputs (video + 34 caches)
-# Carries temporal context between chunks for flicker-free video
+# Step 4: Compile Decoder (Rolling Cache) + post_quant_conv
+# Rolling cache carries temporal context between chunks for flicker-free video
+# post_quant_conv (float32) is also compiled here
 echo ""
-echo "[Step 4/5] Compiling Decoder (Rolling Cache, bfloat16, world_size=${WORLD_SIZE})..."
+echo "[Step 4/4] Compiling Decoder (Rolling Cache, bfloat16) + post_quant_conv..."
 python neuron_wan2_2_ti2v/compile_decoder_rolling.py \
-    --compiled_models_dir "${COMPILED_MODELS_DIR}" \
-    --compiler_workdir "${COMPILER_WORKDIR}" \
-    --height ${HEIGHT} \
-    --width ${WIDTH} \
-    --num_frames ${NUM_FRAMES} \
-    --decoder_frames 2 \
-    --tp_degree ${WORLD_SIZE} \
-    --world_size ${WORLD_SIZE}
-
-# Step 5: Compile Decoder (NoCache) and post_quant_conv
-# NoCache decoder is used as fallback; post_quant_conv is always needed
-echo ""
-echo "[Step 5/5] Compiling Decoder (NoCache) and post_quant_conv (bfloat16, world_size=${WORLD_SIZE})..."
-python neuron_wan2_2_ti2v/compile_decoder_nocache.py \
     --compiled_models_dir "${COMPILED_MODELS_DIR}" \
     --compiler_workdir "${COMPILER_WORKDIR}" \
     --height ${HEIGHT} \

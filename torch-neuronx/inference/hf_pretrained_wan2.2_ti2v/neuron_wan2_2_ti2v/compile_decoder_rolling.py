@@ -228,6 +228,52 @@ def compile_decoder_rolling(args):
 
         print(f"\nDecoder (rolling) saved to {output_path}")
 
+        # ========== Compile post_quant_conv (float32) ==========
+        latent_frames = (args.num_frames - 1) // 4 + 1
+        print("\nCompiling post_quant_conv (float32)...")
+
+        class PostQuantConvWrapper(nn.Module):
+            def __init__(self, post_quant_conv):
+                super().__init__()
+                self.conv = post_quant_conv
+            def forward(self, x):
+                return self.conv(x)
+
+        pqc_wrapper = PostQuantConvWrapper(vae.post_quant_conv)
+        pqc_input = torch.rand(
+            (batch_size, in_channels, latent_frames, latent_height, latent_width),
+            dtype=torch.float32,
+        )
+
+        pqc_builder = ModelBuilder(model=pqc_wrapper)
+        pqc_builder.trace(kwargs={"x": pqc_input}, tag="conv")
+        traced_pqc = pqc_builder.compile(
+            compiler_args="--model-type=unet-inference -O1 --auto-cast=none",
+            compiler_workdir=args.compiler_workdir,
+        )
+
+        pqc_output_path = f"{compiled_models_dir}/post_quant_conv"
+        os.makedirs(pqc_output_path, exist_ok=True)
+        traced_pqc.save(os.path.join(pqc_output_path, "nxd_model.pt"))
+
+        pqc_weights_path = os.path.join(pqc_output_path, "weights")
+        os.makedirs(pqc_weights_path, exist_ok=True)
+        pqc_checkpoint = pqc_wrapper.state_dict()
+        save_file(pqc_checkpoint, os.path.join(pqc_weights_path, "tp0_sharded_checkpoint.safetensors"))
+
+        pqc_config = {
+            "batch_size": batch_size,
+            "latent_frames": latent_frames,
+            "latent_height": latent_height,
+            "latent_width": latent_width,
+            "in_channels": in_channels,
+            "tp_degree": tp_degree,
+            "world_size": world_size,
+            "dtype": "float32",
+        }
+        save_model_config(pqc_output_path, pqc_config)
+        print(f"post_quant_conv saved to {pqc_output_path}")
+
     print("\n" + "=" * 60)
     print("Compilation Complete!")
     print("=" * 60)
