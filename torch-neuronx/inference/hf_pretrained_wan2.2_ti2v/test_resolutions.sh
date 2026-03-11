@@ -42,10 +42,10 @@ MAX_SEQ_LEN=512
 # Define test configurations: "HEIGHT WIDTH NUM_FRAMES FPS"
 # Wan2.2 frame formula: frames = fps * duration + 1, must satisfy (frames-1) % 4 == 0
 CONFIGS=(
-    # "384 512 81 16"    # 512x384 16fps 5s (81 frames)
-    # "384 512 121 24"   # 512x384 24fps 5s (121 frames)
-    # "480 640 81 16"    # 640x480 16fps 5s
-    # "480 640 121 24"   # 640x480 24fps 5s
+    "384 512 81 16"    # 512x384 16fps 5s (81 frames)
+    "384 512 121 24"   # 512x384 24fps 5s (121 frames)
+    "480 640 81 16"    # 640x480 16fps 5s
+    "480 640 121 24"   # 640x480 24fps 5s
     "704 1280 81 16"   # 1280x704 16fps 5s (720P, ~16.7M instructions)
     "704 1280 121 24"  # 1280x704 24fps 5s (720P)
 )
@@ -66,12 +66,12 @@ printf "%-12s %-8s %-8s %-10s %-14s %-10s\n" \
 echo "--------------------------------------------------------------" >> "${RESULTS_FILE}"
 
 # Step 1: Compile text encoder once (shared across all configs)
-TEXT_ENCODER_DIR="${COMPILED_MODELS_BASE}/text_encoder_v2"
+TEXT_ENCODER_DIR="${COMPILED_MODELS_BASE}/text_encoder"
 if [[ "$SKIP_COMPILE" == false ]] && [[ ! -d "${TEXT_ENCODER_DIR}" ]]; then
     echo ""
     echo "[Shared] Compiling Text Encoder (TP=${TP_DEGREE}, world_size=${WORLD_SIZE})..."
     mkdir -p "${COMPILED_MODELS_BASE}"
-    python neuron_wan2_2_ti2v/compile_text_encoder_v2.py \
+    python neuron_wan2_2_ti2v/compile_text_encoder.py \
         --compiled_models_dir "${COMPILED_MODELS_BASE}" \
         --max_sequence_length ${MAX_SEQ_LEN} \
         --tp_degree ${TP_DEGREE} \
@@ -95,18 +95,18 @@ for config in "${CONFIGS[@]}"; do
 
     # Create output dir and symlink shared text encoder
     mkdir -p "${COMPILED_DIR}"
-    if [[ ! -e "${COMPILED_DIR}/text_encoder_v2" ]]; then
-        ln -sf "${TEXT_ENCODER_DIR}" "${COMPILED_DIR}/text_encoder_v2"
+    if [[ ! -e "${COMPILED_DIR}/text_encoder" ]]; then
+        ln -sf "${TEXT_ENCODER_DIR}" "${COMPILED_DIR}/text_encoder"
     fi
 
     COMPILE_START=$(date +%s)
 
     # Compile transformer (skip if already exists)
-    if [[ -d "${COMPILED_DIR}/transformer_v3_cp" ]] && [[ "$SKIP_COMPILE" == false ]]; then
+    if [[ -d "${COMPILED_DIR}/transformer" ]] && [[ "$SKIP_COMPILE" == false ]]; then
         echo "[${TAG}] Transformer already compiled, skipping."
     elif [[ "$SKIP_COMPILE" == false ]]; then
         echo "[${TAG}] Compiling Transformer..."
-        python neuron_wan2_2_ti2v/compile_transformer_v3_cp.py \
+        python neuron_wan2_2_ti2v/compile_transformer.py \
             --compiled_models_dir "${COMPILED_DIR}" \
             --compiler_workdir "${COMPILER_WD}" \
             --height ${HEIGHT} \
@@ -135,8 +135,8 @@ for config in "${CONFIGS[@]}"; do
     fi
 
     if [[ "$USE_TILED" == true ]]; then
-        # Tiled decoder: compile for small tile resolution, save as decoder_v3_tiled
-        if [[ -d "${COMPILED_DIR}/decoder_v3_tiled" ]] && [[ "$SKIP_COMPILE" == false ]]; then
+        # Tiled decoder: compile for small tile resolution, save as decoder_tiled
+        if [[ -d "${COMPILED_DIR}/decoder_tiled" ]] && [[ "$SKIP_COMPILE" == false ]]; then
             echo "[${TAG}] Tiled decoder already compiled, skipping."
         elif [[ "$SKIP_COMPILE" == false ]]; then
             echo "[${TAG}] Compiling Tiled Decoder (tile=${TILE_W}x${TILE_H}, overlap=${OVERLAP})..."
@@ -147,7 +147,7 @@ for config in "${CONFIGS[@]}"; do
                 INST_LIMIT_ARG="--max_instruction_limit ${EST_INSTRUCTIONS}"
             fi
             # Compile decoder at tile resolution
-            python neuron_wan2_2_ti2v/compile_decoder_v3_rolling.py \
+            python neuron_wan2_2_ti2v/compile_decoder_rolling.py \
                 --compiled_models_dir "${COMPILED_DIR}" \
                 --compiler_workdir "${COMPILER_WD}" \
                 --height ${TILE_H} \
@@ -157,13 +157,13 @@ for config in "${CONFIGS[@]}"; do
                 --tp_degree ${WORLD_SIZE} \
                 --world_size ${WORLD_SIZE} \
                 ${INST_LIMIT_ARG} 2>&1 | tee "log_compile_decoder_${TAG}.txt"
-            # Rename to decoder_v3_tiled and add tiling config
-            if [[ -d "${COMPILED_DIR}/decoder_v3_rolling" ]]; then
-                mv "${COMPILED_DIR}/decoder_v3_rolling" "${COMPILED_DIR}/decoder_v3_tiled"
+            # Rename to decoder_tiled and add tiling config
+            if [[ -d "${COMPILED_DIR}/decoder_rolling" ]]; then
+                mv "${COMPILED_DIR}/decoder_rolling" "${COMPILED_DIR}/decoder_tiled"
                 # Update config with tiling parameters
                 python3 -c "
 import json
-config_path = '${COMPILED_DIR}/decoder_v3_tiled/config.json'
+config_path = '${COMPILED_DIR}/decoder_tiled/config.json'
 with open(config_path) as f:
     config = json.load(f)
 config['overlap_latent'] = ${OVERLAP}
@@ -178,7 +178,7 @@ print(f'Tiled config saved: tile={config[\"height\"]}x{config[\"width\"]}, overl
         fi
     else
         # Direct decoder: compile at full resolution
-        if [[ -d "${COMPILED_DIR}/decoder_v3_rolling" ]] && [[ "$SKIP_COMPILE" == false ]]; then
+        if [[ -d "${COMPILED_DIR}/decoder_rolling" ]] && [[ "$SKIP_COMPILE" == false ]]; then
             echo "[${TAG}] Decoder already compiled, skipping."
         elif [[ "$SKIP_COMPILE" == false ]]; then
             INST_LIMIT_ARG=""
@@ -189,7 +189,7 @@ print(f'Tiled config saved: tile={config[\"height\"]}x{config[\"width\"]}, overl
             else
                 echo "[${TAG}] Compiling Decoder (non-TP rolling, latent=${LATENT_PIXELS}px)..."
             fi
-            python neuron_wan2_2_ti2v/compile_decoder_v3_rolling.py \
+            python neuron_wan2_2_ti2v/compile_decoder_rolling.py \
                 --compiled_models_dir "${COMPILED_DIR}" \
                 --compiler_workdir "${COMPILER_WD}" \
                 --height ${HEIGHT} \

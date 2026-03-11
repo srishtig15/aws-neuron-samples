@@ -22,6 +22,35 @@ class InferenceTextEncoderWrapper(nn.Module):
         # return [result['last_hidden_state'].to(self.dtype)]
         return SimpleNamespace(last_hidden_state=result['last_hidden_state'].to(self.dtype))
 
+
+class InferenceTextEncoderWrapperV2(nn.Module):
+    """Wrapper for text encoder with NxDModel V2 API."""
+
+    def __init__(self, dtype, t: UMT5EncoderModel, seqlen: int):
+        super().__init__()
+        self.dtype = dtype
+        self.device = t.device
+        self.t = t
+
+    def forward(self, text_input_ids, attention_mask=None):
+        if hasattr(self.t, 'encode'):
+            result = self.t.encode(
+                text_input_ids=text_input_ids,
+                attention_mask=attention_mask
+            )
+        else:
+            result = self.t(text_input_ids, attention_mask)
+
+        if isinstance(result, dict):
+            last_hidden_state = result.get('last_hidden_state', result.get(0))
+        elif isinstance(result, (tuple, list)):
+            last_hidden_state = result[0]
+        else:
+            last_hidden_state = result
+
+        return SimpleNamespace(last_hidden_state=last_hidden_state.to(self.dtype))
+
+
 class InferenceTransformerWrapper(nn.Module):
     def __init__(self, transformer: WanTransformer3DModel):
         super().__init__()
@@ -792,7 +821,7 @@ class DecoderWrapperV3Rolling(nn.Module):
 
     def _init_caches(self, x):
         """Initialize rolling cache tensors (zeros) based on input spatial dims."""
-        from neuron_wan2_2_ti2v.compile_decoder_v3_rolling import get_feat_cache_shapes
+        from neuron_wan2_2_ti2v.compile_decoder_rolling import get_feat_cache_shapes
         latent_h, latent_w = x.shape[3], x.shape[4]
         cache_shapes = get_feat_cache_shapes(1, latent_h, latent_w)
         self.caches = [torch.zeros(s, dtype=torch.bfloat16) for s in cache_shapes]
@@ -899,7 +928,7 @@ class DecoderWrapperV3Tiled(nn.Module):
 
     def _init_tile_caches(self):
         """Initialize rolling cache tensors (zeros) for one tile."""
-        from neuron_wan2_2_ti2v.compile_decoder_v3_rolling import get_feat_cache_shapes
+        from neuron_wan2_2_ti2v.compile_decoder_rolling import get_feat_cache_shapes
         cache_shapes = get_feat_cache_shapes(1, self.tile_h, self.tile_w)
         return [torch.zeros(s, dtype=torch.bfloat16) for s in cache_shapes]
 

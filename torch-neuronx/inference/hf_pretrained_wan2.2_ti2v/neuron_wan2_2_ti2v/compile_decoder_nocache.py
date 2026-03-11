@@ -175,7 +175,7 @@ def compile_decoder_v3_nocache(args):
         )
 
         # Save
-        output_path = f"{compiled_models_dir}/decoder_v3_nocache"
+        output_path = f"{compiled_models_dir}/decoder_nocache"
         os.makedirs(output_path, exist_ok=True)
         print(f"Saving to {output_path}...")
         traced.save(os.path.join(output_path, "nxd_model.pt"))
@@ -217,7 +217,7 @@ def compile_decoder_v3_nocache(args):
             compiler_workdir=args.compiler_workdir,
         )
 
-        pqc_output_path = f"{compiled_models_dir}/post_quant_conv_v3"
+        pqc_output_path = f"{compiled_models_dir}/post_quant_conv"
         os.makedirs(pqc_output_path, exist_ok=True)
         traced_pqc.save(os.path.join(pqc_output_path, "nxd_model.pt"))
 

@@ -199,7 +199,7 @@ def compile_decoder_rolling(args):
         )
 
         # Save
-        output_path = f"{compiled_models_dir}/decoder_v3_rolling"
+        output_path = f"{compiled_models_dir}/decoder_rolling"
         os.makedirs(output_path, exist_ok=True)
         print(f"Saving to {output_path}...")
         traced.save(os.path.join(output_path, "nxd_model.pt"))

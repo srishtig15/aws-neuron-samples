@@ -38,8 +38,8 @@ import torch_neuronx
 from neuronx_distributed import NxDModel
 from safetensors.torch import load_file
 
-from neuron_wan2_2_ti2v.neuron_commons_v2 import InferenceTextEncoderWrapperV2
 from neuron_wan2_2_ti2v.neuron_commons import (
+    InferenceTextEncoderWrapperV2,
     SimpleWrapper, DecoderWrapper, DecoderWrapperV2, DecoderWrapperV3,
     DecoderWrapperV3NoCache, DecoderWrapperV3Rolling,
     DecoderWrapperV3Tiled,
@@ -214,9 +214,9 @@ class InferenceTransformerWrapperV3CP(torch.nn.Module):
         return (output,)
 
 
-def load_transformer_v3_cp(compiled_models_dir, pipe):
+def load_transformer(compiled_models_dir, pipe):
     """
-    Load V3 CP compiled transformer.
+    Load compiled transformer.
 
     Steps:
     1. Load config to get TP/CP degrees
@@ -233,10 +233,10 @@ def load_transformer_v3_cp(compiled_models_dir, pipe):
     Returns:
         InferenceTransformerWrapperV3CP instance
     """
-    v3_cp_path = f"{compiled_models_dir}/transformer_v3_cp"
+    transformer_path = f"{compiled_models_dir}/transformer"
 
     # Load config
-    config = load_model_config(v3_cp_path)
+    config = load_model_config(transformer_path)
     tp_degree = config["tp_degree"]
     cp_degree = config["cp_degree"]
     world_size = config["world_size"]
@@ -244,19 +244,19 @@ def load_transformer_v3_cp(compiled_models_dir, pipe):
     print(f"Loading V3 CP transformer (TP={tp_degree}, CP={cp_degree}, world_size={world_size})...")
 
     # Load TP checkpoints
-    tp_checkpoints = load_sharded_weights(v3_cp_path, tp_degree)
+    tp_checkpoints = load_sharded_weights(transformer_path, tp_degree)
 
     # Duplicate for CP ranks
     cp_checkpoints = prepare_cp_checkpoints(tp_checkpoints, tp_degree, cp_degree)
 
     # Load NxDModel
-    nxd_model_path = os.path.join(v3_cp_path, "nxd_model.pt")
+    nxd_model_path = os.path.join(transformer_path, "nxd_model.pt")
     nxd_model = NxDModel.load(nxd_model_path)
     nxd_model.set_weights(cp_checkpoints)
     nxd_model.to_neuron()
 
     # Load pre-computed RoPE
-    rope_cache_path = os.path.join(v3_cp_path, "rope_cache.pt")
+    rope_cache_path = os.path.join(transformer_path, "rope_cache.pt")
     rope_cache = torch.load(rope_cache_path)
     rotary_emb_cos = rope_cache["rotary_emb_cos"].to(torch.bfloat16)
     rotary_emb_sin = rope_cache["rotary_emb_sin"].to(torch.bfloat16)
@@ -270,7 +270,7 @@ def load_transformer_v3_cp(compiled_models_dir, pipe):
         rotary_emb_sin=rotary_emb_sin,
     )
 
-    print("V3 CP transformer loaded.")
+    print("Transformer loaded.")
     return wrapper
 
 
@@ -343,12 +343,12 @@ def main(args):
     # IMPORTANT: Load Transformer FIRST to set up correct process groups
     # The transformer uses DP groups for Context Parallel communication
     # Loading it first ensures the process groups are properly initialized
-    print("\nLoading transformer (V3 CP)...")
-    transformer_wrapper = load_transformer_v3_cp(compiled_models_dir, pipe)
+    print("\nLoading transformer...")
+    transformer_wrapper = load_transformer(compiled_models_dir, pipe)
 
-    # Load Text Encoder (V2) - after transformer to share process groups
-    print("\nLoading text encoder (V2)...")
-    text_encoder_dir = f"{compiled_models_dir}/text_encoder_v2"
+    # Load Text Encoder - after transformer to share process groups
+    print("\nLoading text encoder...")
+    text_encoder_dir = f"{compiled_models_dir}/text_encoder"
     text_encoder_wrapper = InferenceTextEncoderWrapperV2(
         torch.bfloat16, pipe.text_encoder, seqlen
     )
@@ -366,18 +366,16 @@ def main(args):
     text_encoder_wrapper.t = text_encoder_nxd
     print("Text encoder loaded.")
 
-    # Load Decoder - check for Tiled, Rolling, NoCache, V3, V2, V1, CPU fallback
+    # Load Decoder - check for Tiled, Rolling, NoCache, fallback
     use_cpu_decoder = False
-    decoder_v3_tiled_path = f"{compiled_models_dir}/decoder_v3_tiled"
-    decoder_v3_rolling_path = f"{compiled_models_dir}/decoder_v3_rolling"
-    decoder_v3_nocache_path = f"{compiled_models_dir}/decoder_v3_nocache"
-    decoder_v3_path = f"{compiled_models_dir}/decoder_v3"
-    decoder_v2_path = f"{compiled_models_dir}/decoder_v2"
-    decoder_v1_path = f"{compiled_models_dir}/decoder/model.pt"
+    decoder_tiled_path = f"{compiled_models_dir}/decoder_tiled"
+    decoder_rolling_path = f"{compiled_models_dir}/decoder_rolling"
+    decoder_nocache_path = f"{compiled_models_dir}/decoder_nocache"
+    decoder_path = f"{compiled_models_dir}/decoder"
 
-    if os.path.exists(decoder_v3_tiled_path) and not args.force_v1_decoder:
-        print("\nLoading decoder (V3 Tiled - spatial tiling for large resolutions)...")
-        decoder_config = load_model_config(decoder_v3_tiled_path)
+    if os.path.exists(decoder_tiled_path) and not args.force_v1_decoder:
+        print("\nLoading decoder (Tiled - spatial tiling for large resolutions)...")
+        decoder_config = load_model_config(decoder_tiled_path)
         decoder_frames = decoder_config.get("decoder_frames", 2)
         tile_h = decoder_config["height"] // 16   # tile latent height
         tile_w = decoder_config["width"] // 16     # tile latent width
@@ -385,150 +383,110 @@ def main(args):
         vae_decoder_wrapper = DecoderWrapperV3Tiled(
             pipe.vae.decoder, decoder_frames=decoder_frames,
             tile_h_latent=tile_h, tile_w_latent=tile_w, overlap_latent=overlap)
-        decoder_nxd = NxDModel.load(os.path.join(decoder_v3_tiled_path, "nxd_model.pt"))
+        decoder_nxd = NxDModel.load(os.path.join(decoder_tiled_path, "nxd_model.pt"))
         decoder_world_size = decoder_config.get("world_size", 8)
 
-        decoder_weights = load_duplicated_weights(decoder_v3_tiled_path, decoder_world_size)
+        decoder_weights = load_duplicated_weights(decoder_tiled_path, decoder_world_size)
         decoder_nxd.set_weights(decoder_weights)
         decoder_nxd.to_neuron()
 
         vae_decoder_wrapper.nxd_model = decoder_nxd
-        print(f"Decoder (V3 Tiled) loaded. tile={tile_h}x{tile_w} latent, "
+        print(f"Decoder (Tiled) loaded. tile={tile_h}x{tile_w} latent, "
               f"overlap={overlap}, decoder_frames={decoder_frames}")
-    elif os.path.exists(decoder_v3_rolling_path) and not args.force_v1_decoder:
-        print("\nLoading decoder (V3 Rolling Cache - flicker-free)...")
-        decoder_config = load_model_config(decoder_v3_rolling_path)
+    elif os.path.exists(decoder_rolling_path) and not args.force_v1_decoder:
+        print("\nLoading decoder (Rolling Cache - flicker-free)...")
+        decoder_config = load_model_config(decoder_rolling_path)
         decoder_frames = decoder_config.get("decoder_frames", 2)
         vae_decoder_wrapper = DecoderWrapperV3Rolling(pipe.vae.decoder, decoder_frames=decoder_frames)
-        decoder_nxd = NxDModel.load(os.path.join(decoder_v3_rolling_path, "nxd_model.pt"))
+        decoder_nxd = NxDModel.load(os.path.join(decoder_rolling_path, "nxd_model.pt"))
         decoder_world_size = decoder_config.get("world_size", 8)
 
-        decoder_weights = load_duplicated_weights(decoder_v3_rolling_path, decoder_world_size)
+        decoder_weights = load_duplicated_weights(decoder_rolling_path, decoder_world_size)
         decoder_nxd.set_weights(decoder_weights)
         decoder_nxd.to_neuron()
 
         vae_decoder_wrapper.nxd_model = decoder_nxd
-        print(f"Decoder (V3 Rolling) loaded. decoder_frames={decoder_frames}")
-    elif os.path.exists(decoder_v3_nocache_path) and not args.force_v1_decoder:
-        print("\nLoading decoder (V3 NoCache - 1 input arg)...")
-        decoder_config = load_model_config(decoder_v3_nocache_path)
+        print(f"Decoder (Rolling) loaded. decoder_frames={decoder_frames}")
+    elif os.path.exists(decoder_nocache_path) and not args.force_v1_decoder:
+        print("\nLoading decoder (NoCache)...")
+        decoder_config = load_model_config(decoder_nocache_path)
         decoder_frames = decoder_config.get("decoder_frames", 2)
         vae_decoder_wrapper = DecoderWrapperV3NoCache(pipe.vae.decoder, decoder_frames=decoder_frames)
-        decoder_nxd = NxDModel.load(os.path.join(decoder_v3_nocache_path, "nxd_model.pt"))
+        decoder_nxd = NxDModel.load(os.path.join(decoder_nocache_path, "nxd_model.pt"))
         decoder_world_size = decoder_config.get("world_size", 8)
 
-        decoder_weights = load_duplicated_weights(decoder_v3_nocache_path, decoder_world_size)
+        decoder_weights = load_duplicated_weights(decoder_nocache_path, decoder_world_size)
         decoder_nxd.set_weights(decoder_weights)
         decoder_nxd.to_neuron()
 
         vae_decoder_wrapper.nxd_model = decoder_nxd
-        print(f"Decoder (V3 NoCache) loaded. decoder_frames={decoder_frames}")
-    elif os.path.exists(decoder_v3_path) and not args.force_v1_decoder:
-        print("\nLoading decoder (V3 - bfloat16)...")
+        print(f"Decoder (NoCache) loaded. decoder_frames={decoder_frames}")
+    elif os.path.exists(decoder_path) and not args.force_v1_decoder:
+        print("\nLoading decoder...")
         vae_decoder_wrapper = DecoderWrapperV3(pipe.vae.decoder)
-        decoder_nxd = NxDModel.load(os.path.join(decoder_v3_path, "nxd_model.pt"))
-        decoder_config = load_model_config(decoder_v3_path)
+        decoder_nxd = NxDModel.load(os.path.join(decoder_path, "nxd_model.pt"))
+        decoder_config = load_model_config(decoder_path)
         decoder_world_size = decoder_config.get("world_size", 8)
 
-        decoder_weights = load_duplicated_weights(decoder_v3_path, decoder_world_size)
+        decoder_weights = load_duplicated_weights(decoder_path, decoder_world_size)
         decoder_nxd.set_weights(decoder_weights)
         decoder_nxd.to_neuron()
 
         vae_decoder_wrapper.nxd_model = decoder_nxd
-        print("Decoder (V3) loaded.")
-    elif os.path.exists(decoder_v2_path) and not args.force_v1_decoder:
-        print("\nLoading decoder (V2)...")
-        vae_decoder_wrapper = DecoderWrapperV2(pipe.vae.decoder)
-        decoder_nxd = NxDModel.load(os.path.join(decoder_v2_path, "nxd_model.pt"))
-        decoder_config = load_model_config(decoder_v2_path)
-        decoder_world_size = decoder_config.get("world_size", 8)
-
-        decoder_weights = load_duplicated_weights(decoder_v2_path, decoder_world_size)
-        decoder_nxd.set_weights(decoder_weights)
-        decoder_nxd.to_neuron()
-
-        vae_decoder_wrapper.nxd_model = decoder_nxd
-        print("Decoder (V2) loaded.")
-    elif os.path.exists(decoder_v1_path):
-        print("\nLoading decoder (V1)...")
-        vae_decoder_wrapper = DecoderWrapper(pipe.vae.decoder)
-        vae_decoder_wrapper.model = torch.jit.load(decoder_v1_path)
-        print("Decoder (V1) loaded.")
+        print("Decoder loaded.")
     else:
         print("\nNo compiled decoder found, using CPU decoder fallback.")
         use_cpu_decoder = True
         vae_decoder_wrapper = None
 
-    # Load post_quant_conv - check for V3 first, then V2, then V1
-    pqc_v3_path = f"{compiled_models_dir}/post_quant_conv_v3"
-    pqc_v2_path = f"{compiled_models_dir}/post_quant_conv_v2"
-    pqc_v1_path = f"{compiled_models_dir}/post_quant_conv/model.pt"
+    # Load post_quant_conv
+    pqc_path = f"{compiled_models_dir}/post_quant_conv"
     vae_post_quant_conv_wrapper = None
 
     if use_cpu_decoder:
         print("Using CPU post_quant_conv (paired with CPU decoder).")
-    elif os.path.exists(pqc_v3_path) and not args.force_v1_decoder:
-        print("\nLoading post_quant_conv (V3)...")
+    elif os.path.exists(pqc_path) and not args.force_v1_decoder:
+        print("\nLoading post_quant_conv...")
         vae_post_quant_conv_wrapper = PostQuantConvWrapperV2(pipe.vae.post_quant_conv)
-        pqc_nxd = NxDModel.load(os.path.join(pqc_v3_path, "nxd_model.pt"))
-        pqc_config = load_model_config(pqc_v3_path)
+        pqc_nxd = NxDModel.load(os.path.join(pqc_path, "nxd_model.pt"))
+        pqc_config = load_model_config(pqc_path)
         pqc_world_size = pqc_config.get("world_size", 8)
 
-        pqc_weights = load_duplicated_weights(pqc_v3_path, pqc_world_size)
+        pqc_weights = load_duplicated_weights(pqc_path, pqc_world_size)
         pqc_nxd.set_weights(pqc_weights)
         pqc_nxd.to_neuron()
 
         vae_post_quant_conv_wrapper.nxd_model = pqc_nxd
-        print("post_quant_conv (V3) loaded.")
-    elif os.path.exists(pqc_v2_path) and not args.force_v1_decoder:
-        print("\nLoading post_quant_conv (V2)...")
-        vae_post_quant_conv_wrapper = PostQuantConvWrapperV2(pipe.vae.post_quant_conv)
-        pqc_nxd = NxDModel.load(os.path.join(pqc_v2_path, "nxd_model.pt"))
-        pqc_config = load_model_config(pqc_v2_path)
-        pqc_world_size = pqc_config.get("world_size", 8)
-
-        pqc_weights = load_duplicated_weights(pqc_v2_path, pqc_world_size)
-        pqc_nxd.set_weights(pqc_weights)
-        pqc_nxd.to_neuron()
-
-        vae_post_quant_conv_wrapper.nxd_model = pqc_nxd
-        print("post_quant_conv (V2) loaded.")
-    elif os.path.exists(pqc_v1_path):
-        print("\nLoading post_quant_conv (V1)...")
-        vae_post_quant_conv_wrapper = SimpleWrapper(pipe.vae.post_quant_conv)
-        vae_post_quant_conv_wrapper.model = torch_neuronx.DataParallel(
-            torch.jit.load(pqc_v1_path), [0, 1, 2, 3], False
-        )
-        print("post_quant_conv (V1) loaded.")
+        print("post_quant_conv loaded.")
     else:
         print("No compiled post_quant_conv found, using CPU.")
 
     # Load Encoder and quant_conv for I2V (optional, only if --image is provided)
     if args.image:
-        encoder_v3_path = f"{compiled_models_dir}/encoder_v3"
-        qc_v3_path = f"{compiled_models_dir}/quant_conv_v3"
+        encoder_path = f"{compiled_models_dir}/encoder"
+        qc_path = f"{compiled_models_dir}/quant_conv"
 
-        if os.path.exists(encoder_v3_path):
-            print("\nLoading encoder (V3 - bfloat16, trace)...")
+        if os.path.exists(encoder_path):
+            print("\nLoading encoder...")
             vae_encoder_wrapper = EncoderWrapperV3(pipe.vae.encoder)
             vae_encoder_wrapper.model = torch.jit.load(
-                os.path.join(encoder_v3_path, "model.pt")
+                os.path.join(encoder_path, "model.pt")
             )
             pipe.vae.encoder = vae_encoder_wrapper
-            print("Encoder (V3) loaded.")
+            print("Encoder loaded.")
         else:
-            print("\nEncoder V3 not found, using CPU encoder for I2V.")
+            print("\nCompiled encoder not found, using CPU encoder for I2V.")
 
-        if os.path.exists(qc_v3_path):
-            print("\nLoading quant_conv (V3 - trace)...")
+        if os.path.exists(qc_path):
+            print("\nLoading quant_conv...")
             vae_quant_conv_wrapper = QuantConvWrapperV3(pipe.vae.quant_conv)
             vae_quant_conv_wrapper.model = torch.jit.load(
-                os.path.join(qc_v3_path, "model.pt")
+                os.path.join(qc_path, "model.pt")
             )
             pipe.vae.quant_conv = vae_quant_conv_wrapper
-            print("quant_conv (V3) loaded.")
+            print("quant_conv loaded.")
         else:
-            print("\nquant_conv V3 not found, using CPU quant_conv for I2V.")
+            print("\nCompiled quant_conv not found, using CPU quant_conv for I2V.")
 
     # Replace pipeline components
     pipe.text_encoder = text_encoder_wrapper

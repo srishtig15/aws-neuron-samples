@@ -100,7 +100,7 @@ The transformer sequence length is 5376 tokens (21 latent frames x 256 spatial).
 - Self-attention uses scatter/gather collectives for cross-sequence communication
 - Cross-attention (text conditioning) doesn't need CP since the text sequence is shared
 
-Implementation: `neuron_wan2_2_ti2v/compile_transformer_v3_cp.py`
+Implementation: `neuron_wan2_2_ti2v/compile_transformer.py`
 
 ### 2. local_rms_norm (Compiler Bug Workaround)
 
@@ -150,7 +150,7 @@ For I2V mode, the input image is encoded into latent space using the VAE encoder
 
 The `EncoderWrapperV3` handles frame padding, dtype conversion, and ignoring `feat_cache`/`feat_idx` arguments.
 
-Implementation: `neuron_wan2_2_ti2v/compile_encoder_v3.py`
+Implementation: `neuron_wan2_2_ti2v/compile_encoder.py`
 
 ### 6. Temporal Chunked Decoding
 
@@ -190,12 +190,12 @@ Implementation: `DecoderWrapperV3Tiled` in `neuron_wan2_2_ti2v/neuron_commons.py
 
 | File | Description |
 |------|-------------|
-| `compile_transformer_v3_cp.py` | Transformer (TP=4, CP=2, local_rms_norm) |
-| `compile_text_encoder_v2.py` | Text encoder (ModelBuilder API) |
-| `compile_decoder_v3_nocache.py` | VAE decoder (bfloat16, NoCache, `--model-type=unet-inference`) |
-| `compile_decoder_v3_rolling.py` | VAE decoder with rolling cache (for tiled decode) |
-| `compile_decoder_v3.py` | VAE decoder with external feat_cache (fallback) |
-| `compile_encoder_v3.py` | VAE encoder + quant_conv (for I2V) |
+| `compile_transformer.py` | Transformer (TP=4, CP=2, local_rms_norm) |
+| `compile_text_encoder.py` | Text encoder (ModelBuilder API) |
+| `compile_decoder_nocache.py` | VAE decoder (bfloat16, NoCache, `--model-type=unet-inference`) |
+| `compile_decoder_rolling.py` | VAE decoder with rolling cache (for tiled decode) |
+| `compile_decoder.py` | VAE decoder with external feat_cache (fallback) |
+| `compile_encoder.py` | VAE encoder + quant_conv (for I2V) |
 | `cache_hf_model.py` | Download and cache HuggingFace model |
 
 ### Runtime
@@ -209,7 +209,6 @@ Implementation: `DecoderWrapperV3Tiled` in `neuron_wan2_2_ti2v/neuron_commons.py
 | File | Description |
 |------|-------------|
 | `neuron_commons.py` | Decoder/encoder wrappers, attention utilities |
-| `neuron_commons_v2.py` | Text encoder wrapper for NxDModel |
 | `neuron_parallel_utils.py` | Tensor parallel utilities for UMT5 sharding |
 | `distributed_rmsnorm.py` | Distributed RMSNorm (reference, not used due to compiler bug) |
 

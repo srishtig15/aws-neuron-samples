@@ -194,7 +194,7 @@ def compile_decoder_v3(args):
         )
 
         # Save decoder
-        decoder_output_path = f"{compiled_models_dir}/decoder_v3"
+        decoder_output_path = f"{compiled_models_dir}/decoder"
         os.makedirs(decoder_output_path, exist_ok=True)
         print(f"Saving decoder to {decoder_output_path}...")
         traced_decoder.save(os.path.join(decoder_output_path, "nxd_model.pt"))
@@ -247,7 +247,7 @@ def compile_decoder_v3(args):
         )
 
         # Save post_quant_conv
-        pqc_output_path = f"{compiled_models_dir}/post_quant_conv_v3"
+        pqc_output_path = f"{compiled_models_dir}/post_quant_conv"
         os.makedirs(pqc_output_path, exist_ok=True)
         print(f"Saving post_quant_conv to {pqc_output_path}...")
         traced_pqc.save(os.path.join(pqc_output_path, "nxd_model.pt"))

@@ -140,7 +140,7 @@ def compile_encoder_v3(args):
         )
 
     # Save encoder
-    encoder_output_path = f"{compiled_models_dir}/encoder_v3"
+    encoder_output_path = f"{compiled_models_dir}/encoder"
     os.makedirs(encoder_output_path, exist_ok=True)
     print(f"Saving encoder to {encoder_output_path}...")
     torch.jit.save(compiled_encoder, os.path.join(encoder_output_path, "model.pt"))
@@ -184,7 +184,7 @@ def compile_encoder_v3(args):
         )
 
     # Save quant_conv
-    qc_output_path = f"{compiled_models_dir}/quant_conv_v3"
+    qc_output_path = f"{compiled_models_dir}/quant_conv"
     os.makedirs(qc_output_path, exist_ok=True)
     print(f"Saving quant_conv to {qc_output_path}...")
     torch.jit.save(compiled_qc, os.path.join(qc_output_path, "model.pt"))

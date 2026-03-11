@@ -134,7 +134,7 @@ def compile_text_encoder_v2(args):
         traced_model = builder.compile()
 
         # Save model
-        output_path = f"{compiled_models_dir}/text_encoder_v2"
+        output_path = f"{compiled_models_dir}/text_encoder"
         os.makedirs(output_path, exist_ok=True)
 
         print(f"Saving compiled model to {output_path}...")

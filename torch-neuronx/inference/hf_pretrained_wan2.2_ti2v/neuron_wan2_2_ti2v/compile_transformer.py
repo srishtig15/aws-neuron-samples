@@ -1015,7 +1015,7 @@ def compile_transformer_v3_cp(args):
         )
 
         # Save
-        output_path = f"{args.compiled_models_dir}/transformer_v3_cp"
+        output_path = f"{args.compiled_models_dir}/transformer"
         os.makedirs(output_path, exist_ok=True)
 
         print(f"\nSaving to {output_path}...")
@@ -1112,8 +1112,8 @@ if __name__ == "__main__":
     parser.add_argument("--max_sequence_length", type=int, default=512, help="Max text sequence length")
     parser.add_argument("--tp_degree", type=int, default=4, help="Tensor parallelism degree")
     parser.add_argument("--world_size", type=int, default=8, help="Total world size (TP x CP)")
-    parser.add_argument("--compiled_models_dir", type=str, default="compile_workdir_v3_cp", help="Output directory")
-    parser.add_argument("--compiler_workdir", type=str, default="compiler_workdir_v3_cp", help="Compiler workdir")
+    parser.add_argument("--compiled_models_dir", type=str, default="compiled_models", help="Output directory")
+    parser.add_argument("--compiler_workdir", type=str, default="compiler_workdir", help="Compiler workdir")
     args = parser.parse_args()
 
     compile_transformer_v3_cp(args)
