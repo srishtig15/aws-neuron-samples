@@ -18,6 +18,9 @@ Timing is pure inference (excludes model loading and warmup). See `test_results.
 ## Quick Start
 
 ```bash
+# Mount NVMe storage (trn2.48xlarge has ~7.6TB NVMe)
+sudo ./setup_nvme.sh
+
 # Activate Neuron virtual environment
 source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
 
@@ -204,6 +207,7 @@ Implementation: `DecoderWrapperV3Tiled` in `neuron_wan2_2_ti2v/neuron_commons.py
 
 | File | Description |
 |------|-------------|
+| `setup_nvme.sh` | Mount NVMe RAID0 storage at `/opt/dlami/nvme` |
 | `compile.sh` | Full compilation pipeline |
 | `test_resolutions.sh` | Multi-resolution test suite (auto-tiling for 720P+) |
 
