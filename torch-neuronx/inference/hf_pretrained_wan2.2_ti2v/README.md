@@ -75,8 +75,6 @@ Video Output (512x512, 81 frames)
 
 ## Compilation Approaches
 
-This project evolved through multiple optimization iterations. The recommended approach is **V3 CP**.
-
 ### V3 CP (Recommended)
 
 - **Script**: `compile_v3_cp.sh` / `run_wan2.2_ti2v_v3_cp.py`
@@ -105,18 +103,6 @@ This project evolved through multiple optimization iterations. The recommended a
 ./compile_v3_flash.sh [output_dir] [compiler_workdir]
 # Default: /opt/dlami/nvme/compiled_models_v3_flash
 ```
-
-### V2 (Legacy)
-
-- **Script**: `compile_latency_optimized_v2.sh` / `run_wan2.2_ti2v_latency_optimized_v2.py`
-- **Transformer**: TP=8, standard attention
-- **Decoder**: V1 TorchScript (single core)
-- Uses ModelBuilder API for text encoder and transformer, falls back to V1 TorchScript for decoder
-
-### V1 (Deprecated)
-
-- **Script**: `compile_latency_optimized.sh` / `run_wan2.2_ti2v_latency_optimized.py`
-- All TorchScript via deprecated `parallel_model_trace()` API
 
 ## Key Optimizations
 
@@ -257,7 +243,6 @@ Implementation: `DecoderWrapperV3Tiled` in `neuron_wan2_2_ti2v/neuron_commons.py
 |------|-------------|
 | `compile_v3_cp.sh` | **Recommended**: Full V3 CP compilation pipeline |
 | `compile_v3_flash.sh` | V3 Flash compilation pipeline |
-| `compile_latency_optimized_v2.sh` | V2 compilation pipeline (legacy) |
 | `test_resolutions.sh` | Multi-resolution test suite (auto-tiling for 720P+) |
 
 ## Inference Options

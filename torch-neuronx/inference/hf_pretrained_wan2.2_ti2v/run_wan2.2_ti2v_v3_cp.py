@@ -41,7 +41,7 @@ from safetensors.torch import load_file
 from neuron_wan2_2_ti2v.neuron_commons_v2 import InferenceTextEncoderWrapperV2
 from neuron_wan2_2_ti2v.neuron_commons import (
     SimpleWrapper, DecoderWrapper, DecoderWrapperV2, DecoderWrapperV3,
-    DecoderWrapperV3NoCache, DecoderWrapperV3Rolling, DecoderWrapperV3TPRolling,
+    DecoderWrapperV3NoCache, DecoderWrapperV3Rolling,
     DecoderWrapperV3Tiled,
     PostQuantConvWrapperV2, EncoderWrapperV3, QuantConvWrapperV3,
 )
@@ -366,10 +366,9 @@ def main(args):
     text_encoder_wrapper.t = text_encoder_nxd
     print("Text encoder loaded.")
 
-    # Load Decoder - check for Tiled, TP Rolling, Rolling, NoCache, V3, V2, V1, CPU fallback
+    # Load Decoder - check for Tiled, Rolling, NoCache, V3, V2, V1, CPU fallback
     use_cpu_decoder = False
     decoder_v3_tiled_path = f"{compiled_models_dir}/decoder_v3_tiled"
-    decoder_v3_tp_rolling_path = f"{compiled_models_dir}/decoder_v3_tp_rolling"
     decoder_v3_rolling_path = f"{compiled_models_dir}/decoder_v3_rolling"
     decoder_v3_nocache_path = f"{compiled_models_dir}/decoder_v3_nocache"
     decoder_v3_path = f"{compiled_models_dir}/decoder_v3"
@@ -396,31 +395,6 @@ def main(args):
         vae_decoder_wrapper.nxd_model = decoder_nxd
         print(f"Decoder (V3 Tiled) loaded. tile={tile_h}x{tile_w} latent, "
               f"overlap={overlap}, decoder_frames={decoder_frames}")
-    elif os.path.exists(decoder_v3_tp_rolling_path) and not args.force_v1_decoder:
-        print("\nLoading decoder (V3 TP Rolling Cache)...")
-        decoder_config = load_model_config(decoder_v3_tp_rolling_path)
-        decoder_frames = decoder_config.get("decoder_frames", 2)
-        decoder_tp = decoder_config.get("tp_degree", 4)
-        vae_decoder_wrapper = DecoderWrapperV3TPRolling(
-            pipe.vae.decoder, decoder_frames=decoder_frames, tp_degree=decoder_tp)
-        decoder_nxd = NxDModel.load(os.path.join(decoder_v3_tp_rolling_path, "nxd_model.pt"))
-
-        decoder_weights = load_sharded_weights(decoder_v3_tp_rolling_path, decoder_tp)
-        # Duplicate TP shards for world_size ranks (TP shards repeat for CP ranks)
-        decoder_world_size = decoder_config.get("world_size", 8)
-        if len(decoder_weights) < decoder_world_size:
-            cp_degree = decoder_world_size // decoder_tp
-            full_weights = []
-            for cp_rank in range(cp_degree):
-                for tp_rank in range(decoder_tp):
-                    full_weights.append(decoder_weights[tp_rank])
-            decoder_weights = full_weights
-
-        decoder_nxd.set_weights(decoder_weights)
-        decoder_nxd.to_neuron()
-
-        vae_decoder_wrapper.nxd_model = decoder_nxd
-        print(f"Decoder (V3 TP Rolling, TP={decoder_tp}) loaded. decoder_frames={decoder_frames}")
     elif os.path.exists(decoder_v3_rolling_path) and not args.force_v1_decoder:
         print("\nLoading decoder (V3 Rolling Cache - flicker-free)...")
         decoder_config = load_model_config(decoder_v3_rolling_path)
