@@ -799,6 +799,48 @@ class DecoderWrapperV3NoCache(nn.Module):
 
         return output
 
+    def decode_latents(self, z):
+        """
+        Decode all latent frames in chunks of decoder_frames.
+
+        Args:
+            z: (B, C, T_latent, H_latent, W_latent) after post_quant_conv
+        Returns:
+            (B, out_channels, T_out, H_out, W_out) float32
+        """
+        T_latent = z.shape[2]
+        outputs = []
+        t = 0
+        while t < T_latent:
+            t_end = min(t + self.decoder_frames, T_latent)
+            chunk = z[:, :, t:t_end]
+            actual = chunk.shape[2]
+
+            if actual < self.decoder_frames:
+                pad = self.decoder_frames - actual
+                chunk = torch.cat([chunk] + [chunk[:, :, -1:]] * pad, dim=2)
+
+            _t0 = time.time()
+            output = self.nxd_model(chunk.to(torch.bfloat16))
+            _t1 = time.time()
+
+            if isinstance(output, (list, tuple)):
+                output = output[0]
+            output = output.to(torch.float32)
+
+            out_frames = actual * 4
+            if output.shape[2] > out_frames:
+                output = output[:, :, :out_frames]
+            outputs.append(output)
+
+            print(f"[nocache] nxd_model={_t1-_t0:.4f}s frames={actual} total_out={out_frames}")
+            t = t_end
+
+        return torch.cat(outputs, dim=2)
+
+    def reset_cache(self):
+        pass
+
     def clear_cache(self):
         pass
 
@@ -876,6 +918,58 @@ class DecoderWrapperV3Rolling(nn.Module):
         print(f"[rolling] prep={_t1-_t0:.4f}s nxd_model={_t2-_t1:.4f}s postproc={_t3-_t2:.4f}s total={_t3-_t0:.4f}s frames={original_frame_count}")
 
         return output
+
+    def decode_latents(self, z):
+        """
+        Decode all latent frames in chunks of decoder_frames.
+
+        Without this, diffusers' default _decode calls forward() once per
+        latent frame (21 calls for 81 video frames). By chunking into
+        decoder_frames=2, we get 11 calls instead: 1 + 10*2 = 21 latent frames.
+
+        Args:
+            z: (B, C, T_latent, H_latent, W_latent) after post_quant_conv
+        Returns:
+            (B, out_channels, T_out, H_out, W_out) float32
+        """
+        T_latent = z.shape[2]
+        outputs = []
+        t = 0
+        while t < T_latent:
+            t_end = min(t + self.decoder_frames, T_latent)
+            chunk = z[:, :, t:t_end]
+            actual = chunk.shape[2]
+
+            if actual < self.decoder_frames:
+                pad = self.decoder_frames - actual
+                chunk = torch.cat([chunk] + [chunk[:, :, -1:]] * pad, dim=2)
+
+            x_bf16 = chunk.to(torch.bfloat16)
+            if self.caches is None:
+                self._init_caches(x_bf16)
+
+            _t0 = time.time()
+            results = self.nxd_model(x_bf16, *self.caches)
+            _t1 = time.time()
+
+            if isinstance(results, (tuple, list)):
+                output = results[0]
+                self.caches = [r.to(torch.bfloat16) for r in results[1:1 + self.num_cache_tensors]]
+            else:
+                output = results
+            if isinstance(output, (list, tuple)):
+                output = output[0]
+            output = output.to(torch.float32)
+
+            out_frames = actual * 4
+            if output.shape[2] > out_frames:
+                output = output[:, :, :out_frames]
+            outputs.append(output)
+
+            print(f"[rolling] nxd_model={_t1-_t0:.4f}s frames={actual} total_out={out_frames}")
+            t = t_end
+
+        return torch.cat(outputs, dim=2)
 
     def reset_cache(self):
         """Reset rolling cache to zeros for next video generation."""

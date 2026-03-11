@@ -13,7 +13,7 @@ This project implements [Wan2.2-TI2V-5B](https://huggingface.co/Wan-AI/Wan2.2-TI
 | 1280x704 | 16 | 81 | 163.88 | 87.66 | tiled |
 | 1280x704 | 24 | 121 | 260.01 | 143.20 | tiled |
 
-Timing is pure inference (excludes model loading and warmup). See `test_results.txt` and `test_results_gpu.txt`.
+Timing is pure inference (excludes model loading and warmup). Results pending re-run with `decode_latents` chunking fix. See `test_results.txt` and `test_results_gpu.txt`.
 
 ## Quick Start
 
@@ -69,13 +69,13 @@ Video Output (512x512, 81 frames)
 
 ### Performance Breakdown (512x512, trn2.48xlarge)
 
-| Component | Time | Details |
-|-----------|------|---------|
-| Text Encoder | ~0.4s | UMT5, single call |
-| Transformer | ~21s | 50 steps @ 0.43s/step |
-| VAE Decoder | ~5.6s | 11 calls @ 0.50s/call (Rolling Cache) |
-| post_quant_conv | ~0.003s | Single call |
-| **Total** | **~27s** | |
+| Component | Time (Rolling) | Time (NoCache) | Details |
+|-----------|---------------|----------------|---------|
+| Text Encoder | ~0.4s | ~0.4s | UMT5, single call |
+| Transformer | ~21s | ~21s | 50 steps @ 0.43s/step |
+| VAE Decoder | ~11.3s | ~5.5s | 11 calls @ 1.03s (Rolling) / 0.50s (NoCache) |
+| post_quant_conv | ~0.003s | ~0.003s | Single call |
+| **Total** | **~33s** | **~27s** | Rolling: flicker-free, NoCache: faster |
 
 ## Compilation
 
