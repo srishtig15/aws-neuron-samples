@@ -68,6 +68,7 @@ Video Output (512x512, 81 frames)
 
 | Component | Time | Details |
 |-----------|------|---------|
+| Text Encoder | ~0.4s | UMT5, single call |
 | Transformer | ~21s | 50 steps @ 0.43s/step |
 | VAE Decoder | ~5.6s | 11 calls @ 0.50s/call (NoCache) |
 | post_quant_conv | ~0.003s | Single call |
