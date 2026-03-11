@@ -179,7 +179,7 @@ The VAE decoder processes latent frames in chunks of 2 (CACHE_T=2) with causal t
 - Call 1: First frame (with `first_chunk=True`)
 - Calls 2-11: Two frames per call
 
-This is implemented in the custom `autoencoder_kl_wan.py` which replaces the diffusers default.
+The compile scripts patch the diffusers `autoencoder_kl_wan.py` in-place via `sed` to replace `nearest-exact` with `nearest` for Trainium2 compatibility.
 
 ### 7. Tiled Spatial Decode (720P+)
 
@@ -226,7 +226,6 @@ Implementation: `DecoderWrapperV3Tiled` in `neuron_wan2_2_ti2v/neuron_commons.py
 |------|-------------|
 | `run_wan2.2_ti2v_v3_cp.py` | V3 CP inference script |
 | `run_wan2.2_ti2v_v3_flash.py` | V3 Flash inference script |
-| `autoencoder_kl_wan.py` | Custom VAE with temporal chunked decoding |
 
 ### Wrappers and Utilities (`neuron_wan2_2_ti2v/`)
 
@@ -300,7 +299,7 @@ NEURON_LOGICAL_NC_CONFIG=2
 ## Troubleshooting
 
 ### "nearest-exact" interpolation error
-The custom `autoencoder_kl_wan.py` patches `F.interpolate` to replace `nearest-exact` with `nearest` for Trainium2 compatibility. The compile scripts automatically copy this file to the diffusers package.
+The compile scripts patch the diffusers `autoencoder_kl_wan.py` in-place via `sed` to replace `nearest-exact` with `nearest` for Trainium2 compatibility.
 
 ### Replica groups assertion error
 If you see errors about replica groups `[[0,1,2,3]]` vs expected `[[0,1,2,3],[4,5,6,7]]`, this is the Neuron compiler bug with `DistributedRMSNorm`. The V3 CP transformer uses `local_rms_norm` to avoid this. Ensure you're using the latest `compile_transformer_v3_cp.py`.
