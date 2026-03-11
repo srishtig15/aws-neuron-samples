@@ -41,7 +41,7 @@ Wan2.2-T2V-A14B is a **Mixture-of-Experts (MoE)** text-to-video diffusion model 
    - Steps 14-40: transformer_2 (low-noise expert, guidance_scale_2=3.0)
 3. **VAE Decode** (Neuron or CPU): Chunked decoder with rolling feat_cache for flicker-free output
    - 480P: Auto-detects rolling cache (`decoder_rolling/`) or NoCache (`decoder_nocache/`) mode
-   - 720P: CPU fallback (Neuron decoder exceeds instruction limit at this resolution)
+   - 720P: Tiled Neuron decode with 480P patches (`decoder_rolling_480p/`) or CPU fallback
 
 ## Performance
 
@@ -60,8 +60,11 @@ Wan2.2-T2V-A14B is a **Mixture-of-Experts (MoE)** text-to-video diffusion model 
 |-------|------|
 | Text Encoding (CPU) | ~5s |
 | Denoising (40 steps, subprocess mode) | ~1069s (~16.1s/step + 2×188s model load) |
-| VAE Decode (CPU fallback) | ~585s |
-| **Inference time** | **~1659s (~27.6min)** |
+| VAE Decode (Neuron tiled) | ~109s (76s decode + 33s load) |
+| **Inference time** | **~1183s (~19.7min)** |
+
+> **Note**: Tiled decode uses 4 overlapping 480P patches (2×2 grid) with linear-ramp blending.
+> CPU fallback (~585s) is still available via `--cpu_vae_decoder` or if `decoder_rolling_480p/` is not compiled.
 
 ## Prerequisites
 
@@ -107,10 +110,11 @@ python run_wan2.2_t2v_a14b.py \
 | 2 | Text Encoder (TP=4) | `text_encoder/` |
 | 3 | Transformer - high-noise expert (TP=4, CP=N) | `transformer/` |
 | 4 | Transformer_2 - low-noise expert (TP=4, CP=N) | `transformer_2/` |
-| 5 | VAE Decoder (Rolling Cache, 480P only) | `decoder_rolling/` |
-| 6 | Post-quant conv | `post_quant_conv/` |
+| 5 | VAE Decoder (Rolling Cache, 480P) | `decoder_rolling/` |
+| 5b | VAE Decoder (480P patches, for tiled 720P decode) | `decoder_rolling_480p/` |
+| 6 | Post-quant conv (480P only) | `post_quant_conv/` |
 
-For 720P, compile with `--height 720 --width 1280` which sets CP=4 (world_size=16). The VAE decoder is not compiled for 720P (instruction limit exceeded); CPU fallback is used automatically.
+For 720P, compile with `--height 720 --width 1280` which sets CP=4 (world_size=16). Step 5b compiles a 480P decoder for tiled 720P decode (`decoder_rolling_480p/`). The full-resolution 720P decoder exceeds the instruction limit; tiled decode uses 480P patches with overlap blending instead.
 
 The script auto-patches `nearest-exact` → `nearest` in diffusers for Trainium2 compatibility.
 
@@ -138,9 +142,10 @@ The inference script auto-detects which decoder mode to use:
 | Mode | Directory | Flicker | Transfer/chunk | Notes |
 |------|-----------|---------|----------------|-------|
 | **Rolling Cache** | `decoder_rolling/` | No | ~3.6GB (1.8GB in + out) | feat_cache carried between chunks as I/O |
+| **Tiled (720P)** | `decoder_rolling_480p/` | No | ~3.6GB × 4 tiles | 480P rolling cache patches with overlap blending |
 | **NoCache** | `decoder_nocache/` | Yes | ~300KB | feat_cache as zero buffers, no temporal context |
 
-Rolling cache is preferred. If `decoder_rolling/nxd_model.pt` exists, it is used automatically.
+Rolling cache is preferred. Auto-detection priority: full-res rolling/nocache → tiled 480P → CPU fallback.
 
 ## File Structure
 

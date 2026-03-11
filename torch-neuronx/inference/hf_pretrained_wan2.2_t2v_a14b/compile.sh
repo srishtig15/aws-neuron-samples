@@ -72,29 +72,47 @@ WORLD_SIZE=${WORLD_SIZE} neuron_parallel_compile python neuron_wan2_2_t2v_a14b/c
     --transformer_subfolder transformer_2 \
     --output_dir "${COMPILED_MODELS_DIR}/transformer_2"
 
-echo "[Step 5/6] Compiling VAE Decoder (Rolling Cache)..."
-WORLD_SIZE=${WORLD_SIZE} neuron_parallel_compile python neuron_wan2_2_t2v_a14b/compile_decoder_rolling.py \
-    --compiled_models_dir "${COMPILED_MODELS_DIR}" \
-    --compiler_workdir "${COMPILER_WORKDIR}/decoder_rolling" \
-    --height ${HEIGHT} \
-    --width ${WIDTH} \
-    --num_frames ${NUM_FRAMES} \
-    --decoder_frames 2 \
-    --tp_degree 8 \
-    --world_size 8 \
-    --cache_dir "${CACHE_DIR}"
+if [ "$HEIGHT" -le 480 ]; then
+    echo "[Step 5/6] Compiling VAE Decoder (Rolling Cache)..."
+    WORLD_SIZE=${WORLD_SIZE} neuron_parallel_compile python neuron_wan2_2_t2v_a14b/compile_decoder_rolling.py \
+        --compiled_models_dir "${COMPILED_MODELS_DIR}" \
+        --compiler_workdir "${COMPILER_WORKDIR}/decoder_rolling" \
+        --height ${HEIGHT} \
+        --width ${WIDTH} \
+        --num_frames ${NUM_FRAMES} \
+        --decoder_frames 2 \
+        --tp_degree 8 \
+        --world_size 8 \
+        --cache_dir "${CACHE_DIR}"
 
-echo "[Step 6/6] Compiling post_quant_conv..."
-WORLD_SIZE=${WORLD_SIZE} neuron_parallel_compile python neuron_wan2_2_t2v_a14b/compile_decoder_nocache.py \
-    --compiled_models_dir "${COMPILED_MODELS_DIR}" \
-    --compiler_workdir "${COMPILER_WORKDIR}/pqc" \
-    --height ${HEIGHT} \
-    --width ${WIDTH} \
-    --num_frames ${NUM_FRAMES} \
-    --tp_degree 8 \
-    --world_size 8 \
-    --cache_dir "${CACHE_DIR}" \
-    --compile_post_quant_conv
+    echo "[Step 6/6] Compiling post_quant_conv..."
+    WORLD_SIZE=${WORLD_SIZE} neuron_parallel_compile python neuron_wan2_2_t2v_a14b/compile_decoder_nocache.py \
+        --compiled_models_dir "${COMPILED_MODELS_DIR}" \
+        --compiler_workdir "${COMPILER_WORKDIR}/pqc" \
+        --height ${HEIGHT} \
+        --width ${WIDTH} \
+        --num_frames ${NUM_FRAMES} \
+        --tp_degree 8 \
+        --world_size 8 \
+        --cache_dir "${CACHE_DIR}" \
+        --compile_post_quant_conv
+else
+    echo "[Step 5/6] Compiling 480P VAE Decoder for tiled decode..."
+    echo "  (720P full-res decoder exceeds instruction limit; using 480P tiled approach)"
+    WORLD_SIZE=8 neuron_parallel_compile python neuron_wan2_2_t2v_a14b/compile_decoder_rolling.py \
+        --compiled_models_dir "${COMPILED_MODELS_DIR}" \
+        --compiler_workdir "${COMPILER_WORKDIR}/decoder_rolling_480p" \
+        --height 480 \
+        --width 832 \
+        --num_frames ${NUM_FRAMES} \
+        --decoder_frames 2 \
+        --tp_degree 8 \
+        --world_size 8 \
+        --output_subdir decoder_rolling_480p \
+        --cache_dir "${CACHE_DIR}"
+
+    echo "[Step 6/6] Skipping post_quant_conv (tiled mode runs PQC on CPU)"
+fi
 
 echo "=============================================="
 echo "Compilation Complete!"

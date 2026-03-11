@@ -193,7 +193,7 @@ def compile_decoder_rolling(args):
         )
 
         # Save
-        output_path = f"{compiled_models_dir}/decoder_rolling"
+        output_path = f"{compiled_models_dir}/{args.output_subdir}"
         os.makedirs(output_path, exist_ok=True)
         print(f"Saving to {output_path}...")
         traced.save(os.path.join(output_path, "nxd_model.pt"))
@@ -237,6 +237,8 @@ if __name__ == "__main__":
     parser.add_argument("--world_size", type=int, default=8)
     parser.add_argument("--compiled_models_dir", type=str, default="compiled_models")
     parser.add_argument("--compiler_workdir", type=str, default="compiler_workdir")
+    parser.add_argument("--output_subdir", type=str, default="decoder_rolling",
+                        help="Subdirectory name within compiled_models_dir (default: decoder_rolling)")
     parser.add_argument("--cache_dir", type=str, default="/opt/dlami/nvme/wan2.2_t2v_a14b_hf_cache_dir")
     args = parser.parse_args()
 
