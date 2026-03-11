@@ -21,8 +21,8 @@ if grep -q 'nearest-exact' "${VAE_FILE}" 2>/dev/null; then
 fi
 
 # Configuration
-COMPILED_MODELS_DIR="${1:-/opt/dlami/nvme/compiled_models}"
-COMPILER_WORKDIR="${2:-/opt/dlami/nvme/compiler_workdir}"
+COMPILED_MODELS_DIR="${1:-/opt/dlami/nvme/compiled_models_wan2.2_ti2v_5b}"
+COMPILER_WORKDIR="${2:-/opt/dlami/nvme/compiler_workdir_wan2.2_ti2v_5b}"
 
 # Video settings (should match inference)
 HEIGHT=512

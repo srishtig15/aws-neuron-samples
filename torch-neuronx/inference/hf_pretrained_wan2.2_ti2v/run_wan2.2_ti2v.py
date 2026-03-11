@@ -316,7 +316,7 @@ def prepare_image_latents(pipe, image, num_frames, height, width, device, dtype,
 
 
 # Defaults
-DEFAULT_COMPILED_MODELS_DIR = "/opt/dlami/nvme/compiled_models"
+DEFAULT_COMPILED_MODELS_DIR = "/opt/dlami/nvme/compiled_models_wan2.2_ti2v_5b"
 HUGGINGFACE_CACHE_DIR = "/opt/dlami/nvme/wan2.2_ti2v_hf_cache_dir"
 SEED = 42
 

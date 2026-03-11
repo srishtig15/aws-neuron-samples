@@ -29,12 +29,12 @@ pip install -r requirements.txt
 
 # Text-to-Video (T2V)
 python run_wan2.2_ti2v.py \
-    --compiled_models_dir /opt/dlami/nvme/compiled_models \
+    --compiled_models_dir /opt/dlami/nvme/compiled_models_wan2.2_ti2v_5b \
     --prompt "A cat walks on the grass, realistic"
 
 # Image-to-Video (I2V)
 python run_wan2.2_ti2v.py \
-    --compiled_models_dir /opt/dlami/nvme/compiled_models \
+    --compiled_models_dir /opt/dlami/nvme/compiled_models_wan2.2_ti2v_5b \
     --image input.png \
     --prompt "A cat walks on the grass, realistic"
 ```
@@ -77,7 +77,7 @@ Video Output (512x512, 81 frames)
 
 ```bash
 ./compile.sh [output_dir] [compiler_workdir]
-# Default: /opt/dlami/nvme/compiled_models
+# Default: /opt/dlami/nvme/compiled_models_wan2.2_ti2v_5b
 ```
 
 The compilation script compiles all components:
@@ -225,7 +225,7 @@ Implementation: `DecoderWrapperV3Tiled` in `neuron_wan2_2_ti2v/neuron_commons.py
 
 ```bash
 python run_wan2.2_ti2v.py \
-    --compiled_models_dir /opt/dlami/nvme/compiled_models \
+    --compiled_models_dir /opt/dlami/nvme/compiled_models_wan2.2_ti2v_5b \
     --prompt "A cat walks on the grass, realistic" \
     --negative_prompt "blurred, low quality, static" \
     --output output.mp4
@@ -235,7 +235,7 @@ python run_wan2.2_ti2v.py \
 
 ```bash
 python run_wan2.2_ti2v.py \
-    --compiled_models_dir /opt/dlami/nvme/compiled_models \
+    --compiled_models_dir /opt/dlami/nvme/compiled_models_wan2.2_ti2v_5b \
     --image input.png \
     --prompt "A cat walks on the grass, realistic" \
     --output output_i2v.mp4
@@ -245,7 +245,7 @@ The I2V pipeline encodes the input image into the first latent frame, then gener
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--compiled_models_dir` | `/opt/dlami/nvme/compiled_models` | Compiled model directory |
+| `--compiled_models_dir` | `/opt/dlami/nvme/compiled_models_wan2.2_ti2v_5b` | Compiled model directory |
 | `--image` | None | Input image for I2V (omit for T2V) |
 | `--height` | 512 | Video height |
 | `--width` | 512 | Video width |
