@@ -207,7 +207,7 @@ print(f'Tiled config saved: tile={config[\"height\"]}x{config[\"width\"]}, overl
 
     # Run inference
     echo "[${TAG}] Running inference..."
-    python run_wan2.2_ti2v_v3_cp.py \
+    python run_wan2.2_ti2v.py \
         --compiled_models_dir "${COMPILED_DIR}" \
         --height ${HEIGHT} \
         --width ${WIDTH} \

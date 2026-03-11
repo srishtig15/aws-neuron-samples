@@ -14,7 +14,7 @@ Key differences from v2:
 - V2 decoder accepts 34 individual feat_cache tensor arguments
 
 Usage:
-    NEURON_RT_NUM_CORES=8 python run_wan2.2_ti2v_v3_cp.py --compiled_models_dir compile_workdir_v3_cp
+    NEURON_RT_NUM_CORES=8 python run_wan2.2_ti2v.py --compiled_models_dir compiled_models
 """
 # IMPORTANT: Set environment variables BEFORE any imports
 import os
@@ -316,7 +316,7 @@ def prepare_image_latents(pipe, image, num_frames, height, width, device, dtype,
 
 
 # Defaults
-DEFAULT_COMPILED_MODELS_DIR = "/opt/dlami/nvme/compile_workdir_v3_cp"
+DEFAULT_COMPILED_MODELS_DIR = "/opt/dlami/nvme/compiled_models"
 HUGGINGFACE_CACHE_DIR = "/opt/dlami/nvme/wan2.2_ti2v_hf_cache_dir"
 SEED = 42
 
@@ -665,7 +665,7 @@ if __name__ == "__main__":
                         default="Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards",
                         help="Negative prompt")
     parser.add_argument("--image", type=str, default=None, help="Input image for I2V (omit for T2V)")
-    parser.add_argument("--output", type=str, default="output_v3_cp.mp4", help="Output video path")
+    parser.add_argument("--output", type=str, default="output.mp4", help="Output video path")
     parser.add_argument("--fps", type=int, default=16, help="Output video FPS (default: 16)")
     parser.add_argument("--force_v1_decoder", action="store_true", help="Force use V1 decoder (faster)")
     args = parser.parse_args()

@@ -18,7 +18,7 @@ if [[ "$1" == "--skip-warmup" ]]; then
     SKIP_WARMUP=true
 fi
 
-# Parameters (aligned with Trainium2 test_resolutions.sh / run_wan2.2_ti2v_v3_cp.py)
+# Parameters (aligned with Trainium2 test_resolutions.sh / run_wan2.2_ti2v.py)
 PROMPT="A cat walks on the grass, realistic"
 NEGATIVE_PROMPT="Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
 NUM_STEPS=50
