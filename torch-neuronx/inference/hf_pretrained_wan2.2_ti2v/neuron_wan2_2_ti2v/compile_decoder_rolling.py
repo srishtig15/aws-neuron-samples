@@ -151,7 +151,13 @@ def compile_decoder_rolling(args):
         cache_dir=args.cache_dir,
     )
 
+    skip_decoder = getattr(args, 'skip_decoder', False)
+    skip_pqc = getattr(args, 'skip_pqc', False)
+    output_subdir = getattr(args, 'output_subdir', None) or "decoder_rolling"
+
     with NxDParallelState(world_size=world_size, tensor_model_parallel_size=tp_degree):
+
+      if not skip_decoder:
         print("\nGetting feat_cache shapes...")
         feat_cache_shapes = get_feat_cache_shapes(
             batch_size, latent_height, latent_width, dtype
@@ -199,7 +205,7 @@ def compile_decoder_rolling(args):
         )
 
         # Save
-        output_path = f"{compiled_models_dir}/decoder_rolling"
+        output_path = f"{compiled_models_dir}/{output_subdir}"
         os.makedirs(output_path, exist_ok=True)
         print(f"Saving to {output_path}...")
         traced.save(os.path.join(output_path, "nxd_model.pt"))
@@ -227,10 +233,13 @@ def compile_decoder_rolling(args):
         save_model_config(output_path, config)
 
         print(f"\nDecoder (rolling) saved to {output_path}")
+      else:
+        print("\nSkipping decoder compilation (--skip_decoder)")
 
-        # ========== Compile post_quant_conv (float32) ==========
+      # ========== Compile post_quant_conv (float32) ==========
+      if not skip_pqc:
         latent_frames = (args.num_frames - 1) // 4 + 1
-        print("\nCompiling post_quant_conv (float32)...")
+        print(f"\nCompiling post_quant_conv (float32, latent {latent_height}x{latent_width})...")
 
         class PostQuantConvWrapper(nn.Module):
             def __init__(self, post_quant_conv):
@@ -273,6 +282,8 @@ def compile_decoder_rolling(args):
         }
         save_model_config(pqc_output_path, pqc_config)
         print(f"post_quant_conv saved to {pqc_output_path}")
+      else:
+        print("\nSkipping post_quant_conv compilation (--skip_pqc)")
 
     print("\n" + "=" * 60)
     print("Compilation Complete!")
@@ -292,6 +303,12 @@ if __name__ == "__main__":
     parser.add_argument("--cache_dir", type=str, default="/opt/dlami/nvme/wan2.2_ti2v_hf_cache_dir")
     parser.add_argument("--max_instruction_limit", type=int, default=None,
                         help="Override max instruction limit (default: compiler default ~5M)")
+    parser.add_argument("--output_subdir", type=str, default=None,
+                        help="Output subdirectory name (default: decoder_rolling)")
+    parser.add_argument("--skip_decoder", action="store_true",
+                        help="Skip decoder compilation, only compile post_quant_conv")
+    parser.add_argument("--skip_pqc", action="store_true",
+                        help="Skip post_quant_conv compilation, only compile decoder")
     args = parser.parse_args()
 
     compile_decoder_rolling(args)

@@ -146,7 +146,7 @@ for config in "${CONFIGS[@]}"; do
                 EST_INSTRUCTIONS=$(( TILE_LATENT_PIXELS * 6500 * 130 / 100 ))
                 INST_LIMIT_ARG="--max_instruction_limit ${EST_INSTRUCTIONS}"
             fi
-            # Compile decoder at tile resolution
+            # Compile decoder at tile resolution (skip pqc, will compile at full res below)
             python neuron_wan2_2_ti2v/compile_decoder_rolling.py \
                 --compiled_models_dir "${COMPILED_DIR}" \
                 --compiler_workdir "${COMPILER_WD}" \
@@ -156,6 +156,7 @@ for config in "${CONFIGS[@]}"; do
                 --decoder_frames 2 \
                 --tp_degree ${WORLD_SIZE} \
                 --world_size ${WORLD_SIZE} \
+                --skip_pqc \
                 ${INST_LIMIT_ARG} 2>&1 | tee "log_compile_decoder_${TAG}.txt"
             # Rename to decoder_tiled and add tiling config
             if [[ -d "${COMPILED_DIR}/decoder_rolling" ]]; then
@@ -175,6 +176,19 @@ with open(config_path, 'w') as f:
 print(f'Tiled config saved: tile={config[\"height\"]}x{config[\"width\"]}, overlap=${OVERLAP}')
 "
             fi
+        fi
+        # Compile post_quant_conv at full target resolution (separate from tiled decoder)
+        if [[ ! -d "${COMPILED_DIR}/post_quant_conv" ]] && [[ "$SKIP_COMPILE" == false ]]; then
+            echo "[${TAG}] Compiling post_quant_conv at full resolution (${HEIGHT}x${WIDTH})..."
+            python neuron_wan2_2_ti2v/compile_decoder_rolling.py \
+                --compiled_models_dir "${COMPILED_DIR}" \
+                --compiler_workdir "${COMPILER_WD}" \
+                --height ${HEIGHT} \
+                --width ${WIDTH} \
+                --num_frames ${NUM_FRAMES} \
+                --tp_degree ${WORLD_SIZE} \
+                --world_size ${WORLD_SIZE} \
+                --skip_decoder 2>&1 | tee -a "log_compile_decoder_${TAG}.txt"
         fi
     else
         # Direct decoder: compile at full resolution
