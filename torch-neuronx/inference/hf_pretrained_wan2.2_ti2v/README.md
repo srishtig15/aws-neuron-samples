@@ -41,15 +41,15 @@ python run_wan2.2_ti2v.py \
 
 ## Architecture Overview
 
-The Wan2.2 pipeline has 5 main components, each compiled separately for Neuron:
+The Wan2.2 pipeline has 4 components compiled for Neuron, plus a CPU-based VAE encoder for I2V mode:
 
 ```
 Text Prompt                Input Image (I2V only)
     |                           |
     v                           v
-[Text Encoder]            [VAE Encoder]    bfloat16, patchify → encode
+[Text Encoder]            [VAE Encoder]    CPU (Neuron bug NCC_IBIR158)
   UMT5, TP=4                   |
-    |                     [quant_conv]     float32
+    |                     [quant_conv]     CPU, float32
     |                           |
     v                           v
 [Transformer]   DiT-based diffusion, 50 denoising steps
@@ -58,7 +58,7 @@ Text Prompt                Input Image (I2V only)
 [post_quant_conv]  3D convolution, float32
     |
     v
-[VAE Decoder]   Conv3D upsampling, bfloat16, 11 temporal chunks
+[VAE Decoder]   Conv3D upsampling, bfloat16, rolling cache
     |
     v
 Video Output (512x512, 81 frames)
@@ -70,7 +70,7 @@ Video Output (512x512, 81 frames)
 |-----------|------|---------|
 | Text Encoder | ~0.4s | UMT5, single call |
 | Transformer | ~21s | 50 steps @ 0.43s/step |
-| VAE Decoder | ~5.6s | 11 calls @ 0.50s/call (NoCache) |
+| VAE Decoder | ~5.6s | 11 calls @ 0.50s/call (Rolling Cache) |
 | post_quant_conv | ~0.003s | Single call |
 | **Total** | **~27s** | |
 
@@ -118,16 +118,13 @@ def local_rms_norm(x, weight, eps=1e-6):
 
 Applied to Q/K normalization in both self-attention and cross-attention. The difference from global norm is negligible for QK normalization since each rank's local hidden dimension (~1024) is large enough for stable statistics.
 
-### 3. VAE Decoder: bfloat16 + NoCache
+### 3. VAE Decoder: bfloat16 + Rolling Cache
 
 The VAE decoder is dominated by Conv3D operations. Two key optimizations:
 
 **bfloat16**: Halves memory bandwidth (the bottleneck for Conv3D).
 
-**NoCache**: The decoder's `feat_cache` (34 tensors, ~960MB) is always zeros between calls because NxDModel copies inputs to device without reflecting device-side mutations back to host. Instead of transferring these zeros every call, they are registered as constant buffers inside the compiled model:
-- Eliminates ~960MB CPU→Device transfer per decoder call
-- Decoder per-call: ~0.50s (vs ~0.78s with external feat_cache)
-- Total decoder time: ~5.6s (vs ~8.6s), a 35% speedup
+**Rolling Cache**: The decoder's `feat_cache` (34 tensors, ~960MB) carries temporal context between chunked decoder calls. Unlike NoCache mode (which zeros the cache each call and causes flickering), Rolling Cache passes feat_cache as explicit inputs AND outputs, producing temporally coherent, flicker-free video.
 
 ### 4. Correct Compiler Model Type
 
@@ -141,16 +138,7 @@ traced_decoder = decoder_builder.compile(
 
 ### 5. VAE Encoder (Image-to-Video)
 
-For I2V mode, the input image is encoded into latent space using the VAE encoder + quant_conv:
-
-- **Encoder**: bfloat16, `--model-type=unet-inference` (Conv3D-heavy like the decoder)
-- **quant_conv**: float32 (cheap, runs once, benefits from precision)
-- Compiled WITHOUT `feat_cache` since I2V only encodes a single image
-- Input is patchified (patch_size=2): `(1, 12, 2, 256, 256)` for 512x512
-
-The `EncoderWrapperV3` handles frame padding, dtype conversion, and ignoring `feat_cache`/`feat_idx` arguments.
-
-Implementation: `neuron_wan2_2_ti2v/compile_encoder.py`
+For I2V mode, the input image is encoded into latent space using the VAE encoder + quant_conv. These run on CPU due to a Neuron compiler bug (NCC_IBIR158) in the Conv3D tensorizer. Since encoding runs only once per video, the overhead is negligible.
 
 ### 6. Temporal Chunked Decoding
 
@@ -193,9 +181,9 @@ Implementation: `DecoderWrapperV3Tiled` in `neuron_wan2_2_ti2v/neuron_commons.py
 | `compile_transformer.py` | Transformer (TP=4, CP=2, local_rms_norm) |
 | `compile_text_encoder.py` | Text encoder (ModelBuilder API) |
 | `compile_decoder_nocache.py` | VAE decoder (bfloat16, NoCache, `--model-type=unet-inference`) |
-| `compile_decoder_rolling.py` | VAE decoder with rolling cache (for tiled decode) |
-| `compile_decoder.py` | VAE decoder with external feat_cache |
-| `compile_encoder.py` | VAE encoder + quant_conv (for I2V) |
+| `compile_decoder_rolling.py` | VAE decoder with rolling cache (default, flicker-free) |
+| `compile_decoder.py` | VAE decoder with external feat_cache (legacy) |
+| `compile_encoder.py` | VAE encoder + quant_conv (unused due to NCC_IBIR158) |
 | `cache_hf_model.py` | Download and cache HuggingFace model |
 
 ### Runtime
@@ -241,7 +229,7 @@ python run_wan2.2_ti2v.py \
     --output output_i2v.mp4
 ```
 
-The I2V pipeline encodes the input image into the first latent frame, then generates the remaining frames via diffusion. The encoder and quant_conv must be compiled (included in `compile.sh` Step 5). If not compiled, the encoder falls back to CPU.
+The I2V pipeline encodes the input image into the first latent frame, then generates the remaining frames via diffusion. The VAE encoder runs on CPU due to a Neuron compiler bug (NCC_IBIR158).
 
 | Argument | Default | Description |
 |----------|---------|-------------|
@@ -253,6 +241,7 @@ The I2V pipeline encodes the input image into the first latent frame, then gener
 | `--num_inference_steps` | 50 | Denoising steps (lower = faster but less quality) |
 | `--max_sequence_length` | 512 | Max text token length |
 | `--output` | `output.mp4` | Output video path |
+| `--fps` | 16 | Output video FPS |
 
 ## Environment
 
