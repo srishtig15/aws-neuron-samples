@@ -40,7 +40,6 @@ from safetensors.torch import load_file
 
 from neuron_wan2_2_ti2v.neuron_commons import (
     InferenceTextEncoderWrapperV2,
-    SimpleWrapper, DecoderWrapper, DecoderWrapperV2, DecoderWrapperV3,
     DecoderWrapperV3NoCache, DecoderWrapperV3Rolling,
     DecoderWrapperV3Tiled,
     PostQuantConvWrapperV2, EncoderWrapperV3, QuantConvWrapperV3,
@@ -366,14 +365,12 @@ def main(args):
     text_encoder_wrapper.t = text_encoder_nxd
     print("Text encoder loaded.")
 
-    # Load Decoder - check for Tiled, Rolling, NoCache, fallback
-    use_cpu_decoder = False
+    # Load Decoder - check for Tiled, Rolling, NoCache
     decoder_tiled_path = f"{compiled_models_dir}/decoder_tiled"
     decoder_rolling_path = f"{compiled_models_dir}/decoder_rolling"
     decoder_nocache_path = f"{compiled_models_dir}/decoder_nocache"
-    decoder_path = f"{compiled_models_dir}/decoder"
 
-    if os.path.exists(decoder_tiled_path) and not args.force_v1_decoder:
+    if os.path.exists(decoder_tiled_path):
         print("\nLoading decoder (Tiled - spatial tiling for large resolutions)...")
         decoder_config = load_model_config(decoder_tiled_path)
         decoder_frames = decoder_config.get("decoder_frames", 2)
@@ -393,7 +390,7 @@ def main(args):
         vae_decoder_wrapper.nxd_model = decoder_nxd
         print(f"Decoder (Tiled) loaded. tile={tile_h}x{tile_w} latent, "
               f"overlap={overlap}, decoder_frames={decoder_frames}")
-    elif os.path.exists(decoder_rolling_path) and not args.force_v1_decoder:
+    elif os.path.exists(decoder_rolling_path):
         print("\nLoading decoder (Rolling Cache - flicker-free)...")
         decoder_config = load_model_config(decoder_rolling_path)
         decoder_frames = decoder_config.get("decoder_frames", 2)
@@ -407,7 +404,7 @@ def main(args):
 
         vae_decoder_wrapper.nxd_model = decoder_nxd
         print(f"Decoder (Rolling) loaded. decoder_frames={decoder_frames}")
-    elif os.path.exists(decoder_nocache_path) and not args.force_v1_decoder:
+    elif os.path.exists(decoder_nocache_path):
         print("\nLoading decoder (NoCache)...")
         decoder_config = load_model_config(decoder_nocache_path)
         decoder_frames = decoder_config.get("decoder_frames", 2)
@@ -421,45 +418,32 @@ def main(args):
 
         vae_decoder_wrapper.nxd_model = decoder_nxd
         print(f"Decoder (NoCache) loaded. decoder_frames={decoder_frames}")
-    elif os.path.exists(decoder_path) and not args.force_v1_decoder:
-        print("\nLoading decoder...")
-        vae_decoder_wrapper = DecoderWrapperV3(pipe.vae.decoder)
-        decoder_nxd = NxDModel.load(os.path.join(decoder_path, "nxd_model.pt"))
-        decoder_config = load_model_config(decoder_path)
-        decoder_world_size = decoder_config.get("world_size", 8)
-
-        decoder_weights = load_duplicated_weights(decoder_path, decoder_world_size)
-        decoder_nxd.set_weights(decoder_weights)
-        decoder_nxd.to_neuron()
-
-        vae_decoder_wrapper.nxd_model = decoder_nxd
-        print("Decoder loaded.")
     else:
-        print("\nNo compiled decoder found, using CPU decoder fallback.")
-        use_cpu_decoder = True
-        vae_decoder_wrapper = None
+        raise RuntimeError(
+            f"No compiled decoder found in {compiled_models_dir}. "
+            f"Expected one of: decoder_tiled/, decoder_rolling/, decoder_nocache/. "
+            f"Run compile.sh first."
+        )
 
     # Load post_quant_conv
     pqc_path = f"{compiled_models_dir}/post_quant_conv"
-    vae_post_quant_conv_wrapper = None
+    if not os.path.exists(pqc_path):
+        raise RuntimeError(
+            f"No compiled post_quant_conv found in {compiled_models_dir}. "
+            f"Run compile.sh first."
+        )
+    print("\nLoading post_quant_conv...")
+    vae_post_quant_conv_wrapper = PostQuantConvWrapperV2(pipe.vae.post_quant_conv)
+    pqc_nxd = NxDModel.load(os.path.join(pqc_path, "nxd_model.pt"))
+    pqc_config = load_model_config(pqc_path)
+    pqc_world_size = pqc_config.get("world_size", 8)
 
-    if use_cpu_decoder:
-        print("Using CPU post_quant_conv (paired with CPU decoder).")
-    elif os.path.exists(pqc_path) and not args.force_v1_decoder:
-        print("\nLoading post_quant_conv...")
-        vae_post_quant_conv_wrapper = PostQuantConvWrapperV2(pipe.vae.post_quant_conv)
-        pqc_nxd = NxDModel.load(os.path.join(pqc_path, "nxd_model.pt"))
-        pqc_config = load_model_config(pqc_path)
-        pqc_world_size = pqc_config.get("world_size", 8)
+    pqc_weights = load_duplicated_weights(pqc_path, pqc_world_size)
+    pqc_nxd.set_weights(pqc_weights)
+    pqc_nxd.to_neuron()
 
-        pqc_weights = load_duplicated_weights(pqc_path, pqc_world_size)
-        pqc_nxd.set_weights(pqc_weights)
-        pqc_nxd.to_neuron()
-
-        vae_post_quant_conv_wrapper.nxd_model = pqc_nxd
-        print("post_quant_conv loaded.")
-    else:
-        print("No compiled post_quant_conv found, using CPU.")
+    vae_post_quant_conv_wrapper.nxd_model = pqc_nxd
+    print("post_quant_conv loaded.")
 
     # Load Encoder and quant_conv for I2V (optional, only if --image is provided)
     if args.image:
@@ -491,33 +475,28 @@ def main(args):
     # Replace pipeline components
     pipe.text_encoder = text_encoder_wrapper
     pipe.transformer = transformer_wrapper
-    if not use_cpu_decoder:
-        pipe.vae.decoder = vae_decoder_wrapper
-        if vae_post_quant_conv_wrapper is not None:
-            pipe.vae.post_quant_conv = vae_post_quant_conv_wrapper
+    pipe.vae.decoder = vae_decoder_wrapper
+    pipe.vae.post_quant_conv = vae_post_quant_conv_wrapper
 
-        # Override _decode to use rolling-cache decode_latents directly,
-        # bypassing diffusers' per-frame loop which causes cache pollution.
-        if hasattr(vae_decoder_wrapper, 'decode_latents'):
-            # Use compiled PQC if available, otherwise keep the original CPU PQC
-            original_post_quant_conv = pipe.vae.post_quant_conv
-            vae_config = pipe.vae.config
-            def _decode_override(z, return_dict=True):
-                from diffusers.models.autoencoders.vae import DecoderOutput
-                from diffusers.models.autoencoders.autoencoder_kl_wan import unpatchify
-                vae_decoder_wrapper.reset_cache()
-                x = original_post_quant_conv(z)
-                out = vae_decoder_wrapper.decode_latents(x)
-                if vae_config.patch_size is not None:
-                    out = unpatchify(out, patch_size=vae_config.patch_size)
-                out = torch.clamp(out, min=-1.0, max=1.0)
-                if not return_dict:
-                    return (out,)
-                return DecoderOutput(sample=out)
-            pipe.vae._decode = _decode_override
-            print("VAE _decode overridden to use rolling-cache decode_latents directly.")
-    else:
-        print("VAE decoder/post_quant_conv: using original CPU pipeline (no replacement)")
+    # Override _decode to use rolling-cache decode_latents directly,
+    # bypassing diffusers' per-frame loop which causes cache pollution.
+    if hasattr(vae_decoder_wrapper, 'decode_latents'):
+        original_post_quant_conv = pipe.vae.post_quant_conv
+        vae_config = pipe.vae.config
+        def _decode_override(z, return_dict=True):
+            from diffusers.models.autoencoders.vae import DecoderOutput
+            from diffusers.models.autoencoders.autoencoder_kl_wan import unpatchify
+            vae_decoder_wrapper.reset_cache()
+            x = original_post_quant_conv(z)
+            out = vae_decoder_wrapper.decode_latents(x)
+            if vae_config.patch_size is not None:
+                out = unpatchify(out, patch_size=vae_config.patch_size)
+            out = torch.clamp(out, min=-1.0, max=1.0)
+            if not return_dict:
+                return (out,)
+            return DecoderOutput(sample=out)
+        pipe.vae._decode = _decode_override
+        print("VAE _decode overridden to use rolling-cache decode_latents directly.")
 
     prompt = args.prompt
     negative_prompt = args.negative_prompt
@@ -625,7 +604,6 @@ if __name__ == "__main__":
     parser.add_argument("--image", type=str, default=None, help="Input image for I2V (omit for T2V)")
     parser.add_argument("--output", type=str, default="output.mp4", help="Output video path")
     parser.add_argument("--fps", type=int, default=16, help="Output video FPS (default: 16)")
-    parser.add_argument("--force_v1_decoder", action="store_true", help="Force use V1 decoder (faster)")
     args = parser.parse_args()
 
     main(args)

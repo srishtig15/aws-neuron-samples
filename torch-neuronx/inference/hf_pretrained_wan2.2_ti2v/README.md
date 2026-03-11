@@ -194,7 +194,7 @@ Implementation: `DecoderWrapperV3Tiled` in `neuron_wan2_2_ti2v/neuron_commons.py
 | `compile_text_encoder.py` | Text encoder (ModelBuilder API) |
 | `compile_decoder_nocache.py` | VAE decoder (bfloat16, NoCache, `--model-type=unet-inference`) |
 | `compile_decoder_rolling.py` | VAE decoder with rolling cache (for tiled decode) |
-| `compile_decoder.py` | VAE decoder with external feat_cache (fallback) |
+| `compile_decoder.py` | VAE decoder with external feat_cache |
 | `compile_encoder.py` | VAE encoder + quant_conv (for I2V) |
 | `cache_hf_model.py` | Download and cache HuggingFace model |
 
@@ -282,5 +282,5 @@ If you see errors about replica groups `[[0,1,2,3]]` vs expected `[[0,1,2,3],[4,
 - Compiled models should be stored on NVMe (`/opt/dlami/nvme/`), not the root EBS volume
 - The decoder uses bfloat16 to reduce memory
 
-### Decoder fallback
-The run script supports automatic fallback: Tiled -> Rolling -> NoCache -> fallback. If a decoder variant wasn't compiled, it will automatically use whatever version is available.
+### Missing compiled models
+All models (text encoder, transformer, decoder, post_quant_conv) must be compiled before inference. If any compiled model is missing, the run script will raise a `RuntimeError`. Run `compile.sh` first. The only exception is the VAE encoder (I2V mode), which runs on CPU due to a Neuron compiler bug (NCC_IBIR158).
