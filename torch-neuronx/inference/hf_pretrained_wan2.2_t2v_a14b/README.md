@@ -8,13 +8,13 @@ Wan2.2-T2V-A14B is a **Mixture-of-Experts (MoE)** text-to-video diffusion model 
 
 | Component | Specification |
 |-----------|--------------|
-| Transformers | 2 × WanTransformer3DModel (14B params each) |
-| Hidden dim | 5120 (40 heads × 128 head_dim) |
+| Transformers | 2 x WanTransformer3DModel (14B params each) |
+| Hidden dim | 5120 (40 heads x 128 head_dim) |
 | Layers | 40 |
-| MoE switch | timestep ≥ 875 → transformer_1 (high-noise), < 875 → transformer_2 (low-noise) |
+| MoE switch | timestep >= 875 -> transformer_1 (high-noise), < 875 -> transformer_2 (low-noise) |
 | Text encoder | UMT5-XXL (4096 dim) |
 | VAE | AutoencoderKLWan (z_dim=16) |
-| Resolution | 480×832 / 720×1280, 81 frames |
+| Resolution | 480x832 / 720x1280, 81 frames |
 
 ## Parallelism Strategy
 
@@ -26,45 +26,63 @@ Wan2.2-T2V-A14B is a **Mixture-of-Experts (MoE)** text-to-video diffusion model 
 | **Tokens/rank** | 16,380 | 18,900 |
 | **NeuronCores (logical)** | 8 (2 chips) | 16 (4 chips) |
 
-- **MoE weight swap**:
-  - 480P: `replace_weights()` in-process (fast, ~63s)
-  - 720P: Subprocess-based reload (NEFF uses 23.94/24GB HBM, no headroom for in-place swap)
+## Pipeline Architecture
 
-## Pipeline Phases
+All Neuron phases run in **isolated subprocesses** for clean HBM lifecycle. This enables reliable multi-inference: each subprocess loads models, runs inference, and exits — OS-level cleanup guarantees full HBM release.
 
-1. **Text Encoding** (Neuron or CPU): Encode prompt with Neuron-compiled UMT5 text encoder (TP=4)
-   - Also supports CPU fallback via `--cpu_text_encoder` flag
-   - 720P requires `--cpu_text_encoder` (text encoder world_size=8 conflicts with transformer world_size=16)
-2. **Denoising** (Neuron): 40 steps with MoE transformer switching
-   - Steps 1-13: transformer_1 (high-noise expert, guidance_scale=4.0)
-   - Weight swap via `replace_weights()` (480P) or subprocess reload (720P)
-   - Steps 14-40: transformer_2 (low-noise expert, guidance_scale_2=3.0)
-3. **VAE Decode** (Neuron or CPU): Chunked decoder with rolling feat_cache for flicker-free output
-   - 480P: Auto-detects rolling cache (`decoder_rolling/`) or NoCache (`decoder_nocache/`) mode
-   - 720P: Tiled Neuron decode with 480P patches (`decoder_rolling_480p/`) or CPU fallback
+### Phase 1: Text Encoding (Neuron subprocess)
+- UMT5-XXL text encoder compiled with TP=4 (world_size=8)
+- Subprocess loads NxDModel, encodes prompt + negative prompt, exits
+- CPU fallback available via `--cpu_text_encoder` (required for 720P where text encoder world_size conflicts with transformer world_size)
+
+### Phase 2: Denoising (Neuron subprocess, Combined MoE)
+- **Single subprocess** handles both MoE transformer phases using `replace_weights()`:
+  1. Load transformer_1 NxDModel (68s)
+  2. Run 13 high-noise steps with guidance_scale=4.0 (107s)
+  3. Swap to transformer_2 weights via `replace_weights()` (61s)
+  4. Run 27 low-noise steps with guidance_scale_2=3.0 (221s)
+  5. Subprocess exits, HBM fully released
+- `replace_weights()` avoids a second `NxDModel.load()` + `to_neuron()`, saving ~10s vs two separate subprocesses
+- 720P uses subprocess-based reload instead (NEFF uses 23.94/24GB HBM, no headroom for in-place swap)
+
+### Phase 3: VAE Decode (Neuron subprocess)
+- **Stateful rolling decoder**: feat_cache as registered buffers with automatic input-output aliasing
+  - 34 cache tensors stay on device (HBM) between chunks — no host-device transfer
+  - Only input x (~300KB) transferred per chunk call
+  - 2x faster than legacy I/O cache mode (~1.0s/chunk vs ~2.2s/chunk)
+- Post-quant conv + chunked rolling decode (2 latent frames per chunk, 11 chunks for 480P)
+- 720P: Tiled Neuron decode with 4 overlapping 480P patches (2x2 grid) + linear-ramp blending
 
 ## Performance
 
-### 480P (480×832, 81 frames)
+### 480P (480x832, 81 frames, 40 steps)
 
-| Phase | Time |
-|-------|------|
-| Text Encoding (Neuron) | ~15s (0.2s inference + 12s model load) |
-| Denoising (40 steps + MoE swap) | ~466s (~8.2s/step + 62s weight swap) |
-| VAE Decode (rolling cache) | ~46s (24s decode + 18s model load) |
-| **Inference time** | **~526s** |
+| Phase | Time | Details |
+|-------|------|---------|
+| Text Encoding | 22s | 12s model load + 0.4s inference |
+| Denoising | 457s | 69s load + 61s swap + 107s phase1 + 221s phase2 |
+| VAE Decode | 44s | 24s model load + 11s decode (stateful) + 8s PQC load |
+| **Total** | **~544s** | |
 
-### 720P (720×1280, 81 frames)
+Per-step breakdown: ~8.2s/step (1s Neuron forward + ~3s CPU scheduler + ~4s data transfer overhead)
 
-| Phase | Time |
-|-------|------|
-| Text Encoding (CPU) | ~5s |
-| Denoising (40 steps, subprocess mode) | ~1069s (~16.1s/step + 2×188s model load) |
-| VAE Decode (Neuron tiled) | ~145s (106s decode + 36s load + 3s PQC) |
-| **Inference time** | **~1320s (~22.0min)** |
+### 720P (720x1280, 81 frames, 40 steps)
 
-> **Note**: Tiled decode uses 4 overlapping 480P patches (2×2 grid) with linear-ramp blending.
-> CPU fallback (~585s) is still available via `--cpu_vae_decoder` or if `decoder_rolling_480p/` is not compiled.
+| Phase | Time | Details |
+|-------|------|---------|
+| Text Encoding (CPU) | 5s | |
+| Denoising | 1069s | 2x188s loads + ~16.1s/step |
+| VAE Decode (tiled) | 145s | 106s decode + 36s load + 3s PQC |
+| **Total** | **~1320s** | |
+
+### Comparison with GPU
+
+| | Trn2 480P | H100 FA4 (no offload) | Ratio |
+|---|---|---|---|
+| Per step | ~8.2s | ~6.85s | 1.2x |
+| Total | ~544s | ~278s | 2.0x |
+
+> The gap is primarily from model loading overhead (130s) and CPU scheduler latency between steps.
 
 ## Prerequisites
 
@@ -110,13 +128,13 @@ python run_wan2.2_t2v_a14b.py \
 | 2 | Text Encoder (TP=4) | `text_encoder/` |
 | 3 | Transformer - high-noise expert (TP=4, CP=N) | `transformer/` |
 | 4 | Transformer_2 - low-noise expert (TP=4, CP=N) | `transformer_2/` |
-| 5 | VAE Decoder (Rolling Cache, 480P) | `decoder_rolling/` |
+| 5 | VAE Decoder (Stateful Rolling Cache, 480P) | `decoder_rolling/` |
 | 5b | VAE Decoder (480P patches, for tiled 720P decode) | `decoder_rolling_480p/` |
 | 6 | Post-quant conv (480P only) | `post_quant_conv/` |
 
 For 720P, compile with `--height 720 --width 1280` which sets CP=4 (world_size=16). Step 5b compiles a 480P decoder for tiled 720P decode (`decoder_rolling_480p/`). The full-resolution 720P decoder exceeds the instruction limit; tiled decode uses 480P patches with overlap blending instead.
 
-The script auto-patches `nearest-exact` → `nearest` in diffusers for Trainium2 compatibility.
+The script auto-patches `nearest-exact` -> `nearest` in diffusers for Trainium2 compatibility.
 
 ## Inference Options
 
@@ -139,13 +157,14 @@ The script auto-patches `nearest-exact` → `nearest` in diffusers for Trainium2
 
 The inference script auto-detects which decoder mode to use:
 
-| Mode | Directory | Flicker | Transfer/chunk | Notes |
-|------|-----------|---------|----------------|-------|
-| **Rolling Cache** | `decoder_rolling/` | No | ~3.6GB (1.8GB in + out) | feat_cache carried between chunks as I/O |
-| **Tiled (720P)** | `decoder_rolling_480p/` | No | ~3.6GB × 4 tiles | 480P rolling cache patches with overlap blending |
-| **NoCache** | `decoder_nocache/` | Yes | ~300KB | feat_cache as zero buffers, no temporal context |
+| Mode | Directory | Flicker | Cache Location | Transfer/chunk | Notes |
+|------|-----------|---------|----------------|----------------|-------|
+| **Stateful Rolling** | `decoder_rolling/` | No | On-device (HBM) | ~300KB (x only) | Default. Cache as registered buffers, auto input-output aliasing |
+| **Legacy Rolling** | `decoder_rolling/` | No | Host (CPU) | ~3.6GB (cache I/O) | Fallback if config `"stateful": false` |
+| **Tiled (720P)** | `decoder_rolling_480p/` | No | On-device (HBM) | ~300KB x 4 tiles | 480P stateful patches with overlap blending |
+| **NoCache** | `decoder_nocache/` | Yes | N/A | ~300KB | No temporal context, visible flicker |
 
-Rolling cache is preferred. Auto-detection priority: full-res rolling/nocache → tiled 480P → CPU fallback.
+Auto-detection priority: full-res rolling/nocache -> tiled 480P -> CPU fallback.
 
 ## File Structure
 
@@ -155,7 +174,7 @@ hf_pretrained_wan2.2_t2v_a14b/
 ├── ROLLING_CACHE.md                     # Rolling cache design document
 ├── GPU_BENCHMARK.md                     # GPU baseline benchmark & flash-attn-4 guide
 ├── compile.sh                           # Master compilation script (Neuron)
-├── run_wan2.2_t2v_a14b.py              # Neuron inference script
+├── run_wan2.2_t2v_a14b.py              # Neuron inference script (subprocess orchestrator)
 ├── run_wan2.2_t2v_a14b_gpu.py          # GPU inference benchmark
 ├── patch_diffusers_fa4.py              # Patch diffusers for flash-attn-4
 ├── requirements.txt
@@ -165,8 +184,10 @@ hf_pretrained_wan2.2_t2v_a14b/
     ├── compile_transformer.py          # Transformer compilation (TP=4, CP=N)
     ├── compile_text_encoder.py         # UMT5 text encoder compilation
     ├── compile_decoder_nocache.py      # VAE decoder compilation (NoCache)
-    ├── compile_decoder_rolling.py      # VAE decoder compilation (Rolling Cache)
-    ├── denoise_worker.py              # Subprocess worker for HBM-tight denoising (720P)
+    ├── compile_decoder_rolling.py      # VAE decoder compilation (Rolling Cache, stateful/legacy)
+    ├── text_encoder_worker.py          # Subprocess worker for text encoding
+    ├── denoise_worker.py               # Subprocess worker for MoE denoising (single/combined mode)
+    ├── decoder_worker.py               # Subprocess worker for VAE decode (stateful/legacy/nocache)
     ├── distributed_rmsnorm.py          # Distributed RMSNorm for TP
     ├── neuron_commons.py               # Wrapper classes for Neuron models
     └── neuron_parallel_utils.py        # TP/CP sharding utilities
