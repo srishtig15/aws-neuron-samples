@@ -62,9 +62,18 @@ python neuron_wan2_2_ti2v/compile_text_encoder.py \
     --tp_degree ${TP_DEGREE} \
     --world_size ${WORLD_SIZE}
 
-# Step 3: Compile Transformer (TP=4, CP=2)
-echo ""
-echo "[Step 3/4] Compiling Transformer (TP=${TP_DEGREE}, CP=2)..."
+# Step 3: Compile Transformer (TP=4, CP=2 or CFG Parallel)
+# Set CFG_PARALLEL=1 to use CFG Parallel (batch=2, no K/V gather) instead of Context Parallel
+CFG_PARALLEL="${CFG_PARALLEL:-0}"
+CFG_FLAG=""
+if [ "${CFG_PARALLEL}" = "1" ]; then
+    CFG_FLAG="--cfg_parallel"
+    echo ""
+    echo "[Step 3/4] Compiling Transformer (TP=${TP_DEGREE}, CFG Parallel, batch=2)..."
+else
+    echo ""
+    echo "[Step 3/4] Compiling Transformer (TP=${TP_DEGREE}, CP=2)..."
+fi
 python neuron_wan2_2_ti2v/compile_transformer.py \
     --compiled_models_dir "${COMPILED_MODELS_DIR}" \
     --compiler_workdir "${COMPILER_WORKDIR}" \
@@ -73,7 +82,8 @@ python neuron_wan2_2_ti2v/compile_transformer.py \
     --num_frames ${NUM_FRAMES} \
     --max_sequence_length ${MAX_SEQUENCE_LENGTH} \
     --tp_degree ${TP_DEGREE} \
-    --world_size ${WORLD_SIZE}
+    --world_size ${WORLD_SIZE} \
+    ${CFG_FLAG}
 
 # Step 4: Compile Decoder (Rolling Cache) + post_quant_conv
 # Rolling cache carries temporal context between chunks for flicker-free video

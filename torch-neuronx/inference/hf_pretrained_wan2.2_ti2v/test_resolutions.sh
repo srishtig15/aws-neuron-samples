@@ -102,10 +102,19 @@ for config in "${CONFIGS[@]}"; do
     COMPILE_START=$(date +%s)
 
     # Compile transformer (skip if already exists)
-    if [[ -d "${COMPILED_DIR}/transformer" ]] && [[ "$SKIP_COMPILE" == false ]]; then
+    # CFG_PARALLEL=1 uses CFG Parallel (batch=2, saves to transformer_cfg/)
+    CFG_PARALLEL="${CFG_PARALLEL:-0}"
+    CFG_FLAG=""
+    TRANSFORMER_SUBDIR="transformer"
+    if [[ "${CFG_PARALLEL}" == "1" ]]; then
+        CFG_FLAG="--cfg_parallel"
+        TRANSFORMER_SUBDIR="transformer_cfg"
+    fi
+
+    if [[ -d "${COMPILED_DIR}/${TRANSFORMER_SUBDIR}" ]] && [[ "$SKIP_COMPILE" == false ]]; then
         echo "[${TAG}] Transformer already compiled, skipping."
     elif [[ "$SKIP_COMPILE" == false ]]; then
-        echo "[${TAG}] Compiling Transformer..."
+        echo "[${TAG}] Compiling Transformer (${TRANSFORMER_SUBDIR})..."
         python neuron_wan2_2_ti2v/compile_transformer.py \
             --compiled_models_dir "${COMPILED_DIR}" \
             --compiler_workdir "${COMPILER_WD}" \
@@ -114,7 +123,8 @@ for config in "${CONFIGS[@]}"; do
             --num_frames ${NUM_FRAMES} \
             --max_sequence_length ${MAX_SEQ_LEN} \
             --tp_degree ${TP_DEGREE} \
-            --world_size ${WORLD_SIZE} 2>&1 | tee "log_compile_transformer_${TAG}.txt"
+            --world_size ${WORLD_SIZE} \
+            ${CFG_FLAG} 2>&1 | tee "log_compile_transformer_${TAG}.txt"
     fi
 
     # Compile decoder (skip if already exists)

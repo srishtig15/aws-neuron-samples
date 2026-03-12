@@ -257,11 +257,12 @@ class CPWanSelfAttention(nn.Module):
     4. RoPE is applied before K/V gathering
     """
 
-    def __init__(self, orig_attn, context_parallel_enabled=False, data_parallel_group=None):
+    def __init__(self, orig_attn, context_parallel_enabled=False, data_parallel_group=None, skip_kv_gather=False):
         super().__init__()
 
         self.context_parallel_enabled = context_parallel_enabled
         self.data_parallel_group = data_parallel_group
+        self.skip_kv_gather = skip_kv_gather
         self.heads = orig_attn.heads
 
         # Copy projections (already sharded for TP)
@@ -311,7 +312,8 @@ class CPWanSelfAttention(nn.Module):
             key = apply_rotary_emb_cp(key, rotary_emb)
 
         # Context Parallel: All-gather K/V across CP group
-        if self.context_parallel_enabled:
+        # (Skipped for CFG Parallel: each rank has full sequence for its batch item)
+        if self.context_parallel_enabled and not self.skip_kv_gather:
             dp_group = self.data_parallel_group
             # Stack K, V and gather together for efficiency
             kv_stacked = torch.stack([key, value], dim=0)  # [2, B, H, local_S, D]
@@ -320,7 +322,7 @@ class CPWanSelfAttention(nn.Module):
             )  # [2, B, H, full_S, D]
             key, value = torch.unbind(kv_stacked, dim=0)
 
-        # NKI Flash Attention: local_Q @ full_K/V
+        # NKI Flash Attention: Q @ K/V (local Q @ full K/V for CP, full Q @ full K/V for CFG)
         hidden_states = nki_flash_attention(query, key, value)
 
         # Reshape back
@@ -612,11 +614,12 @@ class NeuronWanTransformerV3CP(nn.Module):
     - NKI Flash Attention
     """
 
-    def __init__(self, original_transformer, tp_degree, world_size, context_parallel_enabled=False):
+    def __init__(self, original_transformer, tp_degree, world_size, context_parallel_enabled=False, cfg_parallel=False):
         super().__init__()
 
         self.config = original_transformer.config
         self.context_parallel_enabled = context_parallel_enabled
+        self.cfg_parallel = cfg_parallel
         self.tp_degree = tp_degree
         self.world_size = world_size
 
@@ -658,22 +661,25 @@ class NeuronWanTransformerV3CP(nn.Module):
         self.patch_size = original_transformer.config.patch_size
 
     def _replace_attention(self):
-        """Replace attention modules with CP+NKI versions."""
+        """Replace attention modules with CP/CFG+NKI versions."""
         for i, block in enumerate(self.blocks):
-            # Replace self-attention (attn1) with CP version
+            # Replace self-attention (attn1)
+            # For CFG Parallel: skip K/V gather (each rank has full sequence)
             block.attn1 = CPWanSelfAttention(
                 block.attn1,
                 self.context_parallel_enabled,
-                self.data_parallel_group
+                self.data_parallel_group,
+                skip_kv_gather=self.cfg_parallel,
             )
 
-            # Replace cross-attention (attn2) with CP version
+            # Replace cross-attention (attn2) - no K/V gather in either mode
             block.attn2 = CPWanCrossAttention(
                 block.attn2,
                 self.context_parallel_enabled
             )
 
-        print(f"Replaced attention with CP+NKI versions on {len(self.blocks)} blocks")
+        mode = "CFG" if self.cfg_parallel else "CP"
+        print(f"Replaced attention with {mode}+NKI versions on {len(self.blocks)} blocks")
 
     def _find_rope_seq_dim(self, rope_tensor, expected_seq_len):
         """
@@ -736,28 +742,40 @@ class NeuronWanTransformerV3CP(nn.Module):
         print(f"DEBUG: rotary_emb_sin shape: {rotary_emb_sin.shape}")
         print(f"DEBUG: full_seq_len: {full_seq_len}")
 
-        # ========== CONTEXT PARALLEL: SPLIT DATA AT ENTRY ==========
+        # ========== PARALLEL DATA SPLIT AT ENTRY ==========
         if self.context_parallel_enabled:
             dp_group = self.data_parallel_group
 
             # Get DP rank at runtime using SPMDRank
             dp_rank = get_dp_rank_spmd(self.global_rank.get_rank(), self.tp_degree)
 
-            # Split hidden_states along sequence dim (dim=1)
-            hidden_states = split_along_dim(
-                hidden_states, dim=1, rank=dp_rank, data_parallel_group=dp_group
-            )
+            if self.cfg_parallel:
+                # CFG Parallel: scatter along batch dim (dim=0)
+                # [2, seq, D] -> [1, seq, D] per rank
+                hidden_states = split_along_dim(
+                    hidden_states, dim=0, rank=dp_rank, data_parallel_group=dp_group
+                )
+                encoder_hidden_states = split_along_dim(
+                    encoder_hidden_states, dim=0, rank=dp_rank, data_parallel_group=dp_group
+                )
+                timestep = split_along_dim(
+                    timestep, dim=0, rank=dp_rank, data_parallel_group=dp_group
+                )
+                # RoPE: NOT scattered (position-indexed, same for both batch items)
+            else:
+                # Context Parallel: scatter along sequence dim (dim=1)
+                hidden_states = split_along_dim(
+                    hidden_states, dim=1, rank=dp_rank, data_parallel_group=dp_group
+                )
 
-            # Split RoPE along sequence dim
-            # RoPE shape could be [1, 1, seq, dim] or [seq, dim] depending on diffusers version
-            # Find the sequence dimension (the one matching hidden_states seq_len)
-            rope_seq_dim = self._find_rope_seq_dim(rotary_emb_cos, full_seq_len)
-            rotary_emb_cos = split_along_dim(
-                rotary_emb_cos, dim=rope_seq_dim, rank=dp_rank, data_parallel_group=dp_group
-            )
-            rotary_emb_sin = split_along_dim(
-                rotary_emb_sin, dim=rope_seq_dim, rank=dp_rank, data_parallel_group=dp_group
-            )
+                # Split RoPE along sequence dim
+                rope_seq_dim = self._find_rope_seq_dim(rotary_emb_cos, full_seq_len)
+                rotary_emb_cos = split_along_dim(
+                    rotary_emb_cos, dim=rope_seq_dim, rank=dp_rank, data_parallel_group=dp_group
+                )
+                rotary_emb_sin = split_along_dim(
+                    rotary_emb_sin, dim=rope_seq_dim, rank=dp_rank, data_parallel_group=dp_group
+                )
 
         # Condition embedding
         temb, timestep_proj, encoder_hidden_states, _ = self.condition_embedder(
@@ -793,10 +811,11 @@ class NeuronWanTransformerV3CP(nn.Module):
         hidden_states = (self.norm_out(hidden_states.float()) * (1 + scale) + shift).type_as(hidden_states)
         output = self.proj_out(hidden_states)
 
-        # ========== CONTEXT PARALLEL: GATHER OUTPUT ==========
+        # ========== PARALLEL: GATHER OUTPUT ==========
         if self.context_parallel_enabled:
+            gather_dim = 0 if self.cfg_parallel else 1
             output = gather_from_tensor_model_parallel_region_with_dim(
-                output, gather_dim=1, process_group=self.data_parallel_group
+                output, gather_dim=gather_dim, process_group=self.data_parallel_group
             )
 
         # Unpatchify
@@ -902,10 +921,11 @@ def fix_norm_weights_per_rank(weights_path, unsharded_norm_weights, tp_degree):
 
 
 def compile_transformer_v3_cp(args):
-    """Compile transformer with Context Parallel using ModelBuilder API."""
+    """Compile transformer with Context Parallel or CFG Parallel using ModelBuilder API."""
 
     tp_degree = args.tp_degree
     world_size = args.world_size
+    cfg_parallel = getattr(args, 'cfg_parallel', False)
     context_parallel_enabled = (world_size != tp_degree)
     cp_degree = world_size // tp_degree if context_parallel_enabled else 1
 
@@ -914,23 +934,26 @@ def compile_transformer_v3_cp(args):
     latent_frames = (args.num_frames - 1) // 4 + 1
     max_sequence_length = args.max_sequence_length
     hidden_size = 4096
-    batch_size = 1
+    # CFG Parallel: batch_size=2 (negative + positive stacked)
+    batch_size = 2 if cfg_parallel else 1
     in_channels = 48
 
     # Calculate sequence length after patch embedding
     patch_size_t, patch_size_h, patch_size_w = 1, 2, 2
     seq_len = (latent_frames // patch_size_t) * (latent_height // patch_size_h) * (latent_width // patch_size_w)
 
+    mode = "CFG Parallel" if cfg_parallel else "Context Parallel"
     print("=" * 60)
-    print("Wan2.2 Transformer V3 Context Parallel Compilation")
+    print(f"Wan2.2 Transformer V3 {mode} Compilation")
     print("=" * 60)
     print(f"Resolution: {args.height}x{args.width}, Frames: {args.num_frames}")
     print(f"Latent: {latent_frames}x{latent_height}x{latent_width}")
     print(f"Sequence length: {seq_len}")
+    print(f"Batch size: {batch_size}")
     print(f"TP degree: {tp_degree}")
-    print(f"CP degree: {cp_degree}")
+    print(f"CP/CFG degree: {cp_degree}")
     print(f"World size: {world_size}")
-    print(f"Context Parallel: {context_parallel_enabled}")
+    print(f"Mode: {mode}")
     print(f"NKI Flash Attention: Enabled")
     print("=" * 60)
 
@@ -980,11 +1003,11 @@ def compile_transformer_v3_cp(args):
         print(f"Collected {len(unsharded_norm_weights)} unsharded norm weights")
 
         # Create Neuron transformer
-        print("\nCreating Neuron transformer (TP={}, CP={}, world_size={})...".format(
-            tp_degree, cp_degree, world_size
+        print("\nCreating Neuron transformer (TP={}, {}={}, world_size={})...".format(
+            tp_degree, "CFG" if cfg_parallel else "CP", cp_degree, world_size
         ))
         neuron_transformer = NeuronWanTransformerV3CP(
-            pipe.transformer, tp_degree, world_size, context_parallel_enabled
+            pipe.transformer, tp_degree, world_size, context_parallel_enabled, cfg_parallel=cfg_parallel
         )
         neuron_transformer = neuron_transformer.to(torch.bfloat16)
         neuron_transformer.eval()
@@ -1015,7 +1038,8 @@ def compile_transformer_v3_cp(args):
         )
 
         # Save
-        output_path = f"{args.compiled_models_dir}/transformer"
+        output_subdir = "transformer_cfg" if cfg_parallel else "transformer"
+        output_path = f"{args.compiled_models_dir}/{output_subdir}"
         os.makedirs(output_path, exist_ok=True)
 
         print(f"\nSaving to {output_path}...")
@@ -1085,10 +1109,12 @@ def compile_transformer_v3_cp(args):
             "latent_width": latent_width,
             "seq_len": seq_len,
             "max_sequence_length": max_sequence_length,
+            "batch_size": batch_size,
             "tp_degree": tp_degree,
             "cp_degree": cp_degree,
             "world_size": world_size,
             "context_parallel": context_parallel_enabled,
+            "cfg_parallel": cfg_parallel,
             "nki_flash_attention": True,
         }
         with open(os.path.join(output_path, "config.json"), "w") as f:
@@ -1114,6 +1140,8 @@ if __name__ == "__main__":
     parser.add_argument("--world_size", type=int, default=8, help="Total world size (TP x CP)")
     parser.add_argument("--compiled_models_dir", type=str, default="compiled_models", help="Output directory")
     parser.add_argument("--compiler_workdir", type=str, default="compiler_workdir", help="Compiler workdir")
+    parser.add_argument("--cfg_parallel", action="store_true",
+                        help="Use CFG Parallel (batch=2, no K/V gather) instead of Context Parallel")
     args = parser.parse_args()
 
     compile_transformer_v3_cp(args)

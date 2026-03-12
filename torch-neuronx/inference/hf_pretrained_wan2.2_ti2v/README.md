@@ -4,16 +4,19 @@ This project implements [Wan2.2-TI2V-5B](https://huggingface.co/Wan-AI/Wan2.2-TI
 
 ## Multi-Resolution Performance (trn2.48xlarge vs H100)
 
-| Resolution | FPS | Frames | Trn2 (s) | H100 (s) | Decoder |
-|-----------|-----|--------|-----------|-----------|---------|
-| 512x384 | 16 | 81 | 20.67 | 16.13 | stateful rolling |
-| 512x384 | 24 | 121 | 30.07 | 24.48 | stateful rolling |
-| 640x480 | 16 | 81 | 33.20 | 26.06 | stateful rolling |
-| 640x480 | 24 | 121 | 49.29 | 39.67 | stateful rolling |
-| 1280x704 | 16 | 81 | 163.99 | 87.66 | tiled |
-| 1280x704 | 24 | 121 | 255.07 | 143.20 | tiled |
+| Resolution | FPS | Frames | Trn2 CP (s) | Trn2 CFG (s) | H100 (s) | Decoder |
+|-----------|-----|--------|-------------|--------------|-----------|---------|
+| 512x384 | 16 | 81 | 20.67 | **18.31** | 16.13 | stateful rolling |
+| 512x384 | 24 | 121 | 30.07 | **26.22** | 24.48 | stateful rolling |
+| 640x480 | 16 | 81 | **33.20** | 34.13 | 26.06 | stateful rolling |
+| 640x480 | 24 | 121 | 49.29 | **45.11** | 39.67 | stateful rolling |
+| 1280x704 | 16 | 81 | 163.99 | **155.29** | 87.66 | tiled |
+| 1280x704 | 24 | 121 | 255.07 | **247.64** | 143.20 | tiled |
 
-Timing is pure inference (excludes model loading and warmup). See `test_results.txt` and `test_results_gpu.txt`.
+- **Trn2 CP**: Context Parallel (CP=2, sequence split across ranks, K/V all-gather in self-attention)
+- **Trn2 CFG**: CFG Parallel (batch=2, cond+uncond in single forward pass, no K/V communication)
+- CFG Parallel is faster for most configs (up to -13%). At 640x480/81f the doubled attention compute outweighs the communication savings.
+- Timing is pure inference (excludes model loading and warmup). See `test_results.txt` and `test_results_gpu.txt`.
 
 ## Quick Start
 
@@ -56,7 +59,7 @@ Text Prompt                Input Image (I2V only)
     |                           |
     v                           v
 [Transformer]   DiT-based diffusion, 50 denoising steps
-    |            TP=4, Context Parallel (CP=2), world_size=8
+    |            TP=4, CP=2, world_size=8 (CP or CFG Parallel)
     v            (I2V: frame 0 = image latent, frames 1-N = noise)
 [post_quant_conv]  3D convolution, float32
     |
@@ -67,42 +70,57 @@ Text Prompt                Input Image (I2V only)
 Video Output (512x512, 81 frames)
 ```
 
-### Performance Breakdown (512x384, 81 frames, trn2.48xlarge)
+### Performance Breakdown (512x384, 81 frames, CFG Parallel, trn2.48xlarge)
 
 | Component | Time | Details |
 |-----------|------|---------|
 | Text Encoder | ~0.06s | UMT5, single call |
-| Transformer | ~16s | 50 steps @ 0.32s/step |
-| VAE Decoder | ~4.1s | 11 calls (Stateful Rolling Cache, on-device) |
+| Transformer | ~14s | 50 steps @ 0.27s/step (CFG Parallel, 1 forward/step) |
+| VAE Decoder | ~3.7s | 11 calls (Stateful Rolling Cache, on-device) |
 | Cache reset | ~0.5s | Parallel write zeros to 34 on-device buffers |
 | post_quant_conv | ~0.003s | Single call |
-| **Total** | **~21s** | Stateful rolling cache (flicker-free, on-device cache) |
+| **Total** | **~18s** | CFG Parallel + Stateful rolling cache |
 
 ## Compilation
 
 ```bash
+# Context Parallel (default)
 ./compile.sh [output_dir] [compiler_workdir]
-# Default: /opt/dlami/nvme/compiled_models_wan2.2_ti2v_5b
+
+# CFG Parallel (recommended for most resolutions)
+CFG_PARALLEL=1 ./compile.sh [output_dir] [compiler_workdir]
+
+# Default output: /opt/dlami/nvme/compiled_models_wan2.2_ti2v_5b
 ```
 
 The compilation script compiles all components:
 - **Text Encoder**: UMT5, TP=4, world_size=8
-- **Transformer**: TP=4, CP=2 (Context Parallel), world_size=8
+- **Transformer**: TP=4, CP=2, world_size=8 (Context Parallel or CFG Parallel)
 - **Decoder (Rolling Cache)**: bfloat16, `--model-type=unet-inference`, flicker-free temporal caching
 - **post_quant_conv**: float32
 
-For multi-resolution compilation (including 720P with tiled decoder), use `test_resolutions.sh`.
+For multi-resolution compilation (including 720P with tiled decoder), use `test_resolutions.sh` (supports `CFG_PARALLEL=1`).
 
 ## Key Optimizations
 
-### 1. Context Parallel (Transformer)
+### 1. Context Parallel & CFG Parallel (Transformer)
 
-The transformer sequence length is 5376 tokens (21 latent frames x 256 spatial). Context Parallel splits this across 2 groups:
+The transformer uses TP=4 for model parameter sharding and 2-way data parallelism (world_size=8). Two modes are supported:
 
-- **TP=4**: Each tensor parallel rank handles 1/4 of attention heads
-- **CP=2**: Each CP rank handles 1/2 of the sequence
-- Self-attention uses scatter/gather collectives for cross-sequence communication
-- Cross-attention (text conditioning) doesn't need CP since the text sequence is shared
+**Context Parallel (CP)** — splits the sequence dimension across 2 ranks:
+- Each CP rank processes 1/2 of the sequence tokens
+- Self-attention requires K/V all-gather across CP ranks
+- Cross-attention (text conditioning) doesn't need CP since text is shared
+- Better for very long sequences where communication cost is small relative to compute
+
+**CFG Parallel** — splits the batch dimension (cond/uncond) across 2 ranks:
+- Each rank processes the full sequence for one batch item (cond or uncond)
+- No K/V all-gather needed (each rank has full sequence)
+- Reduces 2 forward passes per denoising step to 1 (batch=2)
+- Eliminates one device↔CPU sync per step, improving device utilization (~75% vs ~50%)
+- Best for short-to-medium sequences; at very long sequences the doubled attention compute O(n²) can outweigh communication savings
+
+Compile with `CFG_PARALLEL=1 ./compile.sh` to use CFG Parallel. The inference script auto-detects the mode from the compiled model config.
 
 Implementation: `neuron_wan2_2_ti2v/compile_transformer.py`
 
@@ -182,7 +200,7 @@ Implementation: `DecoderWrapperV3Tiled` in `neuron_wan2_2_ti2v/neuron_commons.py
 
 | File | Description |
 |------|-------------|
-| `compile_transformer.py` | Transformer (TP=4, CP=2, local_rms_norm) |
+| `compile_transformer.py` | Transformer (TP=4, CP=2 or CFG Parallel, local_rms_norm) |
 | `compile_text_encoder.py` | Text encoder (ModelBuilder API) |
 | `compile_decoder_nocache.py` | VAE decoder (bfloat16, NoCache, `--model-type=unet-inference`) |
 | `compile_decoder_rolling.py` | VAE decoder with rolling cache (default, flicker-free) |

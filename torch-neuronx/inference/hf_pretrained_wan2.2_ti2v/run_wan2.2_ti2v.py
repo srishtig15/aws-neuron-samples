@@ -35,6 +35,16 @@ import time
 import torch
 import torch_neuronx
 
+# Patch xm.mark_step() to prevent unwanted per-step synchronization.
+# The diffusers pipeline calls it inside the denoising loop, which
+# triggers a global XLA sync across all NeuronCores. NxDModel handles
+# its own synchronization internally, so this is unnecessary overhead.
+try:
+    import torch_xla.core.xla_model as xm
+    xm.mark_step = lambda *args, **kwargs: None
+except ImportError:
+    pass
+
 from neuronx_distributed import NxDModel
 from safetensors.torch import load_file
 
@@ -150,15 +160,24 @@ def prepare_cp_checkpoints(tp_checkpoints, tp_degree, cp_degree):
 
 class InferenceTransformerWrapperV3CP(torch.nn.Module):
     """
-    Wrapper for transformer with Context Parallel (V3 CP).
+    Wrapper for transformer with Context Parallel (V3 CP) or CFG Parallel.
 
     Key differences from V2:
     - Passes pre-computed RoPE (cos, sin) to transformer
     - Handles CP-specific input shapes
     - Supports I2V by replacing frame 0 in model input (simulates WanImageToVideoPipeline)
+
+    CFG Parallel mode:
+    - The model is compiled with batch_size=2 (uncond + cond stacked along dim=0)
+    - The pipeline still makes 2 forward calls per step (cond then uncond)
+    - On the first call (cond): batch with stored negative embeddings, run single
+      forward pass, cache uncond result, return cond result
+    - On the second call (uncond): return cached result (no forward pass)
+    - This halves the number of actual device forward passes per step
     """
 
-    def __init__(self, transformer, nxd_model, rotary_emb_cos, rotary_emb_sin):
+    def __init__(self, transformer, nxd_model, rotary_emb_cos, rotary_emb_sin,
+                 cfg_parallel=False):
         super().__init__()
         self.transformer = transformer  # Original transformer for config access
         self.nxd_model = nxd_model
@@ -174,22 +193,14 @@ class InferenceTransformerWrapperV3CP(torch.nn.Module):
         # I2V: image condition for model-input replacement
         self.image_condition = None
 
-    def forward(self, hidden_states, timestep=None, encoder_hidden_states=None, return_dict=False, **kwargs):
-        """Forward with pre-computed RoPE."""
-        # I2V: replace frame 0 in model input so the model always sees the clean image
-        if self.image_condition is not None:
-            hidden_states = hidden_states.clone()
-            hidden_states[:, :, 0:1, :, :] = self.image_condition.to(hidden_states.dtype)
+        # CFG Parallel state
+        self.cfg_parallel = cfg_parallel
+        self._negative_embeds = None  # Set before inference with stored negative prompt embeddings
+        self._cached_uncond_result = None
+        self._is_cond_call = True  # Toggles between cond/uncond calls
 
-        # Ensure timestep has correct shape [batch_size]
-        if timestep is not None:
-            if timestep.dim() > 1:
-                timestep = timestep.flatten()[0:1]
-            elif timestep.dim() == 0:
-                timestep = timestep.unsqueeze(0)
-            timestep = timestep.to(torch.float32)
-
-        # Call NxDModel with RoPE
+    def _run_nxd_model(self, hidden_states, timestep, encoder_hidden_states):
+        """Run NxDModel forward pass."""
         if hasattr(self.nxd_model, 'inference'):
             output = self.nxd_model.inference(
                 hidden_states=hidden_states,
@@ -206,11 +217,68 @@ class InferenceTransformerWrapperV3CP(torch.nn.Module):
                 self.rotary_emb_cos,
                 self.rotary_emb_sin,
             )
-
         if isinstance(output, (tuple, list)):
             output = output[0]
+        return output
 
+    def _prepare_timestep(self, timestep):
+        """Normalize timestep to correct shape."""
+        if timestep is not None:
+            if timestep.dim() > 1:
+                timestep = timestep.flatten()[0:1]
+            elif timestep.dim() == 0:
+                timestep = timestep.unsqueeze(0)
+            timestep = timestep.to(torch.float32)
+        return timestep
+
+    def forward(self, hidden_states, timestep=None, encoder_hidden_states=None, return_dict=False, **kwargs):
+        """Forward with pre-computed RoPE. Supports CP and CFG Parallel modes."""
+        # I2V: replace frame 0 in model input so the model always sees the clean image
+        if self.image_condition is not None:
+            hidden_states = hidden_states.clone()
+            hidden_states[:, :, 0:1, :, :] = self.image_condition.to(hidden_states.dtype)
+
+        timestep = self._prepare_timestep(timestep)
+
+        # CFG Parallel: batch cond + uncond into single forward pass
+        if self.cfg_parallel and self._negative_embeds is not None:
+            return self._forward_cfg_parallel(hidden_states, timestep, encoder_hidden_states)
+
+        # Standard CP mode: single forward pass
+        output = self._run_nxd_model(hidden_states, timestep, encoder_hidden_states)
         return (output,)
+
+    def _forward_cfg_parallel(self, hidden_states, timestep, encoder_hidden_states):
+        """CFG Parallel forward: batch cond+uncond, single forward, split results.
+
+        The pipeline calls forward twice per step:
+        1. First call with prompt_embeds (cond) -> we run batched forward, return cond result
+        2. Second call with negative_prompt_embeds (uncond) -> return cached uncond result
+        """
+        if self._is_cond_call:
+            # First call (cond): batch with negative embeddings and run once
+            hs_batched = torch.cat([hidden_states, hidden_states], dim=0)  # [2, C, F, H, W]
+            enc_batched = torch.cat(
+                [self._negative_embeds.to(encoder_hidden_states.dtype), encoder_hidden_states],
+                dim=0,
+            )  # [2, text_len, D]
+            ts_batched = torch.cat([timestep, timestep], dim=0) if timestep is not None else None
+
+            output = self._run_nxd_model(hs_batched, ts_batched, enc_batched)
+
+            # Split: batch[0] = uncond (from negative embeds), batch[1] = cond
+            noise_uncond = output[0:1]
+            noise_cond = output[1:2]
+
+            self._cached_uncond_result = noise_uncond
+            self._is_cond_call = False
+            return (noise_cond,)
+        else:
+            # Second call (uncond): return cached result without running model
+            result = self._cached_uncond_result
+            self._cached_uncond_result = None
+            self._is_cond_call = True
+            return (result,)
 
 
 def load_transformer(compiled_models_dir, pipe):
@@ -218,12 +286,13 @@ def load_transformer(compiled_models_dir, pipe):
     Load compiled transformer.
 
     Steps:
-    1. Load config to get TP/CP degrees
-    2. Load TP checkpoints
-    3. Duplicate for CP ranks with unique global_rank
-    4. Load NxDModel and set weights
-    5. Load pre-computed RoPE
-    6. Create wrapper
+    1. Check for CFG parallel (transformer_cfg/) or CP (transformer/) directory
+    2. Load config to get TP/CP degrees and cfg_parallel flag
+    3. Load TP checkpoints
+    4. Duplicate for CP ranks with unique global_rank
+    5. Load NxDModel and set weights
+    6. Load pre-computed RoPE
+    7. Create wrapper
 
     Args:
         compiled_models_dir: Directory containing compiled models
@@ -232,15 +301,23 @@ def load_transformer(compiled_models_dir, pipe):
     Returns:
         InferenceTransformerWrapperV3CP instance
     """
-    transformer_path = f"{compiled_models_dir}/transformer"
+    # Check for CFG parallel first, fall back to CP
+    transformer_cfg_path = f"{compiled_models_dir}/transformer_cfg"
+    transformer_cp_path = f"{compiled_models_dir}/transformer"
+    if os.path.exists(transformer_cfg_path):
+        transformer_path = transformer_cfg_path
+    else:
+        transformer_path = transformer_cp_path
 
     # Load config
     config = load_model_config(transformer_path)
     tp_degree = config["tp_degree"]
     cp_degree = config["cp_degree"]
     world_size = config["world_size"]
+    cfg_parallel = config.get("cfg_parallel", False)
 
-    print(f"Loading V3 CP transformer (TP={tp_degree}, CP={cp_degree}, world_size={world_size})...")
+    mode = "CFG Parallel" if cfg_parallel else "Context Parallel"
+    print(f"Loading V3 transformer ({mode}, TP={tp_degree}, CP={cp_degree}, world_size={world_size})...")
 
     # Load TP checkpoints
     tp_checkpoints = load_sharded_weights(transformer_path, tp_degree)
@@ -267,9 +344,10 @@ def load_transformer(compiled_models_dir, pipe):
         nxd_model=nxd_model,
         rotary_emb_cos=rotary_emb_cos,
         rotary_emb_sin=rotary_emb_sin,
+        cfg_parallel=cfg_parallel,
     )
 
-    print("Transformer loaded.")
+    print(f"Transformer loaded ({mode}).")
     return wrapper
 
 
@@ -504,6 +582,25 @@ def main(args):
     prompt = args.prompt
     negative_prompt = args.negative_prompt
 
+    # CFG Parallel: pre-encode prompts and store negative embeddings in wrapper
+    prompt_embeds = None
+    negative_prompt_embeds = None
+    if transformer_wrapper.cfg_parallel:
+        print("\nCFG Parallel: pre-encoding prompts...")
+        prompt_embeds, negative_prompt_embeds = pipe.encode_prompt(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            do_classifier_free_guidance=True,
+            num_videos_per_prompt=1,
+            max_sequence_length=seqlen,
+            device=torch.device('cpu'),
+        )
+        prompt_embeds = prompt_embeds.to(torch.bfloat16)
+        negative_prompt_embeds = negative_prompt_embeds.to(torch.bfloat16)
+        transformer_wrapper._negative_embeds = negative_prompt_embeds
+        print(f"  prompt_embeds: {prompt_embeds.shape}")
+        print(f"  negative_prompt_embeds: {negative_prompt_embeds.shape}")
+
     # Prepare I2V latents BEFORE warmup
     i2v_latents = None
     image_condition = None
@@ -517,25 +614,36 @@ def main(args):
         )
         print(f"I2V latents: {i2v_latents.shape}")
 
-    # Warmup (without I2V latents, no generator)
-    print("\nStarting warmup inference...")
-    start = time.time()
-    output_warmup = pipe(
-        prompt=prompt,
-        negative_prompt=negative_prompt,
+    # Build common pipeline kwargs
+    pipe_kwargs = dict(
         height=args.height,
         width=args.width,
         num_frames=args.num_frames,
         guidance_scale=5.0,
         num_inference_steps=args.num_inference_steps,
         max_sequence_length=seqlen,
-    ).frames[0]
+    )
+    if transformer_wrapper.cfg_parallel:
+        # Pass pre-encoded embeddings (pipeline won't re-encode)
+        pipe_kwargs["prompt_embeds"] = prompt_embeds
+        pipe_kwargs["negative_prompt_embeds"] = negative_prompt_embeds
+    else:
+        pipe_kwargs["prompt"] = prompt
+        pipe_kwargs["negative_prompt"] = negative_prompt
+
+    # Warmup (without I2V latents, no generator)
+    print("\nStarting warmup inference...")
+    start = time.time()
+    output_warmup = pipe(**pipe_kwargs).frames[0]
     end = time.time()
     print(f"Warmup time: {end - start:.2f}s")
 
-    # Reset rolling cache between warmup and main inference
+    # Reset state between warmup and main inference
     if hasattr(vae_decoder_wrapper, 'reset_cache'):
         vae_decoder_wrapper.reset_cache()
+    if transformer_wrapper.cfg_parallel:
+        transformer_wrapper._is_cond_call = True
+        transformer_wrapper._cached_uncond_result = None
 
     # Main inference
     print("\nStarting main inference...")
@@ -545,17 +653,8 @@ def main(args):
     if image_condition is not None:
         transformer_wrapper.image_condition = image_condition
 
-    main_kwargs = dict(
-        prompt=prompt,
-        negative_prompt=negative_prompt,
-        height=args.height,
-        width=args.width,
-        num_frames=args.num_frames,
-        guidance_scale=5.0,
-        num_inference_steps=args.num_inference_steps,
-        max_sequence_length=seqlen,
-        generator=generator,
-    )
+    main_kwargs = dict(pipe_kwargs)  # Copy common kwargs
+    main_kwargs["generator"] = generator
     if i2v_latents is not None:
         main_kwargs["latents"] = i2v_latents
 
