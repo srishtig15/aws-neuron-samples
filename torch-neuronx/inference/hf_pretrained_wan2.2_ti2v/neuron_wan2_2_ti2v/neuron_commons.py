@@ -33,6 +33,7 @@ class InferenceTextEncoderWrapperV2(nn.Module):
         self.t = t
 
     def forward(self, text_input_ids, attention_mask=None):
+        _t0 = time.time()
         if hasattr(self.t, 'encode'):
             result = self.t.encode(
                 text_input_ids=text_input_ids,
@@ -48,6 +49,7 @@ class InferenceTextEncoderWrapperV2(nn.Module):
         else:
             last_hidden_state = result
 
+        print(f"[timing] text_encoder forward: {time.time() - _t0:.3f}s")
         return SimpleNamespace(last_hidden_state=last_hidden_state.to(self.dtype))
 
 
@@ -59,21 +61,12 @@ class InferenceTransformerWrapper(nn.Module):
         self.dtype = transformer.dtype
         self.device = transformer.device
         self.cache_context = transformer.cache_context
-    def forward(self, hidden_states, timestep=None, encoder_hidden_states=None, return_dict=False, **kwargs):  # encoder_attention_mask=None, added_cond_kwargs=None,
-        # print('self.config:', self.config)
-        # print('self.dtype:', self.dtype)
-        # print('self.device:', self.device)
-        # print('self.transformer:', self.transformer)
-        # print('hidden_states:', hidden_states.shape, hidden_states)
-        # print('timestep:', timestep)
-        # print('encoder_hidden_states:', encoder_hidden_states.shape, encoder_hidden_states)
-        # print('kwargs:', kwargs)
+    def forward(self, hidden_states, timestep=None, encoder_hidden_states=None, return_dict=False, **kwargs):
         output = self.transformer(
-            hidden_states, 
+            hidden_states,
             timestep,
             encoder_hidden_states
         )
-        # print('output:', output.shape, output)
         return output
 
 class SimpleWrapper(nn.Module):

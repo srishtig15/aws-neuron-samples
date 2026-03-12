@@ -489,12 +489,21 @@ def main(args):
         def _decode_override(z, return_dict=True):
             from diffusers.models.autoencoders.vae import DecoderOutput
             from diffusers.models.autoencoders.autoencoder_kl_wan import unpatchify
+            _t_decode_enter = time.time()
+            print(f"[timing] _decode_override entered at {_t_decode_enter - _phase_t0:.2f}s from pipe() start")
             vae_decoder_wrapper.reset_cache()
+            _t_pqc_start = time.time()
             x = original_post_quant_conv(z)
+            _t_pqc_end = time.time()
+            print(f"[timing] post_quant_conv: {_t_pqc_end - _t_pqc_start:.3f}s")
             out = vae_decoder_wrapper.decode_latents(x)
+            _t_dec_end = time.time()
+            print(f"[timing] decoder decode_latents: {_t_dec_end - _t_pqc_end:.3f}s")
             if vae_config.patch_size is not None:
                 out = unpatchify(out, patch_size=vae_config.patch_size)
             out = torch.clamp(out, min=-1.0, max=1.0)
+            _t_done = time.time()
+            print(f"[timing] VAE decode total: {_t_done - _t_decode_enter:.3f}s")
             if not return_dict:
                 return (out,)
             return DecoderOutput(sample=out)
@@ -539,6 +548,7 @@ def main(args):
 
     # Main inference
     print("\nStarting main inference...")
+    _phase_t0 = time.time()  # shared reference for phase timing
     start = time.time()
 
     # Enable model-input replacement for I2V
