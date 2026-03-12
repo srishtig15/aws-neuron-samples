@@ -489,8 +489,7 @@ def main(args):
         def _decode_override(z, return_dict=True):
             from diffusers.models.autoencoders.vae import DecoderOutput
             from diffusers.models.autoencoders.autoencoder_kl_wan import unpatchify
-            # NOTE: reset_cache removed from hot path — saves ~1.5s per decode.
-            # Cache is reset explicitly between pipe() calls instead.
+            vae_decoder_wrapper.reset_cache()
             x = original_post_quant_conv(z)
             out = vae_decoder_wrapper.decode_latents(x)
             if vae_config.patch_size is not None:
