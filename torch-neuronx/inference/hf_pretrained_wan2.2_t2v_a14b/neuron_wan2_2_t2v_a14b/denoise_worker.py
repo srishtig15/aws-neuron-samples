@@ -1,12 +1,12 @@
 """
 Subprocess worker for running a single denoising phase on Neuron.
 
-Called by run_wan2.2_t2v_a14b.py to run each MoE transformer phase in a
-separate process. This ensures complete HBM cleanup between phases, which
-is required for 720P where the NEFF uses 23.94/24GB per HBM bank.
+Supports both batch_size=1 (two forward passes per step) and batch_size=2
+(single batched forward for CFG). batch_size is auto-detected from the
+compiled model's config.json.
 
 Usage (called programmatically, not directly):
-    python -m neuron_wan2_2_t2v_a14b.denoise_worker <input.pt> <output.pt>
+    python -m neuron_wan2_2_t2v_a14b.denoise_worker <input.pt> <output.pt> [env.json]
 """
 import json
 import os
@@ -72,6 +72,40 @@ def run_transformer_step(nxd_model, hidden_states, timestep, encoder_hidden_stat
     return output
 
 
+def run_transformer_step_batched(nxd_model, hidden_states, timestep,
+                                  prompt_embeds, negative_prompt_embeds,
+                                  rotary_emb_cos, rotary_emb_sin):
+    """Run batched CFG: concat prompt+negative into batch=2, single forward pass."""
+    if timestep is not None:
+        if timestep.dim() > 1:
+            timestep = timestep.flatten()[0:1]
+        elif timestep.dim() == 0:
+            timestep = timestep.unsqueeze(0)
+        timestep = timestep.to(torch.float32)
+        # Expand timestep for batch=2
+        timestep = timestep.expand(2)
+
+    # Batch hidden_states: [1,...] -> [2,...]
+    hidden_states_batched = hidden_states.expand(2, *hidden_states.shape[1:]).contiguous()
+    # Batch encoder_hidden_states: stack prompt + negative
+    encoder_hidden_states_batched = torch.cat([prompt_embeds, negative_prompt_embeds], dim=0)
+    # Expand RoPE for batch=2
+    rotary_emb_cos_batched = rotary_emb_cos.expand(2, *rotary_emb_cos.shape[1:]).contiguous()
+    rotary_emb_sin_batched = rotary_emb_sin.expand(2, *rotary_emb_sin.shape[1:]).contiguous()
+
+    output = nxd_model(
+        hidden_states_batched, timestep, encoder_hidden_states_batched,
+        rotary_emb_cos_batched, rotary_emb_sin_batched,
+    )
+    if isinstance(output, (tuple, list)):
+        output = output[0]
+
+    # Split: output[0] = prompt (noise_pred), output[1] = negative (noise_uncond)
+    noise_pred = output[0:1]
+    noise_uncond = output[1:2]
+    return noise_pred, noise_uncond
+
+
 def main():
     t_total = time.time()
 
@@ -100,6 +134,9 @@ def main():
     tp_degree = config["tp_degree"]
     cp_degree = config["cp_degree"]
     world_size = config["world_size"]
+    compiled_batch_size = config.get("batch_size", 1)
+
+    print(f"  Compiled batch_size={compiled_batch_size}")
 
     # Load RoPE
     rope_cache = torch.load(os.path.join(transformer_path, "rope_cache.pt"), weights_only=True)
@@ -146,7 +183,7 @@ def main():
 
     # Run denoising steps
     num_steps = step_end - step_start
-    print(f"  Running {num_steps} denoising steps ({step_start}-{step_end-1})...")
+    print(f"  Running {num_steps} denoising steps ({step_start}-{step_end-1}), batch_size={compiled_batch_size}...")
     t0 = time.time()
     for i in range(step_start, step_end):
         t = timesteps[i]
@@ -158,10 +195,20 @@ def main():
         else:
             ts = t.expand(latents.shape[0])
 
-        noise_pred = run_transformer_step(nxd_model, latent_input, ts, prompt_embeds,
-                                           rotary_emb_cos, rotary_emb_sin)
-        noise_uncond = run_transformer_step(nxd_model, latent_input, ts, negative_prompt_embeds,
-                                             rotary_emb_cos, rotary_emb_sin)
+        if compiled_batch_size >= 2:
+            # Batched CFG: single forward pass with batch=2
+            noise_pred, noise_uncond = run_transformer_step_batched(
+                nxd_model, latent_input, ts,
+                prompt_embeds, negative_prompt_embeds,
+                rotary_emb_cos, rotary_emb_sin,
+            )
+        else:
+            # Original: two separate forward passes
+            noise_pred = run_transformer_step(nxd_model, latent_input, ts, prompt_embeds,
+                                               rotary_emb_cos, rotary_emb_sin)
+            noise_uncond = run_transformer_step(nxd_model, latent_input, ts, negative_prompt_embeds,
+                                                 rotary_emb_cos, rotary_emb_sin)
+
         noise_pred = noise_uncond.float() + guidance_scale * (noise_pred.float() - noise_uncond.float())
         latents = scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 

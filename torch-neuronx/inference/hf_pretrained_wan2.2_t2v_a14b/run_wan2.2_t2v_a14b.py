@@ -81,13 +81,9 @@ import random
 import time
 import torch
 
-# Subprocess mode: 720P denoising uses subprocesses for HBM lifecycle.
-# Don't import torch_neuronx in main process for 720P — tiled VAE decode will
-# lazily import it later with the correct NEURON_RT_NUM_CORES for the decoder.
-_subprocess_mode = _world_size > 8
-if not _subprocess_mode:
-    import torch_neuronx
-    from neuronx_distributed import NxDModel
+# Subprocess mode: all Neuron phases run in subprocesses for clean HBM lifecycle.
+# Main process never imports torch_neuronx — each subprocess initializes its own NRT.
+_subprocess_mode = True
 
 from safetensors.torch import load_file
 
@@ -288,6 +284,79 @@ def phase_text_encoding_neuron(pipe, compiled_models_dir, seqlen, prompt, negati
     return prompt_embeds, negative_prompt_embeds
 
 
+def _run_text_encoding_subprocess(compiled_models_dir, seqlen, prompt, negative_prompt, pipe):
+    """Run text encoding in a subprocess for clean HBM lifecycle."""
+    import subprocess
+    import tempfile
+
+    tmpdir = tempfile.mkdtemp(prefix="text_enc_")
+    input_path = os.path.join(tmpdir, "input.pt")
+    output_path = os.path.join(tmpdir, "output.pt")
+    env_config_path = os.path.join(tmpdir, "env.json")
+
+    env_config = {
+        "NEURON_RT_NUM_CORES": os.environ.get("NEURON_RT_NUM_CORES", "8"),
+        "NEURON_RT_VIRTUAL_CORE_SIZE": os.environ.get("NEURON_RT_VIRTUAL_CORE_SIZE", "2"),
+        "NEURON_RT_VISIBLE_CORES": os.environ.get("NEURON_RT_VISIBLE_CORES", "0-7"),
+        "NEURON_RT_INSPECT_ENABLE": "0",
+        "NEURON_RT_INSPECT_DEVICE_PROFILE": "0",
+        "NEURON_RT_INSPECT_SYSTEM_PROFILE": "0",
+        "NEURON_RT_PROFILING_MODE": "0",
+    }
+    with open(env_config_path, "w") as f:
+        json.dump(env_config, f)
+
+    # Tokenize in main process (no Neuron needed)
+    text_inputs = pipe.tokenizer(
+        prompt, padding="max_length", max_length=seqlen,
+        truncation=True, return_attention_mask=True, return_tensors="pt",
+    )
+    neg_text_inputs = pipe.tokenizer(
+        negative_prompt, padding="max_length", max_length=seqlen,
+        truncation=True, return_attention_mask=True, return_tensors="pt",
+    )
+
+    torch.save({
+        "te_path": f"{compiled_models_dir}/text_encoder",
+        "seqlen": seqlen,
+        "prompt_input_ids": text_inputs.input_ids,
+        "prompt_attention_mask": text_inputs.attention_mask,
+        "neg_input_ids": neg_text_inputs.input_ids,
+        "neg_attention_mask": neg_text_inputs.attention_mask,
+    }, input_path)
+
+    print(f"[Subprocess] Running text encoding in separate process...")
+    t0 = time.time()
+
+    cwd = os.path.dirname(os.path.abspath(__file__))
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    for k in list(env.keys()):
+        if k.startswith("NEURON_RT_") or k == "NEURON_LOGICAL_NC_CONFIG":
+            del env[k]
+    if "PYTHONPATH" not in env:
+        env["PYTHONPATH"] = cwd
+    elif cwd not in env["PYTHONPATH"]:
+        env["PYTHONPATH"] = cwd + ":" + env["PYTHONPATH"]
+
+    result = subprocess.run(
+        [sys.executable, "-m", "neuron_wan2_2_t2v_a14b.text_encoder_worker",
+         input_path, output_path, env_config_path],
+        cwd=cwd, env=env,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Text encoding subprocess failed with code {result.returncode}")
+
+    output_data = torch.load(output_path, weights_only=False)
+    elapsed = time.time() - t0
+    print(f"[Subprocess] Text encoding done in {elapsed:.1f}s (load: {output_data['load_time']:.1f}s, enc: {output_data['enc_time']:.1f}s)")
+
+    import shutil
+    shutil.rmtree(tmpdir, ignore_errors=True)
+
+    return output_data["prompt_embeds"], output_data["negative_prompt_embeds"]
+
+
 def phase_text_encoding(pipe, compiled_models_dir, seqlen, prompt, negative_prompt,
                         use_neuron=True):
     """Encode prompt. Uses Neuron by default, CPU with --cpu_text_encoder."""
@@ -297,7 +366,7 @@ def phase_text_encoding(pipe, compiled_models_dir, seqlen, prompt, negative_prom
     print("="*60)
 
     if use_neuron:
-        return phase_text_encoding_neuron(pipe, compiled_models_dir, seqlen, prompt, negative_prompt)
+        return _run_text_encoding_subprocess(compiled_models_dir, seqlen, prompt, negative_prompt, pipe)
     else:
         return phase_text_encoding_cpu(pipe, seqlen, prompt, negative_prompt)
 
@@ -429,8 +498,8 @@ def phase_denoising(pipe, compiled_models_dir, prompt_embeds, negative_prompt_em
                      args, generator=None):
     """Run the denoising loop with MoE transformer swap.
 
-    For 480P (world_size=8): uses replace_weights() in-process (fast swap).
-    For 720P (world_size>8): runs each phase in a subprocess to ensure clean HBM.
+    Each expert phase runs in a subprocess for clean HBM lifecycle.
+    Subprocess exit guarantees full NRT resource release between phases.
     """
     print("\n" + "="*60)
     print("PHASE 2: Denoising (MoE)")
@@ -479,14 +548,14 @@ def phase_denoising(pipe, compiled_models_dir, prompt_embeds, negative_prompt_em
     # Load config from transformer_1
     config = load_model_config(transformer_1_path)
     world_size = config["world_size"]
-    hbm_tight = (world_size > 8)  # 720P NEFF uses 23.94/24GB per HBM bank
+    hbm_tight = True  # Always use subprocess for clean HBM lifecycle
 
     if hbm_tight:
         # ============================================================
         # SUBPROCESS MODE: Run each phase in a separate process to
         # ensure clean HBM lifecycle (required for 720P).
         # ============================================================
-        print(f"\nUsing subprocess mode for HBM-tight NEFFs (world_size={world_size})")
+        print(f"\nUsing subprocess mode for clean HBM (world_size={world_size})")
 
         scheduler_config = dict(pipe.scheduler.config)
         scheduler_state_initial = {
@@ -625,6 +694,87 @@ def phase_denoising(pipe, compiled_models_dir, prompt_embeds, negative_prompt_em
         gc.collect()
 
     return latents
+
+
+def _run_vae_decode_subprocess(pipe, compiled_models_dir, latents, num_frames=81):
+    """Run VAE decode (post_quant_conv + decoder) in a subprocess for clean HBM."""
+    import subprocess
+    import tempfile
+
+    print("\n" + "="*60)
+    print("PHASE 3: VAE Decoding (Neuron subprocess)")
+    print("="*60)
+
+    # Denormalize latents on CPU (no Neuron needed)
+    vae_config = pipe.vae.config
+    latents = latents.to(torch.float32)
+    latents_mean = (
+        torch.tensor(vae_config.latents_mean)
+        .view(1, vae_config.z_dim, 1, 1, 1)
+        .to(latents.device, latents.dtype)
+    )
+    latents_std = 1.0 / torch.tensor(vae_config.latents_std).view(
+        1, vae_config.z_dim, 1, 1, 1
+    ).to(latents.device, latents.dtype)
+    latents = latents / latents_std + latents_mean
+    print(f"Denormalized latents: {latents.shape}, range=[{latents.min():.3f}, {latents.max():.3f}]")
+
+    tmpdir = tempfile.mkdtemp(prefix="vae_dec_")
+    input_path = os.path.join(tmpdir, "input.pt")
+    output_path = os.path.join(tmpdir, "output.pt")
+    env_config_path = os.path.join(tmpdir, "env.json")
+
+    env_config = {
+        "NEURON_RT_NUM_CORES": os.environ.get("NEURON_RT_NUM_CORES", "8"),
+        "NEURON_RT_VIRTUAL_CORE_SIZE": os.environ.get("NEURON_RT_VIRTUAL_CORE_SIZE", "2"),
+        "NEURON_RT_VISIBLE_CORES": os.environ.get("NEURON_RT_VISIBLE_CORES", "0-7"),
+        "NEURON_RT_INSPECT_ENABLE": "0",
+        "NEURON_RT_INSPECT_DEVICE_PROFILE": "0",
+        "NEURON_RT_INSPECT_SYSTEM_PROFILE": "0",
+        "NEURON_RT_PROFILING_MODE": "0",
+    }
+    with open(env_config_path, "w") as f:
+        json.dump(env_config, f)
+
+    torch.save({
+        "compiled_models_dir": compiled_models_dir,
+        "latents_f32": latents,
+        "z_bf16": latents.to(torch.bfloat16),
+        "num_frames": num_frames,
+    }, input_path)
+
+    print(f"[Subprocess] Running VAE decode in separate process...")
+    t0 = time.time()
+
+    cwd = os.path.dirname(os.path.abspath(__file__))
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    for k in list(env.keys()):
+        if k.startswith("NEURON_RT_") or k == "NEURON_LOGICAL_NC_CONFIG":
+            del env[k]
+    if "PYTHONPATH" not in env:
+        env["PYTHONPATH"] = cwd
+    elif cwd not in env["PYTHONPATH"]:
+        env["PYTHONPATH"] = cwd + ":" + env["PYTHONPATH"]
+
+    result = subprocess.run(
+        [sys.executable, "-m", "neuron_wan2_2_t2v_a14b.decoder_worker",
+         input_path, output_path, env_config_path],
+        cwd=cwd, env=env,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"VAE decode subprocess failed with code {result.returncode}")
+
+    output_data = torch.load(output_path, weights_only=False)
+    elapsed = time.time() - t0
+    print(f"[Subprocess] VAE decode done in {elapsed:.1f}s (decode: {output_data['decode_time']:.1f}s)")
+
+    import shutil
+    shutil.rmtree(tmpdir, ignore_errors=True)
+
+    video = output_data["video"].numpy()
+    print(f"Output video: shape={video.shape}, dtype={video.dtype}")
+    return video
 
 
 # ============================================================
@@ -1145,7 +1295,6 @@ def main(args):
     # 3. CPU fallback
     has_neuron_decoder = (
         not args.cpu_vae_decoder
-        and not _subprocess_mode  # Full-res Neuron decoder not available in subprocess mode
         and (
             os.path.exists(os.path.join(compiled_models_dir, "decoder_rolling", "nxd_model.pt"))
             or os.path.exists(os.path.join(compiled_models_dir, "decoder_nocache", "nxd_model.pt"))
@@ -1157,7 +1306,7 @@ def main(args):
         and os.path.exists(os.path.join(compiled_models_dir, "decoder_rolling_480p", "nxd_model.pt"))
     )
     if has_neuron_decoder:
-        video = phase_vae_decode(pipe, compiled_models_dir, latents, num_frames=args.num_frames)
+        video = _run_vae_decode_subprocess(pipe, compiled_models_dir, latents, num_frames=args.num_frames)
     elif has_tiled_decoder:
         video = phase_vae_decode_neuron_tiled(pipe, compiled_models_dir, latents, num_frames=args.num_frames)
     else:

@@ -648,7 +648,7 @@ def compute_rope(transformer, latent_frames, latent_height, latent_width, in_cha
     """
     batch_size = 1
     dummy_hidden = torch.zeros(
-        batch_size, in_channels, latent_frames, latent_height, latent_width,
+        1, in_channels, latent_frames, latent_height, latent_width,
         dtype=torch.float32
     )
 
@@ -719,7 +719,7 @@ def compile_transformer(args):
     latent_width = args.width // 8
     latent_frames = (args.num_frames - 1) // 4 + 1
     max_sequence_length = args.max_sequence_length
-    batch_size = 1
+    batch_size = args.batch_size
 
     # T2V-A14B dimensions
     hidden_size = 5120  # 40 heads * 128 head_dim
@@ -912,6 +912,7 @@ def compile_transformer(args):
             "world_size": world_size,
             "context_parallel": context_parallel_enabled,
             "nki_flash_attention": True,
+            "batch_size": batch_size,
             "transformer_subfolder": subfolder,
         }
         with open(os.path.join(output_path, "config.json"), "w") as f:
@@ -942,6 +943,7 @@ if __name__ == "__main__":
     parser.add_argument("--transformer_subfolder", type=str, default="transformer",
                         choices=["transformer", "transformer_2"],
                         help="Which transformer to compile: 'transformer' (high-noise) or 'transformer_2' (low-noise)")
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size (2 for batched CFG)")
     parser.add_argument("--output_dir", type=str, default=None,
                         help="Output directory for compiled model (default: compiled_models_dir/subfolder)")
     args = parser.parse_args()
