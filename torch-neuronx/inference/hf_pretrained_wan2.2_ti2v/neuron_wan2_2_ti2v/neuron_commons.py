@@ -33,7 +33,6 @@ class InferenceTextEncoderWrapperV2(nn.Module):
         self.t = t
 
     def forward(self, text_input_ids, attention_mask=None):
-        _t0 = time.time()
         if hasattr(self.t, 'encode'):
             result = self.t.encode(
                 text_input_ids=text_input_ids,
@@ -49,7 +48,8 @@ class InferenceTextEncoderWrapperV2(nn.Module):
         else:
             last_hidden_state = result
 
-        print(f"[timing] text_encoder forward: {time.time() - _t0:.3f}s")
+        # NOTE: timing commented out to avoid device↔CPU sync
+        # _t0 = time.time(); ...; print(f"[timing] text_encoder forward: {time.time()-_t0:.3f}s")
         return SimpleNamespace(last_hidden_state=last_hidden_state.to(self.dtype))
 
 
