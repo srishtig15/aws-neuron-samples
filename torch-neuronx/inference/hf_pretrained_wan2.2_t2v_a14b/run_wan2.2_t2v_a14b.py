@@ -51,28 +51,25 @@ def _detect_world_size():
     return 8
 
 _world_size = _detect_world_size()
+# Neuron environment setup. All env vars respect external values if already set.
+# Usage: NEURON_RT_VISIBLE_CORES=8-15 NEURON_RT_NUM_CORES=8 python run_wan2.2_t2v_a14b.py ...
+#
 # On trn2.48xlarge with LNC=2: 16 chips, 4 logical NCs per chip, 24GB HBM per NC.
-#   - NEURON_RT_NUM_CORES = world_size = number of logical NCs needed
 #   - 480P: world_size=8 -> 8 NCs = 2 chips; 720P: world_size=16 -> 16 NCs = 4 chips
-# IMPORTANT: When world_size differs between models (e.g., text_encoder=8 vs transformer=16),
-# the first model loaded initializes the NRT communicator. Use --cpu_text_encoder for 720P
-# to ensure the transformer (world_size=16) initializes the communicator at the right size.
-_num_cores = _world_size
-os.environ["NEURON_RT_NUM_CORES"] = str(_num_cores)
-os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "2"
-# Pin to specific logical NCs. For 720P (16 cores), auto-offset to upper range
-# to avoid conflicts with other processes. For 480P (8 cores), use default.
-_core_start = int(os.environ.get("NEURON_CORE_START", "0"))
-if _core_start == 0 and _num_cores > 8:
-    # Auto-offset for 720P to avoid conflicts with other processes
-    _core_start = 64 - _num_cores  # e.g., 48 for 720P (16 cores)
-os.environ["NEURON_RT_VISIBLE_CORES"] = f"{_core_start}-{_core_start + _num_cores - 1}"
-# Disable profiler/inspection buffers to free ~124MB/NC for 720P HBM-tight NEFFs
+_num_cores = int(os.environ.get("NEURON_RT_NUM_CORES", str(_world_size)))
+os.environ.setdefault("NEURON_RT_NUM_CORES", str(_num_cores))
+os.environ.setdefault("NEURON_RT_VIRTUAL_CORE_SIZE", "2")
+if "NEURON_RT_VISIBLE_CORES" not in os.environ:
+    _core_start = 0
+    if _num_cores > 8:
+        _core_start = 64 - _num_cores  # Auto-offset for 720P to avoid conflicts
+    os.environ["NEURON_RT_VISIBLE_CORES"] = f"{_core_start}-{_core_start + _num_cores - 1}"
 os.environ.setdefault("NEURON_RT_INSPECT_ENABLE", "0")
 os.environ.setdefault("NEURON_RT_INSPECT_DEVICE_PROFILE", "0")
 os.environ.setdefault("NEURON_RT_INSPECT_SYSTEM_PROFILE", "0")
 os.environ.setdefault("NEURON_RT_PROFILING_MODE", "0")
-print(f"Auto-detected world_size={_world_size}, NEURON_RT_NUM_CORES={_num_cores}, VCS=2, cores={_core_start}-{_core_start + _num_cores - 1}")
+print(f"Neuron config: world_size={_world_size}, NUM_CORES={os.environ['NEURON_RT_NUM_CORES']}, "
+      f"VCS={os.environ['NEURON_RT_VIRTUAL_CORE_SIZE']}, VISIBLE_CORES={os.environ['NEURON_RT_VISIBLE_CORES']}")
 
 from diffusers import AutoencoderKLWan, WanPipeline
 from diffusers.utils import export_to_video
@@ -159,6 +156,42 @@ def load_duplicated_weights(model_path, world_size):
         ckpt = {k: v.clone() for k, v in base_ckpt.items()}
         sharded_weights.append(ckpt)
     return sharded_weights
+
+
+def unload_neuron_model(nxd_model, label="model"):
+    """Thoroughly unload an NxDModel to release NeuronCore HBM resources.
+
+    Simple del + gc.collect() is insufficient -- NRT resources hold HBM.
+    This tears down per-rank SPMD models individually and forces GC.
+    Reference: LTX-2.3 unload_neuron_model() pattern.
+    """
+    t0 = time.time()
+    # Clear SPMD models (C++ NRT objects that hold HBM)
+    if hasattr(nxd_model, "spmd_models"):
+        for key in list(nxd_model.spmd_models.keys()):
+            nxd_model.spmd_models[key] = None
+        nxd_model.spmd_models.clear()
+    # Clear weights
+    if hasattr(nxd_model, "weights"):
+        for i in range(len(nxd_model.weights)):
+            nxd_model.weights[i] = {}
+    # Clear states
+    if hasattr(nxd_model, "states"):
+        for i in range(len(nxd_model.states)):
+            nxd_model.states[i] = {}
+    # Clear reserved examples
+    if hasattr(nxd_model, "reserved_example_inputs"):
+        nxd_model.reserved_example_inputs.clear()
+    if hasattr(nxd_model, "reserved_example_outputs"):
+        nxd_model.reserved_example_outputs.clear()
+    nxd_model.loaded_on_neuron = False
+    del nxd_model
+    gc.collect()
+    gc.collect(0)
+    gc.collect(1)
+    gc.collect(2)
+    time.sleep(2)  # Give NRT time to release resources
+    print(f"  {label} unloaded from NeuronCores ({time.time() - t0:.1f}s)")
 
 
 def prepare_cp_checkpoints(tp_checkpoints, tp_degree, cp_degree):
@@ -248,9 +281,9 @@ def phase_text_encoding_neuron(pipe, compiled_models_dir, seqlen, prompt, negati
 
     # Restore and clean up
     pipe.text_encoder = original_text_encoder
-    del te_nxd, tp_checkpoints, checkpoints, text_encoder_wrapper
+    unload_neuron_model(te_nxd, "Text encoder")
+    del tp_checkpoints, checkpoints, text_encoder_wrapper
     gc.collect()
-    print(f"  Text encoder unloaded")
 
     return prompt_embeds, negative_prompt_embeds
 
@@ -587,7 +620,8 @@ def phase_denoising(pipe, compiled_models_dir, prompt_embeds, negative_prompt_em
             print(f"Low-noise phase done. {remaining_steps} steps in {time.time() - t0:.1f}s")
 
         # Cleanup
-        del nxd_model, t2_weights
+        unload_neuron_model(nxd_model, "Transformer")
+        del t2_weights
         gc.collect()
 
     return latents
@@ -653,7 +687,8 @@ def phase_vae_decode(pipe, compiled_models_dir, latents, num_frames=81):
     z = z.to(torch.float32)
     print(f"  post_quant_conv done in {time.time() - t0:.1f}s, output: {z.shape}")
 
-    del pqc_nxd, pqc_weights
+    unload_neuron_model(pqc_nxd, "post_quant_conv")
+    del pqc_weights
     gc.collect()
 
     # ---- Load and run decoder ----
@@ -746,7 +781,8 @@ def phase_vae_decode(pipe, compiled_models_dir, latents, num_frames=81):
 
     print(f"  Total decode time: {decode_time:.1f}s, output: {video.shape} [{mode_str}]")
 
-    del decoder_nxd, decoder_weights, z, z_bf16, decoded_frames
+    unload_neuron_model(decoder_nxd, "Decoder")
+    del decoder_weights, z, z_bf16, decoded_frames
     gc.collect()
 
     # Post-processing: [B, C, F, H, W] -> numpy [F, H, W, C], float [0,1]
