@@ -5,10 +5,12 @@ import json
 import time
 
 # Set Neuron env vars before any imports
-compiled_dir = "/opt/dlami/nvme/compiled_models_t2v_a14b_720p"
-os.environ["NEURON_RT_NUM_CORES"] = "8"
+compiled_dir = os.environ.get("COMPILED_MODELS_DIR", "/opt/dlami/nvme/compiled_models_t2v_a14b_720p")
+_num_cores = 8  # decoder world_size
+_core_start = int(os.environ.get("NEURON_CORE_START", "0"))
+os.environ["NEURON_RT_NUM_CORES"] = str(_num_cores)
 os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "2"
-os.environ["NEURON_RT_VISIBLE_CORES"] = "8-15"
+os.environ["NEURON_RT_VISIBLE_CORES"] = f"{_core_start}-{_core_start + _num_cores - 1}"
 os.environ.setdefault("NEURON_RT_INSPECT_ENABLE", "0")
 os.environ.setdefault("NEURON_RT_INSPECT_DEVICE_PROFILE", "0")
 os.environ.setdefault("NEURON_RT_INSPECT_SYSTEM_PROFILE", "0")
