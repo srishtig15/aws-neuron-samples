@@ -483,6 +483,7 @@ def main(args):
 
     # Override _decode to use rolling-cache decode_latents directly,
     # bypassing diffusers' per-frame loop which causes cache pollution.
+    _phase_t0 = None  # set before main inference, used by _decode_override
     if hasattr(vae_decoder_wrapper, 'decode_latents'):
         original_post_quant_conv = pipe.vae.post_quant_conv
         vae_config = pipe.vae.config
@@ -490,7 +491,8 @@ def main(args):
             from diffusers.models.autoencoders.vae import DecoderOutput
             from diffusers.models.autoencoders.autoencoder_kl_wan import unpatchify
             _t_decode_enter = time.time()
-            print(f"[timing] _decode_override entered at {_t_decode_enter - _phase_t0:.2f}s from pipe() start")
+            if _phase_t0 is not None:
+                print(f"[timing] _decode_override entered at {_t_decode_enter - _phase_t0:.2f}s from pipe() start")
             vae_decoder_wrapper.reset_cache()
             _t_pqc_start = time.time()
             x = original_post_quant_conv(z)
