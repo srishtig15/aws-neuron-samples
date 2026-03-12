@@ -1,7 +1,8 @@
 """
 Subprocess worker for running VAE decode on Neuron.
 
-Receives denormalized+post_quant_conv'd latents, runs rolling cache decoder.
+Supports both stateful (on-device cache) and legacy (I/O cache) rolling decoders.
+Auto-detects mode from compiled model's config.json.
 
 Usage (called programmatically):
     python -m neuron_wan2_2_t2v_a14b.decoder_worker <input.pt> <output.pt> <env.json>
@@ -43,7 +44,6 @@ def main():
 
     data = torch.load(input_path, weights_only=False)
     compiled_models_dir = data["compiled_models_dir"]
-    z_bf16 = data["z_bf16"]        # [1, 16, F, H, W] bfloat16, after post_quant_conv
     num_frames = data["num_frames"]
 
     # ---- Load and run post_quant_conv ----
@@ -64,8 +64,7 @@ def main():
     pqc_nxd.to_neuron()
     print(f"  post_quant_conv loaded in {time.time() - t0:.1f}s")
 
-    # z_bf16 is the denormalized latents (float32), run pqc
-    latents_f32 = data["latents_f32"]  # original float32 latents for pqc
+    latents_f32 = data["latents_f32"]
     print(f"  Running post_quant_conv on {latents_f32.shape}...")
     t0 = time.time()
     z = pqc_nxd(latents_f32)
@@ -92,7 +91,8 @@ def main():
         decoder_config = json.load(f)
     decoder_world_size = decoder_config["world_size"]
     decoder_frames = decoder_config.get("decoder_frames", 2)
-    mode_str = "rolling cache" if is_rolling else "nocache"
+    is_stateful = decoder_config.get("stateful", False)
+    mode_str = "stateful rolling" if is_stateful else ("rolling cache" if is_rolling else "nocache")
 
     print(f"  Loading decoder [{mode_str}] (world_size={decoder_world_size}, frames={decoder_frames})...")
     t0 = time.time()
@@ -113,7 +113,8 @@ def main():
     print(f"  Decoding {num_latent_frames} latent frames in {num_chunks} chunks [{mode_str}]...")
     decode_start = time.time()
 
-    if is_rolling:
+    if is_rolling and not is_stateful:
+        # Legacy mode: initialize caches on host
         from neuron_wan2_2_t2v_a14b.compile_decoder_rolling import get_feat_cache_shapes
         latent_h, latent_w = z_bf16.shape[3], z_bf16.shape[4]
         cache_shapes = get_feat_cache_shapes(1, latent_h, latent_w)
@@ -129,7 +130,13 @@ def main():
             padding = chunk[:, :, -1:, :, :].expand(-1, -1, pad_frames, -1, -1)
             chunk = torch.cat([chunk, padding], dim=2)
 
-        if is_rolling:
+        if is_stateful:
+            # Stateful: only pass x, cache stays on device
+            output = decoder_nxd(chunk)
+            if isinstance(output, (list, tuple)):
+                output = output[0]
+        elif is_rolling:
+            # Legacy rolling: pass x + caches, get back output + updated caches
             results = decoder_nxd(chunk, *caches)
             if isinstance(results, (tuple, list)):
                 output = results[0]
@@ -137,6 +144,7 @@ def main():
             else:
                 output = results
         else:
+            # NoCache
             output = decoder_nxd(chunk)
             if isinstance(output, (list, tuple)):
                 output = output[0]

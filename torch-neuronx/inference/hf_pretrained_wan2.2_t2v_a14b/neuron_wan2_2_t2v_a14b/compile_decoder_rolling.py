@@ -1,16 +1,12 @@
 """
 Wan2.2 T2V-A14B VAE Decoder Compilation - Rolling feat_cache.
 
-Unlike NoCache mode (feat_cache as zero buffers), this approach passes
-feat_cache as explicit inputs AND outputs:
-  Inputs:  x [B,C,T,H,W] + 34 cache tensors
-  Outputs: video [B,3,T*4,H*8,W*8] + 34 updated cache tensors
+Supports two modes:
+1. Stateful (default): cache as registered buffers, stays on device via
+   automatic input-output aliasing. Only x (~300KB) transferred per call.
+2. Legacy (--no_stateful): cache as explicit I/O, ~1.9GB roundtrip per call.
 
-This allows carrying temporal context between decoder calls, eliminating
-the flickering artifacts caused by zero temporal context in NoCache mode.
-
-Trade-off: ~1.8GB extra transfer per decoder call (in + out), but produces
-temporally coherent video matching CPU VAE decode quality.
+Stateful mode eliminates host-device cache transfer, ~2x faster per chunk.
 """
 import os
 import json
@@ -84,13 +80,9 @@ def get_feat_cache_shapes(batch_size, latent_height, latent_width, dtype=torch.b
 class DecoderWrapperRolling(nn.Module):
     """
     Decoder wrapper with feat_cache as explicit inputs AND outputs.
-
-    Unlike NoCache (feat_cache as zero buffers), this carries temporal context
-    between calls by returning the updated feat_cache as additional outputs.
+    (Legacy: cache transferred host<->device each call, ~1.9GB roundtrip)
 
     Forward signature: (x, c0, c1, ..., c33) -> (output, c0, c1, ..., c33)
-    - 35 inputs (x + 34 caches)
-    - 35 outputs (video + 34 updated caches)
     """
     NUM_FEAT_CACHE = 34
 
@@ -110,9 +102,35 @@ class DecoderWrapperRolling(nn.Module):
             c30, c31, c32, c33,
         ]
         output = self.decoder(x, feat_cache)
-        # decoder replaces feat_cache list elements in-place (feat_cache[idx] = new_tensor)
-        # Return updated cache tensors as additional outputs
         return tuple([output] + feat_cache)
+
+
+class DecoderWrapperRollingStateful(nn.Module):
+    """
+    Stateful decoder wrapper with feat_cache as registered buffers.
+
+    The 34 cache tensors are registered as nn.Module buffers, which enables
+    automatic input-output aliasing in the Neuron compiler. This keeps the
+    cache on the Neuron device (HBM) between calls, eliminating ~1.9GB
+    host<->device roundtrip per call.
+
+    Forward signature: (x) -> (output)
+    Cache stays on device, only x (~300KB) is transferred per call.
+    """
+    NUM_FEAT_CACHE = 34
+
+    def __init__(self, decoder, feat_cache_shapes, dtype=torch.bfloat16):
+        super().__init__()
+        self.decoder = decoder
+        for i, shape in enumerate(feat_cache_shapes):
+            self.register_buffer(f"c{i}", torch.zeros(shape, dtype=dtype))
+
+    def forward(self, x):
+        feat_cache = [self._buffers[f"c{i}"] for i in range(self.NUM_FEAT_CACHE)]
+        output = self.decoder(x, feat_cache)
+        for i in range(self.NUM_FEAT_CACHE):
+            self._buffers[f"c{i}"] = feat_cache[i]
+        return output
 
 
 def save_model_config(output_path, config):
@@ -132,15 +150,17 @@ def compile_decoder_rolling(args):
     in_channels = 16
     dtype = torch.bfloat16
 
+    use_stateful = not getattr(args, 'no_stateful', False)
+    mode_str = "STATEFUL" if use_stateful else "legacy I/O"
+
     print("=" * 60)
-    print("Wan2.2 T2V-A14B VAE Decoder Rolling Cache Compilation")
+    print(f"Wan2.2 T2V-A14B VAE Decoder Rolling Cache Compilation ({mode_str})")
     print("=" * 60)
     print(f"Resolution: {args.height}x{args.width}")
     print(f"Latent: {latent_height}x{latent_width}")
     print(f"in_channels (z_dim): {in_channels}")
     print(f"Decoder frames: {decoder_frames}")
     print(f"World size: {world_size}, TP: {tp_degree}")
-    print(f"Key: feat_cache as I/O -> 35 inputs, 35 outputs")
     print("=" * 60)
 
     print("\nLoading VAE...")
@@ -151,54 +171,76 @@ def compile_decoder_rolling(args):
         cache_dir=args.cache_dir,
     )
 
+    skip_decoder = getattr(args, 'skip_decoder', False)
+    skip_pqc = getattr(args, 'skip_pqc', False)
+    output_subdir = getattr(args, 'output_subdir', None) or "decoder_rolling"
+
     with NxDParallelState(world_size=world_size, tensor_model_parallel_size=tp_degree):
+
+      if not skip_decoder:
         print("\nGetting feat_cache shapes...")
         feat_cache_shapes = get_feat_cache_shapes(
             batch_size, latent_height, latent_width, dtype
         )
-        print(f"  {len(feat_cache_shapes)} entries (ALL tensors, as I/O)")
+        print(f"  {len(feat_cache_shapes)} entries")
         total_cache_bytes = 0
         for i, s in enumerate(feat_cache_shapes):
             size_mb = reduce(operator.mul, s) * 2 / 1024 / 1024
             total_cache_bytes += reduce(operator.mul, s) * 2
             print(f"    [{i:2d}] {s}  ({size_mb:.1f} MB)")
-        print(f"  Total cache: {total_cache_bytes/1024/1024:.0f} MB per direction")
 
-        print("\nPreparing decoder (bfloat16, rolling feat_cache)...")
-        decoder = vae.decoder.to(dtype).eval()
-        wrapper = DecoderWrapperRolling(decoder)
+        if use_stateful:
+            print(f"  Total cache: {total_cache_bytes/1024/1024:.0f} MB (on-device, no transfer)")
+            print("\nPreparing decoder (bfloat16, STATEFUL rolling cache)...")
+            print("  Cache as registered buffers -> automatic input-output aliasing")
+            print("  Only x (~300KB) transferred per call, cache stays on device")
+            decoder = vae.decoder.to(dtype).eval()
+            wrapper = DecoderWrapperRollingStateful(decoder, feat_cache_shapes, dtype)
 
-        # Build trace kwargs: x + 34 cache tensors
-        decoder_input = torch.rand(
-            (batch_size, in_channels, decoder_frames, latent_height, latent_width),
-            dtype=dtype,
-        )
-        trace_kwargs = {"x": decoder_input}
-        for i, shape in enumerate(feat_cache_shapes):
-            trace_kwargs[f"c{i}"] = torch.zeros(shape, dtype=dtype)
+            decoder_input = torch.rand(
+                (batch_size, in_channels, decoder_frames, latent_height, latent_width),
+                dtype=dtype,
+            )
+            trace_kwargs = {"x": decoder_input}
+            print(f"  Input x: {decoder_input.shape} ({decoder_input.nelement()*2/1024:.0f} KB)")
+        else:
+            print(f"  Total cache: {total_cache_bytes/1024/1024:.0f} MB per direction")
+            print("\nPreparing decoder (bfloat16, rolling feat_cache as I/O)...")
+            decoder = vae.decoder.to(dtype).eval()
+            wrapper = DecoderWrapperRolling(decoder)
 
-        print(f"  Input x: {decoder_input.shape} ({decoder_input.nelement()*2/1024:.0f} KB)")
-        print(f"  Cache inputs: 34 tensors ({total_cache_bytes/1024/1024:.0f} MB)")
-        print(f"  Total I/O per call: ~{total_cache_bytes*2/1024/1024:.0f} MB (in + out)")
+            decoder_input = torch.rand(
+                (batch_size, in_channels, decoder_frames, latent_height, latent_width),
+                dtype=dtype,
+            )
+            trace_kwargs = {"x": decoder_input}
+            for i, shape in enumerate(feat_cache_shapes):
+                trace_kwargs[f"c{i}"] = torch.zeros(shape, dtype=dtype)
+            print(f"  Input x: {decoder_input.shape} ({decoder_input.nelement()*2/1024:.0f} KB)")
+            print(f"  Cache I/O: 34 tensors ({total_cache_bytes/1024/1024:.0f} MB) per direction")
 
         builder = ModelBuilder(model=wrapper)
-        print("Tracing (this may take a while due to 35 I/O tensors)...")
+        print("Tracing...")
         builder.trace(kwargs=trace_kwargs, tag="decode")
 
         print("Compiling...")
         compile_args = "--model-type=unet-inference -O1 --auto-cast=none"
+        if getattr(args, 'max_instruction_limit', None):
+            compile_args += f" --internal-hlo2tensorizer-options='--tiled-inst-limit={args.max_instruction_limit}'"
+            compile_args += f" --internal-backend-options='--max-instruction-limit={args.max_instruction_limit}'"
+            print(f"  Max instruction limit: {args.max_instruction_limit}")
         traced = builder.compile(
             compiler_args=compile_args,
             compiler_workdir=args.compiler_workdir,
         )
 
         # Save
-        output_path = f"{compiled_models_dir}/{args.output_subdir}"
+        output_path = f"{compiled_models_dir}/{output_subdir}"
         os.makedirs(output_path, exist_ok=True)
         print(f"Saving to {output_path}...")
         traced.save(os.path.join(output_path, "nxd_model.pt"))
 
-        # Save weights (decoder parameters only, no buffers)
+        # Save weights
         weights_path = os.path.join(output_path, "weights")
         os.makedirs(weights_path, exist_ok=True)
         checkpoint = wrapper.state_dict()
@@ -216,11 +258,63 @@ def compile_decoder_rolling(args):
             "world_size": world_size,
             "dtype": "bfloat16",
             "rolling_cache": True,
+            "stateful": use_stateful,
             "num_cache_tensors": len(feat_cache_shapes),
         }
         save_model_config(output_path, config)
 
-        print(f"\nDecoder (rolling) saved to {output_path}")
+        print(f"\nDecoder (rolling, {mode_str}) saved to {output_path}")
+      else:
+        print("\nSkipping decoder compilation (--skip_decoder)")
+
+      # ========== Compile post_quant_conv (float32) ==========
+      if not skip_pqc:
+        latent_frames = (args.num_frames - 1) // 4 + 1
+        print(f"\nCompiling post_quant_conv (float32, latent {latent_height}x{latent_width})...")
+
+        class PostQuantConvWrapper(nn.Module):
+            def __init__(self, post_quant_conv):
+                super().__init__()
+                self.conv = post_quant_conv
+            def forward(self, x):
+                return self.conv(x)
+
+        pqc_wrapper = PostQuantConvWrapper(vae.post_quant_conv)
+        pqc_input = torch.rand(
+            (batch_size, in_channels, latent_frames, latent_height, latent_width),
+            dtype=torch.float32,
+        )
+
+        pqc_builder = ModelBuilder(model=pqc_wrapper)
+        pqc_builder.trace(kwargs={"x": pqc_input}, tag="conv")
+        traced_pqc = pqc_builder.compile(
+            compiler_args="--model-type=unet-inference -O1 --auto-cast=none",
+            compiler_workdir=args.compiler_workdir,
+        )
+
+        pqc_output_path = f"{compiled_models_dir}/post_quant_conv"
+        os.makedirs(pqc_output_path, exist_ok=True)
+        traced_pqc.save(os.path.join(pqc_output_path, "nxd_model.pt"))
+
+        pqc_weights_path = os.path.join(pqc_output_path, "weights")
+        os.makedirs(pqc_weights_path, exist_ok=True)
+        pqc_checkpoint = pqc_wrapper.state_dict()
+        save_file(pqc_checkpoint, os.path.join(pqc_weights_path, "tp0_sharded_checkpoint.safetensors"))
+
+        pqc_config = {
+            "batch_size": batch_size,
+            "latent_frames": latent_frames,
+            "latent_height": latent_height,
+            "latent_width": latent_width,
+            "in_channels": in_channels,
+            "tp_degree": tp_degree,
+            "world_size": world_size,
+            "dtype": "float32",
+        }
+        save_model_config(pqc_output_path, pqc_config)
+        print(f"post_quant_conv saved to {pqc_output_path}")
+      else:
+        print("\nSkipping post_quant_conv compilation (--skip_pqc)")
 
     print("\n" + "=" * 60)
     print("Compilation Complete!")
@@ -240,6 +334,14 @@ if __name__ == "__main__":
     parser.add_argument("--output_subdir", type=str, default="decoder_rolling",
                         help="Subdirectory name within compiled_models_dir (default: decoder_rolling)")
     parser.add_argument("--cache_dir", type=str, default="/opt/dlami/nvme/wan2.2_t2v_a14b_hf_cache_dir")
+    parser.add_argument("--max_instruction_limit", type=int, default=None,
+                        help="Override max instruction limit")
+    parser.add_argument("--skip_decoder", action="store_true",
+                        help="Skip decoder compilation, only compile post_quant_conv")
+    parser.add_argument("--skip_pqc", action="store_true",
+                        help="Skip post_quant_conv compilation, only compile decoder")
+    parser.add_argument("--no_stateful", action="store_true",
+                        help="Use legacy I/O cache instead of stateful on-device cache")
     args = parser.parse_args()
 
     compile_decoder_rolling(args)
