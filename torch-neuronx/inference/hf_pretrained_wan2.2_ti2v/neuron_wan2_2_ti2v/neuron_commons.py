@@ -847,22 +847,27 @@ class DecoderWrapperV3NoCache(nn.Module):
 
 class DecoderWrapperV3Rolling(nn.Module):
     """
-    Wrapper for V3 Rolling Cache compiled decoder.
+    Wrapper for stateful rolling cache compiled decoder.
 
-    The compiled model takes x + 34 cache tensors as inputs, and returns
-    video + 34 updated cache tensors as outputs. This carries temporal
-    context between chunks for flicker-free video.
+    The compiled model uses input-output aliasing: the 34 cache tensors are
+    registered buffers that stay on the Neuron device (HBM) between calls.
+    Only x (~300KB) is transferred per call, eliminating ~1.4GB roundtrip.
+
+    Also supports legacy (non-stateful) mode where cache is passed as I/O.
     """
 
-    def __init__(self, original_decoder, decoder_frames=2):
+    def __init__(self, original_decoder, decoder_frames=2, stateful=True):
         super().__init__()
         self.original_decoder = original_decoder
         self.decoder_frames = decoder_frames
         self.nxd_model = None
-        self.caches = None  # List of 34 cache tensors, initialized on first call
+        self.stateful = stateful
+        # Legacy mode only
+        self.caches = None
+        self.num_cache_tensors = 34
 
     def _init_caches(self, x):
-        """Initialize rolling cache tensors (zeros) based on input spatial dims."""
+        """Initialize rolling cache tensors (zeros) for legacy mode."""
         from neuron_wan2_2_ti2v.compile_decoder_rolling import get_feat_cache_shapes
         latent_h, latent_w = x.shape[3], x.shape[4]
         cache_shapes = get_feat_cache_shapes(1, latent_h, latent_w)
@@ -873,59 +878,41 @@ class DecoderWrapperV3Rolling(nn.Module):
         if 'feat_cache' not in kwargs:
             return self.original_decoder(x)
 
-        _t0 = time.time()
-
-        # Determine original frame count before padding
         original_frame_count = x.shape[2]
-
-        # Pad temporal dimension to decoder_frames if needed
         if x.shape[2] < self.decoder_frames:
             pad_frames = self.decoder_frames - x.shape[2]
             x = torch.cat([x] + [x[:, :, -1:]] * pad_frames, dim=2)
 
-        # Convert to bfloat16 for the compiled decoder
         x_bf16 = x.to(torch.bfloat16)
 
-        # Initialize caches on first call
-        if self.caches is None:
-            self._init_caches(x_bf16)
-
+        _t0 = time.time()
+        if self.stateful:
+            output = self.nxd_model(x_bf16)
+        else:
+            if self.caches is None:
+                self._init_caches(x_bf16)
+            results = self.nxd_model(x_bf16, *self.caches)
+            if isinstance(results, (tuple, list)):
+                output = results[0]
+                self.caches = [r.to(torch.bfloat16) for r in results[1:1 + self.num_cache_tensors]]
+            else:
+                output = results
         _t1 = time.time()
 
-        # Rolling: pass x + 34 cache tensors, get video + 34 updated caches
-        results = self.nxd_model(x_bf16, *self.caches)
-
-        _t2 = time.time()
-
-        if isinstance(results, (tuple, list)):
-            output = results[0]
-            self.caches = [r.to(torch.bfloat16) for r in results[1:1 + self.num_cache_tensors]]
-        else:
-            output = results
-
-        # Convert back to float32 and trim to original frame count
         if isinstance(output, (list, tuple)):
             output = output[0]
         output = output.to(torch.float32)
 
-        # Trim padded frames: output temporal = original_frame_count * 4 (due to upsampling)
         output_frames = original_frame_count * 4
         if output.shape[2] > output_frames:
             output = output[:, :, :output_frames]
 
-        _t3 = time.time()
-
-        print(f"[rolling] prep={_t1-_t0:.4f}s nxd_model={_t2-_t1:.4f}s postproc={_t3-_t2:.4f}s total={_t3-_t0:.4f}s frames={original_frame_count}")
-
+        print(f"[rolling] nxd_model={_t1-_t0:.4f}s frames={original_frame_count}")
         return output
 
     def decode_latents(self, z):
         """
         Decode all latent frames in chunks of decoder_frames.
-
-        Without this, diffusers' default _decode calls forward() once per
-        latent frame (21 calls for 81 video frames). By chunking into
-        decoder_frames=2, we get 11 calls instead: 1 + 10*2 = 21 latent frames.
 
         Args:
             z: (B, C, T_latent, H_latent, W_latent) after post_quant_conv
@@ -945,18 +932,21 @@ class DecoderWrapperV3Rolling(nn.Module):
                 chunk = torch.cat([chunk] + [chunk[:, :, -1:]] * pad, dim=2)
 
             x_bf16 = chunk.to(torch.bfloat16)
-            if self.caches is None:
-                self._init_caches(x_bf16)
 
             _t0 = time.time()
-            results = self.nxd_model(x_bf16, *self.caches)
+            if self.stateful:
+                output = self.nxd_model(x_bf16)
+            else:
+                if self.caches is None:
+                    self._init_caches(x_bf16)
+                results = self.nxd_model(x_bf16, *self.caches)
+                if isinstance(results, (tuple, list)):
+                    output = results[0]
+                    self.caches = [r.to(torch.bfloat16) for r in results[1:1 + self.num_cache_tensors]]
+                else:
+                    output = results
             _t1 = time.time()
 
-            if isinstance(results, (tuple, list)):
-                output = results[0]
-                self.caches = [r.to(torch.bfloat16) for r in results[1:1 + self.num_cache_tensors]]
-            else:
-                output = results
             if isinstance(output, (list, tuple)):
                 output = output[0]
             output = output.to(torch.float32)
@@ -973,7 +963,22 @@ class DecoderWrapperV3Rolling(nn.Module):
 
     def reset_cache(self):
         """Reset rolling cache to zeros for next video generation."""
-        self.caches = None
+        if self.stateful and self.nxd_model is not None:
+            # Write zeros to on-device state buffers
+            from neuron_wan2_2_ti2v.compile_decoder_rolling import get_feat_cache_shapes
+            # We need to know the spatial dims; read from a buffer to get shape
+            try:
+                sample = self.nxd_model.read_from_neuron_buffer("c0", 0)
+                latent_h, latent_w = sample.shape[3], sample.shape[4]
+                cache_shapes = get_feat_cache_shapes(1, latent_h, latent_w)
+                for rank in range(self.nxd_model.local_ranks_size):
+                    for i, shape in enumerate(cache_shapes):
+                        zeros = torch.zeros(shape, dtype=torch.bfloat16)
+                        self.nxd_model.write_to_neuron_buffer(zeros, f"c{i}", rank)
+            except (KeyError, AttributeError):
+                pass  # Non-stateful or not yet loaded
+        else:
+            self.caches = None
 
     def clear_cache(self):
         self.reset_cache()

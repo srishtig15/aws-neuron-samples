@@ -391,10 +391,13 @@ def main(args):
         print(f"Decoder (Tiled) loaded. tile={tile_h}x{tile_w} latent, "
               f"overlap={overlap}, decoder_frames={decoder_frames}")
     elif os.path.exists(decoder_rolling_path):
-        print("\nLoading decoder (Rolling Cache - flicker-free)...")
         decoder_config = load_model_config(decoder_rolling_path)
         decoder_frames = decoder_config.get("decoder_frames", 2)
-        vae_decoder_wrapper = DecoderWrapperV3Rolling(pipe.vae.decoder, decoder_frames=decoder_frames)
+        is_stateful = decoder_config.get("stateful", False)
+        mode = "Stateful" if is_stateful else "Legacy I/O"
+        print(f"\nLoading decoder (Rolling Cache - {mode}, flicker-free)...")
+        vae_decoder_wrapper = DecoderWrapperV3Rolling(
+            pipe.vae.decoder, decoder_frames=decoder_frames, stateful=is_stateful)
         decoder_nxd = NxDModel.load(os.path.join(decoder_rolling_path, "nxd_model.pt"))
         decoder_world_size = decoder_config.get("world_size", 8)
 
@@ -403,7 +406,7 @@ def main(args):
         decoder_nxd.to_neuron()
 
         vae_decoder_wrapper.nxd_model = decoder_nxd
-        print(f"Decoder (Rolling) loaded. decoder_frames={decoder_frames}")
+        print(f"Decoder (Rolling, {mode}) loaded. decoder_frames={decoder_frames}")
     elif os.path.exists(decoder_nocache_path):
         print("\nLoading decoder (NoCache)...")
         decoder_config = load_model_config(decoder_nocache_path)

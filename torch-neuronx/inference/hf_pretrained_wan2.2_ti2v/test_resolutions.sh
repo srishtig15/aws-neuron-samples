@@ -146,7 +146,7 @@ for config in "${CONFIGS[@]}"; do
                 EST_INSTRUCTIONS=$(( TILE_LATENT_PIXELS * 6500 * 130 / 100 ))
                 INST_LIMIT_ARG="--max_instruction_limit ${EST_INSTRUCTIONS}"
             fi
-            # Compile decoder at tile resolution (skip pqc, will compile at full res below)
+            # Compile decoder at tile resolution (non-stateful: tiled decode manages per-tile caches)
             python neuron_wan2_2_ti2v/compile_decoder_rolling.py \
                 --compiled_models_dir "${COMPILED_DIR}" \
                 --compiler_workdir "${COMPILER_WD}" \
@@ -157,6 +157,7 @@ for config in "${CONFIGS[@]}"; do
                 --tp_degree ${WORLD_SIZE} \
                 --world_size ${WORLD_SIZE} \
                 --skip_pqc \
+                --no_stateful \
                 ${INST_LIMIT_ARG} 2>&1 | tee "log_compile_decoder_${TAG}.txt"
             # Rename to decoder_tiled and add tiling config
             if [[ -d "${COMPILED_DIR}/decoder_rolling" ]]; then
