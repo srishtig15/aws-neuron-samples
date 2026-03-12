@@ -851,6 +851,8 @@ class DecoderWrapperV3Rolling(nn.Module):
         # Legacy mode only
         self.caches = None
         self.num_cache_tensors = 34
+        # Pre-allocated zero tensors for fast cache reset (stateful mode)
+        self._zero_cache = None
 
     def _init_caches(self, x):
         """Initialize rolling cache tensors (zeros) for legacy mode."""
@@ -947,22 +949,35 @@ class DecoderWrapperV3Rolling(nn.Module):
 
         return torch.cat(outputs, dim=2)
 
+    def _ensure_zero_cache(self):
+        """Pre-allocate zero tensors for cache reset (called once, reused)."""
+        if self._zero_cache is not None:
+            return
+        from neuron_wan2_2_ti2v.compile_decoder_rolling import get_feat_cache_shapes
+        try:
+            sample = self.nxd_model.read_from_neuron_buffer("c0", 0)
+            latent_h, latent_w = sample.shape[3], sample.shape[4]
+            cache_shapes = get_feat_cache_shapes(1, latent_h, latent_w)
+            self._zero_cache = [torch.zeros(s, dtype=torch.bfloat16) for s in cache_shapes]
+        except (KeyError, AttributeError):
+            self._zero_cache = None
+
     def reset_cache(self):
         """Reset rolling cache to zeros for next video generation."""
         if self.stateful and self.nxd_model is not None:
-            # Write zeros to on-device state buffers
-            from neuron_wan2_2_ti2v.compile_decoder_rolling import get_feat_cache_shapes
-            # We need to know the spatial dims; read from a buffer to get shape
-            try:
-                sample = self.nxd_model.read_from_neuron_buffer("c0", 0)
-                latent_h, latent_w = sample.shape[3], sample.shape[4]
-                cache_shapes = get_feat_cache_shapes(1, latent_h, latent_w)
-                for rank in range(self.nxd_model.local_ranks_size):
-                    for i, shape in enumerate(cache_shapes):
-                        zeros = torch.zeros(shape, dtype=torch.bfloat16)
-                        self.nxd_model.write_to_neuron_buffer(zeros, f"c{i}", rank)
-            except (KeyError, AttributeError):
-                pass  # Non-stateful or not yet loaded
+            self._ensure_zero_cache()
+            if self._zero_cache is None:
+                return
+            num_ranks = self.nxd_model.local_ranks_size
+            num_buffers = len(self._zero_cache)
+            # Parallel write across ranks using threads
+            # Each write_to_neuron_buffer is an independent host→device DMA
+            from concurrent.futures import ThreadPoolExecutor
+            def _write_rank(rank):
+                for i in range(num_buffers):
+                    self.nxd_model.write_to_neuron_buffer(self._zero_cache[i], f"c{i}", rank)
+            with ThreadPoolExecutor(max_workers=num_ranks) as pool:
+                list(pool.map(_write_rank, range(num_ranks)))
         else:
             self.caches = None
 
