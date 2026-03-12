@@ -60,8 +60,8 @@ Wan2.2-T2V-A14B is a **Mixture-of-Experts (MoE)** text-to-video diffusion model 
 |-------|------|
 | Text Encoding (CPU) | ~5s |
 | Denoising (40 steps, subprocess mode) | ~1069s (~16.1s/step + 2×188s model load) |
-| VAE Decode (Neuron tiled) | ~109s (76s decode + 33s load) |
-| **Inference time** | **~1183s (~19.7min)** |
+| VAE Decode (Neuron tiled) | ~145s (106s decode + 36s load + 3s PQC) |
+| **Inference time** | **~1320s (~22.0min)** |
 
 > **Note**: Tiled decode uses 4 overlapping 480P patches (2×2 grid) with linear-ramp blending.
 > CPU fallback (~585s) is still available via `--cpu_vae_decoder` or if `decoder_rolling_480p/` is not compiled.

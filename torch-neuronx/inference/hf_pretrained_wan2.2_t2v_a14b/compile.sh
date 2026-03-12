@@ -25,7 +25,12 @@ if grep -q 'nearest-exact' "${VAE_FILE}" 2>/dev/null; then
     sed -i 's/nearest-exact/nearest/g' "${VAE_FILE}"
 fi
 
-CP_DEGREE=2
+# Auto-set CP based on resolution: 480P -> CP=2 (ws=8), 720P -> CP=4 (ws=16)
+if [ "$HEIGHT" -le 480 ]; then
+    CP_DEGREE=2
+else
+    CP_DEGREE=4
+fi
 WORLD_SIZE=$((TP_DEGREE * CP_DEGREE))
 
 echo "=============================================="

@@ -783,8 +783,9 @@ def phase_vae_decode_neuron_tiled(pipe, compiled_models_dir, latents, num_frames
     if 'torch_neuronx' not in sys.modules:
         decoder_ws = 8
         decoder_num_cores = decoder_ws * 2
-        # Respect NEURON_CORE_START for environments where some cores are in use
-        core_start = int(os.environ.get("NEURON_CORE_START", "0"))
+        # Derive core range from current VISIBLE_CORES (set by top-level init or user)
+        visible = os.environ.get("NEURON_RT_VISIBLE_CORES", "0-63")
+        core_start = int(visible.split("-")[0])
         os.environ["NEURON_RT_NUM_CORES"] = str(decoder_num_cores)
         os.environ["NEURON_RT_VISIBLE_CORES"] = f"{core_start}-{core_start + decoder_num_cores - 1}"
         print(f"Initializing Neuron for tiled decoder: NUM_CORES={decoder_num_cores}, cores={core_start}-{core_start + decoder_num_cores - 1}")
