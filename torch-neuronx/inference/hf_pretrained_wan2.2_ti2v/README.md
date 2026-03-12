@@ -6,12 +6,12 @@ This project implements [Wan2.2-TI2V-5B](https://huggingface.co/Wan-AI/Wan2.2-TI
 
 | Resolution | FPS | Frames | Trn2 (s) | H100 (s) | Decoder |
 |-----------|-----|--------|-----------|-----------|---------|
-| 512x384 | 16 | 81 | 24.92 | 16.13 | rolling |
-| 512x384 | 24 | 121 | 36.30 | 24.48 | rolling |
-| 640x480 | 16 | 81 | 39.96 | 26.06 | rolling |
-| 640x480 | 24 | 121 | 58.65 | 39.67 | rolling |
-| 1280x704 | 16 | 81 | 161.90 | 87.66 | tiled |
-| 1280x704 | 24 | 121 | 249.42 | 143.20 | tiled |
+| 512x384 | 16 | 81 | 21.37 | 16.13 | stateful rolling |
+| 512x384 | 24 | 121 | 30.81 | 24.48 | stateful rolling |
+| 640x480 | 16 | 81 | 34.36 | 26.06 | stateful rolling |
+| 640x480 | 24 | 121 | 49.80 | 39.67 | stateful rolling |
+| 1280x704 | 16 | 81 | 166.67 | 87.66 | tiled |
+| 1280x704 | 24 | 121 | 251.60 | 143.20 | tiled |
 
 Timing is pure inference (excludes model loading and warmup). See `test_results.txt` and `test_results_gpu.txt`.
 
@@ -73,9 +73,9 @@ Video Output (512x512, 81 frames)
 |-----------|------|---------|
 | Text Encoder | ~0.3s | UMT5, single call |
 | Transformer | ~16s | 50 steps @ 0.32s/step |
-| VAE Decoder | ~8.8s | 11 calls @ 0.80s/call (Rolling Cache) |
+| VAE Decoder | ~5s | 11 calls @ 0.43s/call (Stateful Rolling Cache) |
 | post_quant_conv | ~0.003s | Single call |
-| **Total** | **~25s** | Rolling cache (flicker-free) |
+| **Total** | **~21s** | Stateful rolling cache (flicker-free, on-device cache) |
 
 ## Compilation
 
@@ -127,7 +127,7 @@ The VAE decoder is dominated by Conv3D operations. Two key optimizations:
 
 **bfloat16**: Halves memory bandwidth (the bottleneck for Conv3D).
 
-**Rolling Cache**: The decoder's `feat_cache` (34 tensors, ~960MB) carries temporal context between chunked decoder calls. Unlike NoCache mode (which zeros the cache each call and causes flickering), Rolling Cache passes feat_cache as explicit inputs AND outputs, producing temporally coherent, flicker-free video.
+**Stateful Rolling Cache**: The decoder's `feat_cache` (34 tensors, ~960MB) carries temporal context between chunked decoder calls. Unlike NoCache mode (which zeros the cache each call and causes flickering), Rolling Cache maintains temporal coherence for flicker-free video. The cache tensors are registered as `nn.Module` buffers, enabling automatic input-output aliasing in the Neuron compiler — the cache stays on-device (HBM) between calls, eliminating ~960MB host↔device roundtrip per call. Only the latent input (~300KB) is transferred each call.
 
 ### 4. Correct Compiler Model Type
 
