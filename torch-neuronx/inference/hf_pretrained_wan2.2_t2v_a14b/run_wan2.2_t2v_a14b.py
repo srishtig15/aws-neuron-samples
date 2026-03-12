@@ -494,6 +494,83 @@ def _run_denoising_subprocess(phase_label, transformer_path, latents, prompt_emb
     return output_data["latents"], output_data
 
 
+def _run_denoising_combined_subprocess(transformer_1_path, transformer_2_path,
+                                        latents, prompt_embeds, negative_prompt_embeds,
+                                        timesteps, switch_idx, guidance_scale_high, guidance_scale_low,
+                                        expand_timesteps, mask, scheduler_config, scheduler_state):
+    """Run both MoE phases in a single subprocess using replace_weights()."""
+    import subprocess
+    import tempfile
+
+    tmpdir = tempfile.mkdtemp(prefix="denoise_combined_")
+    input_path = os.path.join(tmpdir, "input.pt")
+    output_path = os.path.join(tmpdir, "output.pt")
+    env_config_path = os.path.join(tmpdir, "env.json")
+
+    env_config = {
+        "NEURON_RT_NUM_CORES": os.environ.get("NEURON_RT_NUM_CORES", "32"),
+        "NEURON_RT_VIRTUAL_CORE_SIZE": os.environ.get("NEURON_RT_VIRTUAL_CORE_SIZE", "2"),
+        "NEURON_RT_VISIBLE_CORES": os.environ.get("NEURON_RT_VISIBLE_CORES", "0-31"),
+        "NEURON_RT_INSPECT_ENABLE": "0",
+        "NEURON_RT_INSPECT_DEVICE_PROFILE": "0",
+        "NEURON_RT_INSPECT_SYSTEM_PROFILE": "0",
+        "NEURON_RT_PROFILING_MODE": "0",
+    }
+    with open(env_config_path, "w") as f:
+        json.dump(env_config, f)
+
+    phase_data = {
+        "mode": "combined",
+        "latents": latents,
+        "prompt_embeds": prompt_embeds,
+        "negative_prompt_embeds": negative_prompt_embeds,
+        "timesteps": timesteps,
+        "switch_idx": switch_idx,
+        "guidance_scale_high": guidance_scale_high,
+        "guidance_scale_low": guidance_scale_low,
+        "transformer_1_path": transformer_1_path,
+        "transformer_2_path": transformer_2_path,
+        "expand_timesteps": expand_timesteps,
+        "mask": mask,
+        "scheduler_config": scheduler_config,
+    }
+    phase_data.update(scheduler_state)
+    torch.save(phase_data, input_path)
+
+    print(f"\n[Subprocess] Running combined MoE denoising (40 steps, replace_weights) in single process...")
+    t0 = time.time()
+
+    cwd = os.path.dirname(os.path.abspath(__file__))
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    for k in list(env.keys()):
+        if k.startswith("NEURON_RT_") or k == "NEURON_LOGICAL_NC_CONFIG":
+            del env[k]
+    if "PYTHONPATH" not in env:
+        env["PYTHONPATH"] = cwd
+    elif cwd not in env["PYTHONPATH"]:
+        env["PYTHONPATH"] = cwd + ":" + env["PYTHONPATH"]
+
+    result = subprocess.run(
+        [sys.executable, "-m", "neuron_wan2_2_t2v_a14b.denoise_worker",
+         input_path, output_path, env_config_path],
+        cwd=cwd, env=env,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Combined denoising subprocess failed with code {result.returncode}")
+
+    output_data = torch.load(output_path, weights_only=False)
+    elapsed = time.time() - t0
+    print(f"[Subprocess] Combined MoE done in {elapsed:.1f}s "
+          f"(load: {output_data['load_time']:.1f}s, swap: {output_data.get('swap_time', 0):.1f}s, "
+          f"phase1: {output_data.get('phase1_time', 0):.1f}s, phase2: {output_data.get('phase2_time', 0):.1f}s)")
+
+    import shutil
+    shutil.rmtree(tmpdir, ignore_errors=True)
+
+    return output_data["latents"], output_data
+
+
 def phase_denoising(pipe, compiled_models_dir, prompt_embeds, negative_prompt_embeds,
                      args, generator=None):
     """Run the denoising loop with MoE transformer swap.
@@ -566,32 +643,15 @@ def phase_denoising(pipe, compiled_models_dir, prompt_embeds, negative_prompt_em
             "scheduler_sample": getattr(pipe.scheduler, 'sample', None),
         }
 
-        # Phase 2a: High-noise steps with transformer_1
-        latents, out1 = _run_denoising_subprocess(
-            "transformer_1 (high-noise)", transformer_1_path,
-            latents, prompt_embeds, negative_prompt_embeds, timesteps,
-            0, switch_idx, guidance_scale_high,
+        # Combined MoE: load T1, run, replace_weights T2, run, exit
+        # Saves ~70s by avoiding second NxDModel.load()
+        latents, out2 = _run_denoising_combined_subprocess(
+            transformer_1_path, transformer_2_path,
+            latents, prompt_embeds, negative_prompt_embeds,
+            timesteps, switch_idx, guidance_scale_high, guidance_scale_low,
             pipe.config.expand_timesteps, mask, scheduler_config,
             scheduler_state_initial,
         )
-
-        # Phase 2b: Low-noise steps with transformer_2
-        remaining_steps = len(timesteps) - switch_idx
-        if remaining_steps > 0:
-            scheduler_state_after_phase1 = {
-                "scheduler_order_list": out1.get("scheduler_order_list"),
-                "scheduler_model_outputs": out1.get("scheduler_model_outputs"),
-                "scheduler_timestep_list": out1.get("scheduler_timestep_list"),
-                "scheduler_lower_order_nums": out1.get("scheduler_lower_order_nums"),
-                "scheduler_sample": out1.get("scheduler_sample"),
-            }
-            latents, out2 = _run_denoising_subprocess(
-                "transformer_2 (low-noise)", transformer_2_path,
-                latents, prompt_embeds, negative_prompt_embeds, timesteps,
-                switch_idx, len(timesteps), guidance_scale_low,
-                pipe.config.expand_timesteps, mask, scheduler_config,
-                scheduler_state_after_phase1,
-            )
 
     else:
         # ============================================================
