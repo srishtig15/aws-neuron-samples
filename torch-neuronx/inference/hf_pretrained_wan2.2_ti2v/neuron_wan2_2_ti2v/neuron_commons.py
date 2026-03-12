@@ -762,8 +762,6 @@ class DecoderWrapperV3NoCache(nn.Module):
         if 'feat_cache' not in kwargs:
             return self.original_decoder(x)
 
-        _t0 = time.time()
-
         # Determine original frame count before padding
         original_frame_count = x.shape[2]
 
@@ -775,13 +773,8 @@ class DecoderWrapperV3NoCache(nn.Module):
         # Convert to bfloat16 for the compiled decoder
         x_bf16 = x.to(torch.bfloat16)
 
-        _t1 = time.time()
-
         # NoCache: only pass x as input (1 argument, ~300KB)
-        # vs V3 cache: x + 34 feat_cache tensors (35 arguments, ~960MB)
         output = self.nxd_model(x_bf16)
-
-        _t2 = time.time()
 
         # Convert back to float32 and trim to original frame count
         if isinstance(output, (list, tuple)):
@@ -793,9 +786,9 @@ class DecoderWrapperV3NoCache(nn.Module):
         if output.shape[2] > output_frames:
             output = output[:, :, :output_frames]
 
-        _t3 = time.time()
-
-        print(f"[nocache] prep={_t1-_t0:.4f}s nxd_model={_t2-_t1:.4f}s postproc={_t3-_t2:.4f}s total={_t3-_t0:.4f}s frames={original_frame_count}")
+        # NOTE: per-call timing commented out to avoid device↔CPU sync overhead
+        # _t0 = time.time(); output = self.nxd_model(x_bf16); _t1 = time.time()
+        # print(f"[nocache] nxd_model={_t1-_t0:.4f}s frames={original_frame_count}")
 
         return output
 
@@ -820,9 +813,7 @@ class DecoderWrapperV3NoCache(nn.Module):
                 pad = self.decoder_frames - actual
                 chunk = torch.cat([chunk] + [chunk[:, :, -1:]] * pad, dim=2)
 
-            _t0 = time.time()
             output = self.nxd_model(chunk.to(torch.bfloat16))
-            _t1 = time.time()
 
             if isinstance(output, (list, tuple)):
                 output = output[0]
@@ -833,7 +824,9 @@ class DecoderWrapperV3NoCache(nn.Module):
                 output = output[:, :, :out_frames]
             outputs.append(output)
 
-            print(f"[nocache] nxd_model={_t1-_t0:.4f}s frames={actual} total_out={out_frames}")
+            # NOTE: per-call timing commented out to avoid device↔CPU sync overhead
+            # _t0 = time.time(); output = self.nxd_model(...); _t1 = time.time()
+            # print(f"[nocache] nxd_model={_t1-_t0:.4f}s frames={actual} total_out={out_frames}")
             t = t_end
 
         return torch.cat(outputs, dim=2)
@@ -885,7 +878,6 @@ class DecoderWrapperV3Rolling(nn.Module):
 
         x_bf16 = x.to(torch.bfloat16)
 
-        _t0 = time.time()
         if self.stateful:
             output = self.nxd_model(x_bf16)
         else:
@@ -897,7 +889,6 @@ class DecoderWrapperV3Rolling(nn.Module):
                 self.caches = [r.to(torch.bfloat16) for r in results[1:1 + self.num_cache_tensors]]
             else:
                 output = results
-        _t1 = time.time()
 
         if isinstance(output, (list, tuple)):
             output = output[0]
@@ -907,7 +898,9 @@ class DecoderWrapperV3Rolling(nn.Module):
         if output.shape[2] > output_frames:
             output = output[:, :, :output_frames]
 
-        print(f"[rolling] nxd_model={_t1-_t0:.4f}s frames={original_frame_count}")
+        # NOTE: per-call timing commented out to avoid device↔CPU sync overhead
+        # _t0 = time.time(); output = self.nxd_model(x_bf16); _t1 = time.time()
+        # print(f"[rolling] nxd_model={_t1-_t0:.4f}s frames={original_frame_count}")
         return output
 
     def decode_latents(self, z):
@@ -933,7 +926,6 @@ class DecoderWrapperV3Rolling(nn.Module):
 
             x_bf16 = chunk.to(torch.bfloat16)
 
-            _t0 = time.time()
             if self.stateful:
                 output = self.nxd_model(x_bf16)
             else:
@@ -945,7 +937,6 @@ class DecoderWrapperV3Rolling(nn.Module):
                     self.caches = [r.to(torch.bfloat16) for r in results[1:1 + self.num_cache_tensors]]
                 else:
                     output = results
-            _t1 = time.time()
 
             if isinstance(output, (list, tuple)):
                 output = output[0]
@@ -956,7 +947,9 @@ class DecoderWrapperV3Rolling(nn.Module):
                 output = output[:, :, :out_frames]
             outputs.append(output)
 
-            print(f"[rolling] nxd_model={_t1-_t0:.4f}s frames={actual} total_out={out_frames}")
+            # NOTE: per-call timing commented out to avoid device↔CPU sync overhead
+            # _t0 = time.time(); output = self.nxd_model(x_bf16); _t1 = time.time()
+            # print(f"[rolling] nxd_model={_t1-_t0:.4f}s frames={actual} total_out={out_frames}")
             t = t_end
 
         return torch.cat(outputs, dim=2)
