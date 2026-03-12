@@ -51,22 +51,21 @@ def _detect_world_size():
     return 8
 
 _world_size = _detect_world_size()
-# On trn2.48xlarge with logical-neuroncore-config=2 (LNC=2):
-#   - NEURON_RT_VIRTUAL_CORE_SIZE=2: each NEC device uses 2 logical NCs (48GB HBM/rank)
-#   - NEURON_RT_NUM_CORES = world_size * 2: number of logical NCs needed
+# On trn2.48xlarge with LNC=2: 16 chips, 4 logical NCs per chip, 24GB HBM per NC.
+#   - NEURON_RT_NUM_CORES = world_size = number of logical NCs needed
+#   - 480P: world_size=8 -> 8 NCs = 2 chips; 720P: world_size=16 -> 16 NCs = 4 chips
 # IMPORTANT: When world_size differs between models (e.g., text_encoder=8 vs transformer=16),
 # the first model loaded initializes the NRT communicator. Use --cpu_text_encoder for 720P
 # to ensure the transformer (world_size=16) initializes the communicator at the right size.
-_num_cores = _world_size * 2
+_num_cores = _world_size
 os.environ["NEURON_RT_NUM_CORES"] = str(_num_cores)
 os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "2"
-# Pin to specific logical NCs. For 720P (32 cores), use the last 32 cores (32-63)
-# to avoid conflicts with other processes (e.g., vLLM) on the first cores.
-# For 480P (16 cores), use cores 0-15 (default).
+# Pin to specific logical NCs. For 720P (16 cores), auto-offset to upper range
+# to avoid conflicts with other processes. For 480P (8 cores), use default.
 _core_start = int(os.environ.get("NEURON_CORE_START", "0"))
-if _core_start == 0 and _num_cores > 16:
+if _core_start == 0 and _num_cores > 8:
     # Auto-offset for 720P to avoid conflicts with other processes
-    _core_start = 64 - _num_cores  # e.g., 32 for 720P
+    _core_start = 64 - _num_cores  # e.g., 48 for 720P (16 cores)
 os.environ["NEURON_RT_VISIBLE_CORES"] = f"{_core_start}-{_core_start + _num_cores - 1}"
 # Disable profiler/inspection buffers to free ~124MB/NC for 720P HBM-tight NEFFs
 os.environ.setdefault("NEURON_RT_INSPECT_ENABLE", "0")
@@ -782,7 +781,7 @@ def phase_vae_decode_neuron_tiled(pipe, compiled_models_dir, latents, num_frames
     # Lazy Neuron import (only if not already imported by top-level code)
     if 'torch_neuronx' not in sys.modules:
         decoder_ws = 8
-        decoder_num_cores = decoder_ws * 2
+        decoder_num_cores = decoder_ws
         # Derive core range from current VISIBLE_CORES (set by top-level init or user)
         visible = os.environ.get("NEURON_RT_VISIBLE_CORES", "0-63")
         core_start = int(visible.split("-")[0])

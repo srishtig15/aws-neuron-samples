@@ -24,7 +24,7 @@ Wan2.2-T2V-A14B is a **Mixture-of-Experts (MoE)** text-to-video diffusion model 
 | **CP** | 2 | 4 |
 | **world_size** | 8 | 16 |
 | **Tokens/rank** | 16,380 | 18,900 |
-| **NeuronCores** | 8 (16 logical NCs) | 16 (32 logical NCs) |
+| **NeuronCores (logical)** | 8 (2 chips) | 16 (4 chips) |
 
 - **MoE weight swap**:
   - 480P: `replace_weights()` in-process (fast, ~63s)
@@ -49,10 +49,10 @@ Wan2.2-T2V-A14B is a **Mixture-of-Experts (MoE)** text-to-video diffusion model 
 
 | Phase | Time |
 |-------|------|
-| Text Encoding (Neuron) | ~14s (0.4s inference + 12s model load) |
-| Denoising (40 steps + MoE swap) | ~465s (~8.2s/step) |
-| VAE Decode (rolling cache) | ~45s (24s decode + 18s model load) |
-| **Inference time** | **~525s** |
+| Text Encoding (Neuron) | ~15s (0.2s inference + 12s model load) |
+| Denoising (40 steps + MoE swap) | ~466s (~8.2s/step + 62s weight swap) |
+| VAE Decode (rolling cache) | ~46s (24s decode + 18s model load) |
+| **Inference time** | **~526s** |
 
 ### 720P (720×1280, 81 frames)
 
