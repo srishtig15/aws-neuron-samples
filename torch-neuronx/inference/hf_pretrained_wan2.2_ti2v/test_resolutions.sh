@@ -7,6 +7,8 @@
 # Usage:
 #   ./test_resolutions.sh              # Run all configs
 #   ./test_resolutions.sh --skip-compile  # Skip compilation, only run inference
+#   NUM_RUNS=3 ./test_resolutions.sh --skip-compile  # 3 runs per config (avg/min/max)
+#   CFG_PARALLEL=1 ./test_resolutions.sh  # Use CFG Parallel mode
 
 set -e
 
@@ -230,8 +232,9 @@ print(f'Tiled config saved: tile={config[\"height\"]}x{config[\"width\"]}, overl
     COMPILE_END=$(date +%s)
     COMPILE_TIME="$((COMPILE_END - COMPILE_START))s"
 
-    # Run inference
-    echo "[${TAG}] Running inference..."
+    # Run inference (NUM_RUNS controls benchmark repetitions, default=1)
+    NUM_RUNS="${NUM_RUNS:-1}"
+    echo "[${TAG}] Running inference (${NUM_RUNS} run(s))..."
     python run_wan2.2_ti2v.py \
         --compiled_models_dir "${COMPILED_DIR}" \
         --height ${HEIGHT} \
@@ -239,6 +242,7 @@ print(f'Tiled config saved: tile={config[\"height\"]}x{config[\"width\"]}, overl
         --num_frames ${NUM_FRAMES} \
         --num_inference_steps 50 \
         --fps ${FPS} \
+        --num_runs ${NUM_RUNS} \
         --prompt "A cat walks on the grass, realistic" \
         --output "output_${TAG}.mp4" 2>&1 | tee "log_infer_${TAG}.txt"
 

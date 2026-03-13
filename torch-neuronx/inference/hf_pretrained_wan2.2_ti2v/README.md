@@ -6,12 +6,12 @@ This project implements [Wan2.2-TI2V-5B](https://huggingface.co/Wan-AI/Wan2.2-TI
 
 | Resolution | FPS | Frames | Trn2 CP (s) | Trn2 CFG (s) | H100 (s) | Decoder |
 |-----------|-----|--------|-------------|--------------|-----------|---------|
-| 512x384 | 16 | 81 | 20.67 | **18.31** | 16.13 | stateful rolling |
-| 512x384 | 24 | 121 | 30.07 | **26.22** | 24.48 | stateful rolling |
-| 640x480 | 16 | 81 | **33.20** | 34.13 | 26.06 | stateful rolling |
-| 640x480 | 24 | 121 | 49.29 | **45.11** | 39.67 | stateful rolling |
-| 1280x704 | 16 | 81 | 163.99 | **155.29** | 87.66 | tiled |
-| 1280x704 | 24 | 121 | 255.07 | **247.64** | 143.20 | tiled |
+| 512x384 | 16 | 81 | 20.67 | **18.32** | 16.13 | stateful rolling |
+| 512x384 | 24 | 121 | 30.07 | **26.44** | 24.48 | stateful rolling |
+| 640x480 | 16 | 81 | **33.20** | 34.10 | 26.06 | stateful rolling |
+| 640x480 | 24 | 121 | 49.29 | **45.15** | 39.67 | stateful rolling |
+| 1280x704 | 16 | 81 | 163.99 | **155.06** | 87.66 | tiled |
+| 1280x704 | 24 | 121 | 255.07 | **243.71** | 143.20 | tiled |
 
 - **Trn2 CP**: Context Parallel (CP=2, sequence split across ranks, K/V all-gather in self-attention)
 - **Trn2 CFG**: CFG Parallel (batch=2, cond+uncond in single forward pass, no K/V communication)
@@ -265,6 +265,7 @@ The I2V pipeline encodes the input image into the first latent frame, then gener
 | `--max_sequence_length` | 512 | Max text token length |
 | `--output` | `output.mp4` | Output video path |
 | `--fps` | 16 | Output video FPS |
+| `--num_runs` | 1 | Number of inference runs (for benchmarking, reports avg/min/max) |
 
 ## Environment
 

@@ -638,52 +638,76 @@ def main(args):
     end = time.time()
     print(f"Warmup time: {end - start:.2f}s")
 
-    # Reset state between warmup and main inference
-    if hasattr(vae_decoder_wrapper, 'reset_cache'):
-        vae_decoder_wrapper.reset_cache()
-    if transformer_wrapper.cfg_parallel:
-        transformer_wrapper._is_cond_call = True
-        transformer_wrapper._cached_uncond_result = None
-
-    # Main inference
-    print("\nStarting main inference...")
-    start = time.time()
-
-    # Enable model-input replacement for I2V
-    if image_condition is not None:
-        transformer_wrapper.image_condition = image_condition
-
-    main_kwargs = dict(pipe_kwargs)  # Copy common kwargs
-    main_kwargs["generator"] = generator
-    if i2v_latents is not None:
-        main_kwargs["latents"] = i2v_latents
-
-        # Restore frame 0 only on the last step (for correct decode)
-        num_steps = args.num_inference_steps
-        def i2v_callback(pipe_ref, step_index, timestep, callback_kwargs):
-            if step_index == num_steps - 1:
-                callback_kwargs["latents"][:, :, 0:1, :, :] = image_condition.to(
-                    callback_kwargs["latents"].dtype
-                )
-            return callback_kwargs
-
-        main_kwargs["callback_on_step_end"] = i2v_callback
-        main_kwargs["callback_on_step_end_tensor_inputs"] = ["latents"]
-
-    output = pipe(**main_kwargs).frames[0]
-    end = time.time()
-
-    # Reset
-    transformer_wrapper.image_condition = None
-
-    inference_time = end - start
-    per_step_time = inference_time / args.num_inference_steps
+    # Main inference (multiple runs for accurate benchmarking)
+    num_runs = args.num_runs
     mode = "I2V" if args.image else "T2V"
-    print(f"\n{mode} inference time: {inference_time:.2f}s")
-    print(f"Per step (denoise only): {per_step_time:.3f}s")
-    print(f"Output frames: {len(output)}")
+    run_times = []
 
-    # Save video
+    for run_idx in range(num_runs):
+        # Reset state before each run
+        if hasattr(vae_decoder_wrapper, 'reset_cache'):
+            vae_decoder_wrapper.reset_cache()
+        if transformer_wrapper.cfg_parallel:
+            transformer_wrapper._is_cond_call = True
+            transformer_wrapper._cached_uncond_result = None
+
+        run_label = f"Run {run_idx + 1}/{num_runs}" if num_runs > 1 else "Main inference"
+        print(f"\nStarting {run_label}...")
+        start = time.time()
+
+        # Enable model-input replacement for I2V
+        if image_condition is not None:
+            transformer_wrapper.image_condition = image_condition
+
+        # Reset generator for reproducibility
+        generator = torch.Generator().manual_seed(SEED)
+
+        main_kwargs = dict(pipe_kwargs)  # Copy common kwargs
+        main_kwargs["generator"] = generator
+        if i2v_latents is not None:
+            main_kwargs["latents"] = i2v_latents.clone()
+
+            # Restore frame 0 only on the last step (for correct decode)
+            num_steps = args.num_inference_steps
+            def i2v_callback(pipe_ref, step_index, timestep, callback_kwargs):
+                if step_index == num_steps - 1:
+                    callback_kwargs["latents"][:, :, 0:1, :, :] = image_condition.to(
+                        callback_kwargs["latents"].dtype
+                    )
+                return callback_kwargs
+
+            main_kwargs["callback_on_step_end"] = i2v_callback
+            main_kwargs["callback_on_step_end_tensor_inputs"] = ["latents"]
+
+        output = pipe(**main_kwargs).frames[0]
+        end = time.time()
+
+        # Reset
+        transformer_wrapper.image_condition = None
+
+        inference_time = end - start
+        per_step_time = inference_time / args.num_inference_steps
+        run_times.append(inference_time)
+        print(f"{run_label}: {inference_time:.2f}s ({per_step_time:.3f}s/step)")
+
+    # Report results
+    print(f"\nOutput frames: {len(output)}")
+    if num_runs > 1:
+        avg_time = sum(run_times) / len(run_times)
+        min_time = min(run_times)
+        max_time = max(run_times)
+        avg_per_step = avg_time / args.num_inference_steps
+        print(f"\n{mode} benchmark ({num_runs} runs):")
+        print(f"  Avg: {avg_time:.2f}s ({avg_per_step:.3f}s/step)")
+        print(f"  Min: {min_time:.2f}s  Max: {max_time:.2f}s")
+        # Print in the standard format (avg) for test_resolutions.sh parsing
+        print(f"\n{mode} inference time: {avg_time:.2f}s")
+        print(f"Per step (denoise only): {avg_per_step:.3f}s")
+    else:
+        print(f"\n{mode} inference time: {run_times[0]:.2f}s")
+        print(f"Per step (denoise only): {run_times[0] / args.num_inference_steps:.3f}s")
+
+    # Save video (from last run)
     output_path = args.output
     export_to_video(output, output_path, fps=args.fps)
     print(f"\nVideo saved to: {output_path}")
@@ -706,6 +730,7 @@ if __name__ == "__main__":
     parser.add_argument("--image", type=str, default=None, help="Input image for I2V (omit for T2V)")
     parser.add_argument("--output", type=str, default="output.mp4", help="Output video path")
     parser.add_argument("--fps", type=int, default=16, help="Output video FPS (default: 16)")
+    parser.add_argument("--num_runs", type=int, default=1, help="Number of inference runs for benchmarking")
     args = parser.parse_args()
 
     main(args)
