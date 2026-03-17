@@ -295,10 +295,20 @@ def _run_text_encoding_subprocess(compiled_models_dir, seqlen, prompt, negative_
     output_path = os.path.join(tmpdir, "output.pt")
     env_config_path = os.path.join(tmpdir, "env.json")
 
+    # Use text encoder own world_size (may differ from transformer world_size)
+    te_config_path = os.path.join(compiled_models_dir, "text_encoder", "config.json")
+    if os.path.exists(te_config_path):
+        with open(te_config_path) as f:
+            te_config = json.load(f)
+        te_world_size = te_config.get("world_size", 8)
+    else:
+        te_world_size = 8
+    visible = os.environ.get("NEURON_RT_VISIBLE_CORES", "0-63")
+    te_core_start = int(visible.split("-")[0])
     env_config = {
-        "NEURON_RT_NUM_CORES": os.environ.get("NEURON_RT_NUM_CORES", "8"),
+        "NEURON_RT_NUM_CORES": str(te_world_size),
         "NEURON_RT_VIRTUAL_CORE_SIZE": os.environ.get("NEURON_RT_VIRTUAL_CORE_SIZE", "2"),
-        "NEURON_RT_VISIBLE_CORES": os.environ.get("NEURON_RT_VISIBLE_CORES", "0-7"),
+        "NEURON_RT_VISIBLE_CORES": f"{te_core_start}-{te_core_start + te_world_size - 1}",
         "NEURON_RT_INSPECT_ENABLE": "0",
         "NEURON_RT_INSPECT_DEVICE_PROFILE": "0",
         "NEURON_RT_INSPECT_SYSTEM_PROFILE": "0",

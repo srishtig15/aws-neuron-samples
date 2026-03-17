@@ -33,7 +33,8 @@ All Neuron phases run in **isolated subprocesses** for clean HBM lifecycle. This
 ### Phase 1: Text Encoding (Neuron subprocess)
 - UMT5-XXL text encoder compiled with TP=4 (world_size=8)
 - Subprocess loads NxDModel, encodes prompt + negative prompt, exits
-- CPU fallback available via `--cpu_text_encoder` (required for 720P where text encoder world_size conflicts with transformer world_size)
+- CPU fallback available via `--cpu_text_encoder`
+- 720P: subprocess auto-detects text encoder world_size (8) and allocates the correct number of NCs, no conflict with transformer world_size (16)
 
 ### Phase 2: Denoising (Neuron subprocess, Combined MoE)
 - **Single subprocess** handles both MoE transformer phases using `replace_weights()`:
@@ -72,10 +73,10 @@ Per-step breakdown: ~8.2s/step (1s Neuron forward + ~3s CPU scheduler + ~4s data
 
 | Phase | Time | Details |
 |-------|------|---------|
-| Text Encoding (CPU) | 5s | |
+| Text Encoding | ~22s | Neuron subprocess (same as 480P) |
 | Denoising | 1069s | 2x188s loads + ~16.1s/step |
 | VAE Decode (parallel tiled) | ~32s | 8 tiles on 8 NCs, ~20s parallel load + ~4s decode + ~1s PQC |
-| **Total** | **~1106s** | |
+| **Total** | **~1123s** | |
 
 ### Comparison with GPU
 
@@ -115,7 +116,7 @@ python run_wan2.2_t2v_a14b.py \
 # Run 720P inference (requires separate compilation with --height 720 --width 1280)
 python run_wan2.2_t2v_a14b.py \
     --compiled_models_dir /opt/dlami/nvme/compiled_models_t2v_a14b_720p \
-    --height 720 --width 1280 --cpu_text_encoder \
+    --height 720 --width 1280 \
     --prompt "A cat walks on the grass, realistic" \
     --output output_t2v_720p.mp4
 ```
@@ -151,7 +152,7 @@ The script auto-patches `nearest-exact` -> `nearest` in diffusers for Trainium2 
 --prompt                  Text prompt
 --negative_prompt         Negative prompt
 --output                  Output video path (default: output_t2v_a14b.mp4)
---cpu_text_encoder        Use CPU text encoder instead of Neuron (required for 720P)
+--cpu_text_encoder        Use CPU text encoder instead of Neuron
 --cpu_vae_decoder         Force CPU VAE decoder (auto-detected if no Neuron decoder compiled)
 ```
 
