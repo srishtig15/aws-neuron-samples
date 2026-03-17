@@ -76,6 +76,7 @@ from diffusers.utils import export_to_video
 
 import argparse
 import gc
+import math
 import numpy as np
 import random
 import time
@@ -1010,34 +1011,22 @@ def phase_vae_decode(pipe, compiled_models_dir, latents, num_frames=81):
 # Phase 3 (Neuron Tiled): VAE Decoding with 480P tile patches
 # ============================================================
 def phase_vae_decode_neuron_tiled(pipe, compiled_models_dir, latents, num_frames=81):
-    """Decode latents using tiled Neuron VAE decode with 480P decoder patches.
+    """Decode 720P latents using parallel tiled Neuron VAE decode.
 
-    For 720P (90x160 latent), tiles the volume into overlapping 480P-sized patches
-    (60x104 latent), decodes each on Neuron using the compiled 480P rolling-cache
-    decoder, and blends tiles with linear ramp weighting in overlap zones.
+    Tiles the latent volume into spatial patches matching the compiled tile decoder,
+    launches one subprocess per tile (each on a separate Neuron Core), and blends
+    results with linear ramp weighting in overlap zones.
 
+    For 720P (90x160 latent) with 52x52 tile decoder: 2x4 = 8 tiles on 8 NCs.
     post_quant_conv runs on CPU for the full volume (Conv3d(16,16,1) is negligible).
     """
+    import subprocess
+    import tempfile
+    import shutil
+
     print("\n" + "="*60)
-    print("PHASE 3: VAE Decoding (Neuron Tiled)")
+    print("PHASE 3: VAE Decoding (Neuron Parallel Tiled)")
     print("="*60)
-
-    import torch.nn.functional as F
-
-    # Lazy Neuron import (only if not already imported by top-level code)
-    if 'torch_neuronx' not in sys.modules:
-        decoder_ws = 8
-        decoder_num_cores = decoder_ws
-        # Derive core range from current VISIBLE_CORES (set by top-level init or user)
-        visible = os.environ.get("NEURON_RT_VISIBLE_CORES", "0-63")
-        core_start = int(visible.split("-")[0])
-        os.environ["NEURON_RT_NUM_CORES"] = str(decoder_num_cores)
-        os.environ["NEURON_RT_VISIBLE_CORES"] = f"{core_start}-{core_start + decoder_num_cores - 1}"
-        print(f"Initializing Neuron for tiled decoder: NUM_CORES={decoder_num_cores}, cores={core_start}-{core_start + decoder_num_cores - 1}")
-
-    import torch_neuronx  # noqa: F811 — may re-import (safe, Python caches modules)
-    from neuronx_distributed import NxDModel  # noqa: F811
-    from neuron_wan2_2_t2v_a14b.compile_decoder_rolling import get_feat_cache_shapes
 
     # Denormalize latents on CPU
     vae_config = pipe.vae.config
@@ -1067,176 +1056,201 @@ def phase_vae_decode_neuron_tiled(pipe, compiled_models_dir, latents, num_frames
 
     B, C, T, H_lat, W_lat = z_bf16.shape
 
-    # Tile parameters (480P decoder compiled for 60x104 latent)
-    tile_h, tile_w = 60, 104
-    overlap_h = tile_h // 4  # 15
-    overlap_w = tile_w // 4  # 26
-    stride_h = tile_h - overlap_h  # 45
-    stride_w = tile_w - overlap_w  # 78
+    # Load tile decoder config to get tile size
+    decoder_path = f"{compiled_models_dir}/decoder_tile_ws1"
+    decoder_config = load_model_config(decoder_path)
+    tile_h = decoder_config["height"] // 8  # latent tile height
+    tile_w = decoder_config["width"] // 8   # latent tile width
+    decoder_frames = decoder_config.get("decoder_frames", 2)
+    decoder_world_size = decoder_config["world_size"]
 
-    # Compute tile positions (stop when current tile covers the full dimension)
-    h_starts = []
-    h = 0
-    while h < H_lat:
-        h_starts.append(h)
-        if h + tile_h >= H_lat:
-            break
-        h += stride_h
-    w_starts = []
-    w = 0
-    while w < W_lat:
-        w_starts.append(w)
-        if w + tile_w >= W_lat:
-            break
-        w += stride_w
+    # Compute tile grid
+    if H_lat <= tile_h:
+        h_starts = [0]
+    else:
+        n_h = math.ceil(H_lat / tile_h)
+        # Distribute tiles evenly: last tile ends at H_lat
+        if n_h == 1:
+            h_starts = [0]
+        else:
+            stride_h = (H_lat - tile_h) / (n_h - 1)
+            h_starts = [round(i * stride_h) for i in range(n_h)]
+
+    if W_lat <= tile_w:
+        w_starts = [0]
+    else:
+        n_w = math.ceil(W_lat / tile_w)
+        if n_w == 1:
+            w_starts = [0]
+        else:
+            stride_w = (W_lat - tile_w) / (n_w - 1)
+            w_starts = [round(i * stride_w) for i in range(n_w)]
 
     n_tiles = len(h_starts) * len(w_starts)
     print(f"Tiling: latent {H_lat}x{W_lat} -> {len(h_starts)}x{len(w_starts)} = {n_tiles} tiles")
-    print(f"  Tile size: {tile_h}x{tile_w}, stride: {stride_h}x{stride_w}, overlap: {overlap_h}x{overlap_w}")
+    print(f"  Tile size: {tile_h}x{tile_w} latent ({tile_h*8}x{tile_w*8} pixels)")
     for hi, hs in enumerate(h_starts):
         for wi, ws in enumerate(w_starts):
-            ah = min(tile_h, H_lat - hs)
-            aw = min(tile_w, W_lat - ws)
-            print(f"  Tile ({hi},{wi}): latent [{hs}:{hs+ah}, {ws}:{ws+aw}] (actual {ah}x{aw})")
+            he = min(hs + tile_h, H_lat)
+            we = min(ws + tile_w, W_lat)
+            print(f"  Tile ({hi},{wi}): latent [{hs}:{he}, {ws}:{we}] ({he-hs}x{we-ws})")
 
-    # Load 480P decoder
-    decoder_path = f"{compiled_models_dir}/decoder_rolling_480p"
-    decoder_config = load_model_config(decoder_path)
-    decoder_world_size = decoder_config["world_size"]
-    decoder_frames = decoder_config.get("decoder_frames", 2)
+    # Determine available NCs
+    visible = os.environ.get("NEURON_RT_VISIBLE_CORES", "0-63")
+    core_start = int(visible.split("-")[0])
 
-    print(f"\nLoading 480P decoder (world_size={decoder_world_size}, frames={decoder_frames})...")
-    t0 = time.time()
-    decoder_nxd = NxDModel.load(
-        os.path.join(decoder_path, "nxd_model.pt"),
-        start_rank=0, local_ranks_size=decoder_world_size,
-    )
-    decoder_weights = load_duplicated_weights(decoder_path, decoder_world_size)
-    decoder_nxd.set_weights(decoder_weights)
-    decoder_nxd.to_neuron()
-    load_time = time.time() - t0
-    print(f"  Decoder loaded in {load_time:.1f}s")
+    # Prepare subprocess environment template
+    cwd = os.path.dirname(os.path.abspath(__file__))
+    base_env = os.environ.copy()
+    base_env["PYTHONUNBUFFERED"] = "1"
+    for k in list(base_env.keys()):
+        if k.startswith("NEURON_RT_") or k == "NEURON_LOGICAL_NC_CONFIG":
+            del base_env[k]
+    if "PYTHONPATH" not in base_env:
+        base_env["PYTHONPATH"] = cwd
+    elif cwd not in base_env["PYTHONPATH"]:
+        base_env["PYTHONPATH"] = cwd + ":" + base_env["PYTHONPATH"]
 
-    # Pixel-space dimensions
-    H_pix = H_lat * 8
-    W_pix = W_lat * 8
-    overlap_h_pix = overlap_h * 8
-    overlap_w_pix = overlap_w * 8
-
-    # Accumulation buffers (float32 for blending precision)
-    num_latent_frames = T
-    num_video_frames = num_frames
-    output_acc = torch.zeros(3, num_video_frames, H_pix, W_pix, dtype=torch.float32)
-    weight_acc = torch.zeros(H_pix, W_pix, dtype=torch.float32)
-
-    num_chunks = (num_latent_frames + decoder_frames - 1) // decoder_frames
+    tmpdir = tempfile.mkdtemp(prefix="tiled_dec_")
     decode_start = time.time()
 
+    # Launch all tile subprocesses in parallel
+    tile_info = []  # (hi, wi, h_start, w_start, actual_h, actual_w, proc, output_path)
+    tile_idx = 0
     for hi, h_start in enumerate(h_starts):
         for wi, w_start in enumerate(w_starts):
-            tile_idx = hi * len(w_starts) + wi
             actual_h = min(tile_h, H_lat - h_start)
             actual_w = min(tile_w, W_lat - w_start)
 
-            # Extract spatial tile
+            # Extract tile and pad to compiled size if needed
             z_tile = z_bf16[:, :, :, h_start:h_start+actual_h, w_start:w_start+actual_w]
-
-            # Pad to tile size if edge tile
             if actual_h < tile_h or actual_w < tile_w:
+                import torch.nn.functional as F
                 z_tile = F.pad(z_tile, (0, tile_w - actual_w, 0, tile_h - actual_h))
 
-            # Initialize rolling cache for this tile
-            cache_shapes = get_feat_cache_shapes(1, tile_h, tile_w)
-            caches = [torch.zeros(s, dtype=torch.bfloat16) for s in cache_shapes]
+            # Save tile input
+            tile_input_path = os.path.join(tmpdir, f"tile_{tile_idx}_input.pt")
+            tile_output_path = os.path.join(tmpdir, f"tile_{tile_idx}_output.pt")
+            tile_env_path = os.path.join(tmpdir, f"tile_{tile_idx}_env.json")
 
-            # Decode temporal chunks
-            tile_frames = []
-            tile_start = time.time()
-            for chunk_idx in range(num_chunks):
-                t_start = chunk_idx * decoder_frames
-                t_end = min(t_start + decoder_frames, num_latent_frames)
-                chunk = z_tile[:, :, t_start:t_end, :, :]
+            torch.save({
+                "tile_data": z_tile,
+                "decoder_path": decoder_path,
+                "decoder_frames": decoder_frames,
+                "num_video_frames": num_frames,
+                "tile_id": f"{hi},{wi}",
+            }, tile_input_path)
 
-                # Pad last temporal chunk if needed
-                if chunk.shape[2] < decoder_frames:
-                    pad_t = decoder_frames - chunk.shape[2]
-                    padding = chunk[:, :, -1:, :, :].expand(-1, -1, pad_t, -1, -1)
-                    chunk = torch.cat([chunk, padding], dim=2)
+            # Each tile gets one NC
+            nc = core_start + tile_idx
+            env_config = {
+                "NEURON_RT_NUM_CORES": str(decoder_world_size),
+                "NEURON_RT_VIRTUAL_CORE_SIZE": "2",
+                "NEURON_RT_VISIBLE_CORES": f"{nc}-{nc + decoder_world_size - 1}",
+                "NEURON_RT_INSPECT_ENABLE": "0",
+                "NEURON_RT_INSPECT_DEVICE_PROFILE": "0",
+                "NEURON_RT_INSPECT_SYSTEM_PROFILE": "0",
+                "NEURON_RT_PROFILING_MODE": "0",
+            }
+            with open(tile_env_path, "w") as f:
+                json.dump(env_config, f)
 
-                # Run decoder
-                results = decoder_nxd(chunk, *caches)
-                if isinstance(results, (tuple, list)):
-                    output = results[0]
-                    caches = [r.to(torch.bfloat16) for r in results[1:1 + len(cache_shapes)]]
-                else:
-                    output = results
+            # Launch subprocess
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "neuron_wan2_2_t2v_a14b.tiled_decoder_worker",
+                 tile_input_path, tile_output_path, tile_env_path],
+                cwd=cwd, env=base_env,
+            )
+            tile_info.append((hi, wi, h_start, w_start, actual_h, actual_w, proc, tile_output_path))
+            print(f"  Launched tile ({hi},{wi}) on NC {nc}")
+            tile_idx += 1
 
-                output = output.to(torch.float32)
+    del z_bf16
+    gc.collect()
 
-                # Trim temporal padding
-                actual_t = t_end - t_start
-                video_frames_from_chunk = actual_t * 4
-                output = output[:, :, :video_frames_from_chunk]
-                tile_frames.append(output)
+    # Wait for all subprocesses
+    print(f"Waiting for {n_tiles} tile subprocesses...")
+    for hi, wi, h_start, w_start, actual_h, actual_w, proc, _ in tile_info:
+        ret = proc.wait()
+        if ret != 0:
+            raise RuntimeError(f"Tile ({hi},{wi}) subprocess failed with code {ret}")
 
-            tile_video = torch.cat(tile_frames, dim=2)  # [1, 3, F_total, tile_h*8, tile_w*8]
+    launch_and_wait_time = time.time() - decode_start
+    print(f"All tiles done in {launch_and_wait_time:.1f}s")
 
-            # Trim to expected frame count
-            if tile_video.shape[2] > num_video_frames:
-                tile_video = tile_video[:, :, :num_video_frames]
+    # Collect results and blend
+    H_pix = H_lat * 8
+    W_pix = W_lat * 8
+    output_acc = torch.zeros(3, num_frames, H_pix, W_pix, dtype=torch.float32)
+    weight_acc = torch.zeros(H_pix, W_pix, dtype=torch.float32)
 
-            # Trim spatial padding from decoded output
-            actual_h_pix = actual_h * 8
-            actual_w_pix = actual_w * 8
-            tile_video = tile_video[:, :, :, :actual_h_pix, :actual_w_pix]
+    max_decode_time = 0
+    max_load_time = 0
 
-            # Compute blending weight (linear ramps in overlap zones)
-            h_weight = torch.ones(actual_h_pix)
-            w_weight = torch.ones(actual_w_pix)
+    for hi, wi, h_start, w_start, actual_h, actual_w, proc, tile_output_path in tile_info:
+        result = torch.load(tile_output_path, weights_only=False)
+        tile_video = result["tile_video"]  # [1, 3, F, tile_h*8, tile_w*8]
+        max_decode_time = max(max_decode_time, result["decode_time"])
+        max_load_time = max(max_load_time, result["load_time"])
 
-            if hi > 0:  # has tile above -> ramp at start
-                ramp = min(overlap_h_pix, actual_h_pix)
+        # Trim to actual frame count
+        if tile_video.shape[2] > num_frames:
+            tile_video = tile_video[:, :, :num_frames]
+
+        # Trim spatial padding
+        actual_h_pix = actual_h * 8
+        actual_w_pix = actual_w * 8
+        tile_video = tile_video[:, :, :, :actual_h_pix, :actual_w_pix]
+
+        # Compute blending weight (linear ramps in overlap zones)
+        h_weight = torch.ones(actual_h_pix)
+        w_weight = torch.ones(actual_w_pix)
+
+        if hi > 0:  # overlap with tile above
+            overlap_top = (h_starts[hi - 1] + tile_h - h_start) * 8
+            if overlap_top > 0:
+                ramp = min(overlap_top, actual_h_pix)
                 h_weight[:ramp] = torch.linspace(0, 1, ramp + 2)[1:-1]
-            if hi < len(h_starts) - 1:  # has tile below -> ramp at end
-                ramp = min(overlap_h_pix, actual_h_pix)
+        if hi < len(h_starts) - 1:  # overlap with tile below
+            overlap_bot = (h_start + tile_h - h_starts[hi + 1]) * 8
+            if overlap_bot > 0:
+                ramp = min(overlap_bot, actual_h_pix)
                 h_weight[-ramp:] = torch.linspace(1, 0, ramp + 2)[1:-1]
-            if wi > 0:  # has tile left -> ramp at start
-                ramp = min(overlap_w_pix, actual_w_pix)
+        if wi > 0:  # overlap with tile left
+            overlap_left = (w_starts[wi - 1] + tile_w - w_start) * 8
+            if overlap_left > 0:
+                ramp = min(overlap_left, actual_w_pix)
                 w_weight[:ramp] = torch.linspace(0, 1, ramp + 2)[1:-1]
-            if wi < len(w_starts) - 1:  # has tile right -> ramp at end
-                ramp = min(overlap_w_pix, actual_w_pix)
+        if wi < len(w_starts) - 1:  # overlap with tile right
+            overlap_right = (w_start + tile_w - w_starts[wi + 1]) * 8
+            if overlap_right > 0:
+                ramp = min(overlap_right, actual_w_pix)
                 w_weight[-ramp:] = torch.linspace(1, 0, ramp + 2)[1:-1]
 
-            weight_2d = h_weight.unsqueeze(1) * w_weight.unsqueeze(0)  # [ah_pix, aw_pix]
+        weight_2d = h_weight.unsqueeze(1) * w_weight.unsqueeze(0)
 
-            # Accumulate weighted tile into output
-            h_pix = h_start * 8
-            w_pix = w_start * 8
-            output_acc[:, :, h_pix:h_pix+actual_h_pix, w_pix:w_pix+actual_w_pix] += (
-                tile_video[0] * weight_2d.unsqueeze(0).unsqueeze(0)
-            )
-            weight_acc[h_pix:h_pix+actual_h_pix, w_pix:w_pix+actual_w_pix] += weight_2d
+        h_pix = h_start * 8
+        w_pix = w_start * 8
+        output_acc[:, :, h_pix:h_pix+actual_h_pix, w_pix:w_pix+actual_w_pix] += (
+            tile_video[0] * weight_2d.unsqueeze(0).unsqueeze(0)
+        )
+        weight_acc[h_pix:h_pix+actual_h_pix, w_pix:w_pix+actual_w_pix] += weight_2d
 
-            tile_time = time.time() - tile_start
-            elapsed = time.time() - decode_start
-            print(f"  Tile ({hi},{wi}) done: {num_chunks} chunks, {tile_time:.1f}s ({elapsed:.1f}s total)")
-
-            del tile_video, tile_frames, z_tile, caches
-            gc.collect()
-
-    decode_time = time.time() - decode_start
+        del tile_video, result
 
     # Normalize by accumulated weights
     video = output_acc / weight_acc.unsqueeze(0).unsqueeze(0).clamp(min=1e-6)
 
-    print(f"  Total tiled decode time: {decode_time:.1f}s (load: {load_time:.1f}s)")
+    decode_time = time.time() - decode_start
+    print(f"  Parallel tiled decode: {decode_time:.1f}s total (max load: {max_load_time:.1f}s, max decode: {max_decode_time:.1f}s)")
     print(f"  Output: {list(video.shape)}")
 
-    del decoder_nxd, decoder_weights, z_bf16, output_acc, weight_acc
+    del output_acc, weight_acc
     gc.collect()
+    shutil.rmtree(tmpdir, ignore_errors=True)
 
     # Post-processing: [C, F, H, W] -> numpy [F, H, W, C], float [0,1]
-    video = video.permute(1, 2, 3, 0).float().cpu().numpy()  # [F, H, W, C]
+    video = video.permute(1, 2, 3, 0).float().cpu().numpy()
     video = ((video + 1.0) / 2.0).clip(0, 1)
     print(f"Output video: shape={video.shape}, dtype={video.dtype}")
 
@@ -1363,7 +1377,7 @@ def main(args):
     has_tiled_decoder = (
         not args.cpu_vae_decoder
         and not has_neuron_decoder
-        and os.path.exists(os.path.join(compiled_models_dir, "decoder_rolling_480p", "nxd_model.pt"))
+        and os.path.exists(os.path.join(compiled_models_dir, "decoder_tile_ws1", "nxd_model.pt"))
     )
     if has_neuron_decoder:
         video = _run_vae_decode_subprocess(pipe, compiled_models_dir, latents, num_frames=args.num_frames)

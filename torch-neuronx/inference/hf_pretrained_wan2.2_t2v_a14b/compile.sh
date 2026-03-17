@@ -102,18 +102,22 @@ if [ "$HEIGHT" -le 480 ]; then
         --cache_dir "${CACHE_DIR}" \
         --compile_post_quant_conv
 else
-    echo "[Step 5/6] Compiling 480P VAE Decoder for tiled decode..."
-    echo "  (720P full-res decoder exceeds instruction limit; using 480P tiled approach)"
-    WORLD_SIZE=8 neuron_parallel_compile python neuron_wan2_2_t2v_a14b/compile_decoder_rolling.py \
+    echo "[Step 5/6] Compiling world_size=1 tile decoder for parallel tiled decode..."
+    echo "  (720P full-res decoder exceeds instruction limit; using parallel tiles)"
+    echo "  Tile size: 416x416 (52x52 latent), 8 tiles on 8 NCs for 720P"
+    echo "  NOTE: Must NOT use neuron_parallel_compile (it overrides world_size)"
+    NEURON_RT_NUM_CORES=2 NEURON_RT_VIRTUAL_CORE_SIZE=2 \
+    python neuron_wan2_2_t2v_a14b/compile_decoder_rolling.py \
         --compiled_models_dir "${COMPILED_MODELS_DIR}" \
-        --compiler_workdir "${COMPILER_WORKDIR}/decoder_rolling_480p" \
-        --height 480 \
-        --width 832 \
+        --compiler_workdir "${COMPILER_WORKDIR}/decoder_tile_ws1" \
+        --height 416 \
+        --width 416 \
         --num_frames ${NUM_FRAMES} \
         --decoder_frames 2 \
-        --tp_degree 8 \
-        --world_size 8 \
-        --output_subdir decoder_rolling_480p \
+        --tp_degree 1 \
+        --world_size 1 \
+        --output_subdir decoder_tile_ws1 \
+        --skip_pqc \
         --cache_dir "${CACHE_DIR}"
 
     echo "[Step 6/6] Skipping post_quant_conv (tiled mode runs PQC on CPU)"
