@@ -56,6 +56,22 @@ All Neuron phases run in **isolated subprocesses** for clean HBM lifecycle. This
   - Each tile runs in its own subprocess with a world_size=1 stateful decoder
   - All 8 tiles decode simultaneously, ~18x faster than CPU fallback
 
+### Persistent Mode (All Models Co-resident)
+
+`run_wan2.2_t2v_a14b_persistent.py` keeps **all 4 models loaded simultaneously** on separate NeuronCores, eliminating all model load/swap overhead between inferences.
+
+- **NC allocation (480P, transformer ws=8)**:
+  - NCs 0-7: Text Encoder (persistent)
+  - NCs 8-15: Transformer_1 (persistent)
+  - NCs 16-23: Transformer_2 (persistent)
+  - NCs 24-31: VAE Decoder + PQC (persistent)
+  - Total: 32 / 64 NCs
+
+- Each model runs as a **long-lived subprocess** with stdin/stdout protocol (READY/command/DONE)
+- Models load once at startup (~88s parallel), then serve unlimited inference requests
+- Decoder cache reset between inferences via `replace_weights()` (~16s)
+- Supports `--num_runs` for multi-run benchmarking (1 warmup + N timed runs)
+
 ## Performance
 
 ### 480P (480x832, 81 frames, 40 steps)
@@ -68,6 +84,17 @@ All Neuron phases run in **isolated subprocesses** for clean HBM lifecycle. This
 | **Total** | **~544s** | |
 
 Per-step breakdown: ~8.2s/step (1s Neuron forward + ~3s CPU scheduler + ~4s data transfer overhead)
+
+### 480P Persistent Mode (all models co-resident, no model loading)
+
+| Phase | Time | Details |
+|-------|------|---------|
+| Text Encoding | 0.1s | Model already loaded, pure inference |
+| Denoising | 327s | 107s phase1 + 221s phase2 (zero load/swap) |
+| VAE Decode | 27s | 16s cache reset + 11s decode (stateful) |
+| **Total** | **~355s** | **35% faster than subprocess mode** |
+
+> Benchmark: avg of 3 runs after warmup. All runs within 0.4s (354.5-354.9s). Uses 32/64 NCs.
 
 ### 720P (720x1280, 81 frames, 40 steps)
 
@@ -119,6 +146,17 @@ python run_wan2.2_t2v_a14b.py \
     --height 720 --width 1280 \
     --prompt "A cat walks on the grass, realistic" \
     --output output_t2v_720p.mp4
+```
+
+### Persistent Mode (multi-run, no model reloading)
+
+```bash
+# Run persistent mode: all models stay loaded, 1 warmup + 3 timed runs
+python run_wan2.2_t2v_a14b_persistent.py \
+    --compiled_models_dir /opt/dlami/nvme/compiled_models_t2v_a14b \
+    --num_runs 3 \
+    --prompt "A cat walks on the grass, realistic" \
+    --output output_persistent.mp4
 ```
 
 ## Compilation
@@ -178,6 +216,7 @@ hf_pretrained_wan2.2_t2v_a14b/
 ├── GPU_BENCHMARK.md                     # GPU baseline benchmark & flash-attn-4 guide
 ├── compile.sh                           # Master compilation script (Neuron)
 ├── run_wan2.2_t2v_a14b.py              # Neuron inference script (subprocess orchestrator)
+├── run_wan2.2_t2v_a14b_persistent.py   # Persistent mode (all models co-resident, multi-run)
 ├── run_wan2.2_t2v_a14b_gpu.py          # GPU inference benchmark
 ├── patch_diffusers_fa4.py              # Patch diffusers for flash-attn-4
 ├── requirements.txt
@@ -192,6 +231,9 @@ hf_pretrained_wan2.2_t2v_a14b/
     ├── denoise_worker.py               # Subprocess worker for MoE denoising (single/combined mode)
     ├── decoder_worker.py               # Subprocess worker for VAE decode (stateful/legacy/nocache)
     ├── tiled_decoder_worker.py          # Subprocess worker for single-tile decode (parallel tiled 720P)
+    ├── persistent_text_encoder_worker.py # Persistent text encoder worker (stays loaded)
+    ├── persistent_denoise_worker.py     # Persistent transformer worker (stays loaded)
+    ├── persistent_decoder_worker.py     # Persistent VAE decoder worker (stays loaded)
     ├── distributed_rmsnorm.py          # Distributed RMSNorm for TP
     ├── neuron_commons.py               # Wrapper classes for Neuron models
     └── neuron_parallel_utils.py        # TP/CP sharding utilities
