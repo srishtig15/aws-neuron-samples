@@ -25,6 +25,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--transformer_path", required=True)
     parser.add_argument("--env_config", default=None)
+    parser.add_argument("--warmup", action="store_true",
+                        help="Run a dummy forward pass before READY to establish NCCL ring")
     args = parser.parse_args()
 
     # Set env vars before Neuron imports
@@ -113,6 +115,33 @@ def main():
         if isinstance(output, (tuple, list)):
             output = output[0]
         return output
+
+    # Optional warmup forward pass to establish NCCL ring
+    if args.warmup:
+        print("[Worker] Running warmup forward pass to init NCCL...", flush=True)
+        t0 = time.time()
+        # Build dummy inputs from config
+        in_channels = config.get("in_channels", 16)
+        latent_frames = config.get("latent_frames", 21)
+        latent_h = config.get("latent_height", 60)
+        latent_w = config.get("latent_width", 104)
+        seq_len = config.get("seq_len", latent_frames * latent_h * latent_w)
+        max_seq = config.get("max_sequence_length", 512)
+        # encoder_dim is T5 output dim (4096), NOT transformer hidden_size (5120)
+        encoder_dim = config.get("encoder_dim", 4096)
+        dummy_hs = torch.zeros(1, in_channels, latent_frames, latent_h, latent_w, dtype=DTYPE)
+        dummy_ts = torch.zeros(1, dtype=torch.float32)
+        dummy_enc = torch.zeros(1, max_seq, encoder_dim, dtype=DTYPE)
+        try:
+            _ = nxd_model(dummy_hs, dummy_ts, dummy_enc,
+                          rotary_emb_cos, rotary_emb_sin)
+            print(f"[Worker] Warmup done in {time.time()-t0:.1f}s", flush=True)
+        except Exception as e:
+            import traceback
+            print(f"[Worker] Warmup FAILED: {type(e).__name__}: {e}", flush=True)
+            print(f"[Worker] Shapes: hs={list(dummy_hs.shape)}, ts={list(dummy_ts.shape)}, enc={list(dummy_enc.shape)}", flush=True)
+            traceback.print_exc()
+            # Don't exit - continue to READY, warmup is best-effort
 
     # Signal ready
     print("READY", flush=True)
