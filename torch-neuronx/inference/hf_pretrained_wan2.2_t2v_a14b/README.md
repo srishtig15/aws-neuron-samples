@@ -118,11 +118,11 @@ Per-step breakdown: ~8.2s/step (1s Neuron forward + ~3s CPU scheduler + ~4s data
 | Phase | Time | Details |
 |-------|------|---------|
 | Text Encoding | 0.1s | Model already loaded, pure inference |
-| Denoising | 633s | 206s phase1 + 427s phase2 (zero load/swap) |
-| VAE Decode (parallel tiled) | 8.4s | 4s cache reset + 4s decode (4 tiles on 4 NCs) |
-| **Total** | **~641s** | **43% faster than subprocess mode (~1123s)** |
+| Denoising | 633.0s | 206.4s phase1 + 426.3s phase2 (zero load/swap) |
+| VAE Decode (parallel tiled) | 8.5s | ~4s cache reset + ~4s decode (4 tiles on 4 NCs) |
+| **Total** | **641.5s** | **43% faster than subprocess mode (~1123s)** |
 
-> Benchmark: 1 warmup + timed run. VAE decode is 70x faster than CPU (8.4s vs 585s). Uses 48/64 NCs.
+> Benchmark: avg of 3 runs after warmup. All runs within 0.1s (641.5-641.6s). Model load 472s one-time. VAE decode 69x faster than CPU (8.5s vs 585s). Uses 48/64 NCs.
 
 ### Comparison with GPU
 
