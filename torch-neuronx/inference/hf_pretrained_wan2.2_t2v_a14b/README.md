@@ -51,7 +51,9 @@ All Neuron phases run in **isolated subprocesses** for clean HBM lifecycle. This
   - Only input x (~300KB) transferred per chunk call
   - 2x faster than legacy I/O cache mode (~1.0s/chunk vs ~2.2s/chunk)
 - Post-quant conv + chunked rolling decode (2 latent frames per chunk, 11 chunks for 480P)
-- 720P: Tiled Neuron decode with 4 overlapping 480P patches (2x2 grid) + linear-ramp blending
+- 720P: **Parallel tiled Neuron decode** with 8 tiles (2x4 grid of 416x416 patches) on 8 independent NCs
+  - Each tile runs in its own subprocess with a world_size=1 stateful decoder
+  - All 8 tiles decode simultaneously, ~18x faster than CPU fallback
 
 ## Performance
 
@@ -72,8 +74,8 @@ Per-step breakdown: ~8.2s/step (1s Neuron forward + ~3s CPU scheduler + ~4s data
 |-------|------|---------|
 | Text Encoding (CPU) | 5s | |
 | Denoising | 1069s | 2x188s loads + ~16.1s/step |
-| VAE Decode (tiled) | 145s | 106s decode + 36s load + 3s PQC |
-| **Total** | **~1320s** | |
+| VAE Decode (parallel tiled) | ~32s | 8 tiles on 8 NCs, ~20s parallel load + ~4s decode + ~1s PQC |
+| **Total** | **~1106s** | |
 
 ### Comparison with GPU
 
@@ -129,10 +131,10 @@ python run_wan2.2_t2v_a14b.py \
 | 3 | Transformer - high-noise expert (TP=4, CP=N) | `transformer/` |
 | 4 | Transformer_2 - low-noise expert (TP=4, CP=N) | `transformer_2/` |
 | 5 | VAE Decoder (Stateful Rolling Cache, 480P) | `decoder_rolling/` |
-| 5b | VAE Decoder (480P patches, for tiled 720P decode) | `decoder_rolling_480p/` |
+| 5b | VAE Decoder (world_size=1 tile, for parallel tiled 720P decode) | `decoder_tile_ws1/` |
 | 6 | Post-quant conv (480P only) | `post_quant_conv/` |
 
-For 720P, compile with `--height 720 --width 1280` which sets CP=4 (world_size=16). Step 5b compiles a 480P decoder for tiled 720P decode (`decoder_rolling_480p/`). The full-resolution 720P decoder exceeds the instruction limit; tiled decode uses 480P patches with overlap blending instead.
+For 720P, compile with `--height 720 --width 1280` which sets CP=4 (world_size=16). Step 5b compiles a world_size=1 decoder for 416x416 tiles (`decoder_tile_ws1/`). The full-resolution 720P decoder exceeds the instruction limit; parallel tiled decode runs 8 tiles (2x4 grid) on 8 independent NCs with overlap blending. **Note**: Step 5b must NOT use `neuron_parallel_compile` as it overrides world_size.
 
 The script auto-patches `nearest-exact` -> `nearest` in diffusers for Trainium2 compatibility.
 
@@ -161,10 +163,10 @@ The inference script auto-detects which decoder mode to use:
 |------|-----------|---------|----------------|----------------|-------|
 | **Stateful Rolling** | `decoder_rolling/` | No | On-device (HBM) | ~300KB (x only) | Default. Cache as registered buffers, auto input-output aliasing |
 | **Legacy Rolling** | `decoder_rolling/` | No | Host (CPU) | ~3.6GB (cache I/O) | Fallback if config `"stateful": false` |
-| **Tiled (720P)** | `decoder_rolling_480p/` | No | On-device (HBM) | ~300KB x 4 tiles | 480P stateful patches with overlap blending |
+| **Parallel Tiled (720P)** | `decoder_tile_ws1/` | No | On-device (HBM) | ~300KB x 8 tiles | 8 parallel ws=1 decoders on 8 NCs, overlap blending |
 | **NoCache** | `decoder_nocache/` | Yes | N/A | ~300KB | No temporal context, visible flicker |
 
-Auto-detection priority: full-res rolling/nocache -> tiled 480P -> CPU fallback.
+Auto-detection priority: full-res rolling/nocache -> parallel tiled (decoder_tile_ws1) -> CPU fallback.
 
 ## File Structure
 
@@ -188,6 +190,7 @@ hf_pretrained_wan2.2_t2v_a14b/
     ├── text_encoder_worker.py          # Subprocess worker for text encoding
     ├── denoise_worker.py               # Subprocess worker for MoE denoising (single/combined mode)
     ├── decoder_worker.py               # Subprocess worker for VAE decode (stateful/legacy/nocache)
+    ├── tiled_decoder_worker.py          # Subprocess worker for single-tile decode (parallel tiled 720P)
     ├── distributed_rmsnorm.py          # Distributed RMSNorm for TP
     ├── neuron_commons.py               # Wrapper classes for Neuron models
     └── neuron_parallel_utils.py        # TP/CP sharding utilities
