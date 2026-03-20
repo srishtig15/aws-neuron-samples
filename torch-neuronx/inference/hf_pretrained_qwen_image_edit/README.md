@@ -607,6 +607,85 @@ The `--enable-ccop-compute-overlap` flag is particularly important for tensor pa
 
 The transformer is the main bottleneck, accounting for ~80% of total inference time. V3 Language Model on Neuron is ~2-8x faster than CPU. V3 Vision Encoder on Neuron is ~10-15x faster than CPU (first call).
 
+## trn2.3xlarge Support
+
+The code works on trn2.3xlarge with the following configuration changes. This enables running on a much smaller (and cheaper) instance.
+
+### Configuration: LNC=2, TP=4, CP=1
+
+trn2.3xlarge has 2 NeuronCores. At the default LNC=2, this gives **4 logical cores** with 24 GB HBM each.
+
+| Setting | trn2.48xlarge | trn2.3xlarge |
+|---------|--------------|--------------|
+| LNC | 1 (8 logical cores) | 2 (4 logical cores, default) |
+| TP | 4 | 4 |
+| CP / DP | 2 | **1 (disabled)** |
+| World size | 8 | **4** |
+| NEURON_RT_NUM_CORES | 8 | **4** |
+| All on Neuron? | Yes | Yes |
+
+**Key**: Pass `--world_size 4` to `compile_transformer_v3_cp.py`. The script auto-derives `cp_degree = world_size // tp_degree = 1`, effectively disabling Context Parallel.
+
+### Compilation on trn2.3xlarge
+
+```bash
+# Compile transformer (CP disabled, world_size=4)
+python neuron_qwen_image_edit/compile_transformer_v3_cp.py \
+    --world_size 4 --height 1024 --width 1024
+
+# Compile language model (world_size=4)
+python neuron_qwen_image_edit/compile_language_model_v3.py \
+    --world_size 4
+
+# Compile vision encoder (use --load_bf16 to avoid OOM on 64GB RAM)
+python neuron_qwen_image_edit/compile_vision_encoder_v3.py \
+    --load_bf16
+
+# Compile VAE (unchanged)
+python neuron_qwen_image_edit/compile_vae.py
+```
+
+### Inference on trn2.3xlarge
+
+```bash
+NEURON_RT_NUM_CORES=4 python run_qwen_image_edit.py \
+    --use_v3_cp --use_v3_language_model --use_v3_vision_encoder \
+    --images input.jpg --prompt "convert to oil painting" \
+    --num_inference_steps 28
+```
+
+### Known Issues on trn2.3xlarge
+
+1. **VAE decoder compiler error at LNC=2**: `NEURON_CUSTOM_SILU=1` and `NEURON_FUSE_SOFTMAX=1` cause an internal compiler error (NCC_IBIR182) for the VAE decoder. The fix (included in this code) automatically disables these flags for decoder compilation.
+
+2. **Vision encoder OOM**: Loading the full pipeline in fp32 (~95 GB) exceeds the 64 GB system RAM on trn2.3xlarge. Use `--load_bf16` to load in bf16 and auto-convert to fp32 for compilation.
+
+3. **Multi-image sequence length overflow**: With 3 input images, the text encoder produces ~1042 tokens, exceeding the default `max_sequence_length=1024`. Recompile the language model with `--max_sequence_length 2048` and pass `--max_sequence_length 2048` to the run script.
+
+### Performance: trn2.3xlarge vs GPU
+
+Benchmarked on trn2.3xlarge (LNC=2, TP=4, CP=1) with SDK 2.28, spot pricing $0.90/hr:
+
+| Test | trn2.3xlarge | GPU (g6e.12xlarge, 4x L40S) | Ratio |
+|------|-------------|------------------------------|-------|
+| 1 img, 1024x1024, 28 steps | 83.1s (2.97 s/step) | 67.6s (2.41 s/step) | Neuron 1.23x slower |
+| 3 img, 768x1280, 28 steps | 92.9s (3.32 s/step) | 160.1s (5.72 s/step) | **Neuron 1.72x faster** |
+
+**Cost comparison** (28 steps, spot pricing):
+
+| Instance | $/hr | $/image (1 img, 1024x1024) |
+|----------|------|---------------------------|
+| trn2.3xlarge (spot) | $0.90 | **$0.021** |
+| g6e.12xlarge (spot, 4x L40S) | $4.94 | $0.093 |
+
+**Key finding**: Neuron is **4.4x cheaper per image** than GPU. For multi-image workloads, Neuron is both faster AND cheaper — NKI Flash Attention handles longer sequences far more efficiently than GPU attention (GPU slows 2.37x for 23% more tokens while Neuron slows only 12%).
+
+## Qwen-Image-Edit-2511 Compatibility
+
+The code was developed for `Qwen-Image-Edit-2509`. It is fully compatible with `Qwen-Image-Edit-2511` — the architectures are identical (same pipeline, transformer, VAE, encoder configs). 2511 is a weight-only update that adds one config field (`zero_cond_t: true`), handled by the diffusers pipeline.
+
+To use 2511, simply change the MODEL_ID or pass `--model_path Qwen/Qwen-Image-Edit-2511` to compile and run scripts. All components need recompilation with the new weights.
+
 ## Known Limitations
 
 1. **Fixed dimensions**: Models are compiled for specific dimensions. Different sizes require recompilation.
