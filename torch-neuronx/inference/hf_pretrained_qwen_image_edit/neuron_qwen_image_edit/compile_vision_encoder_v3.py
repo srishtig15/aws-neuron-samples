@@ -57,6 +57,7 @@ def load_pipeline(dtype=torch.float32):
 
 class f32Wrapper(nn.Module):
     """Wrapper to run normalization layers in float32 for numerical stability."""
+
     def __init__(self, original):
         super().__init__()
         self.original = original
@@ -73,7 +74,7 @@ def upcast_norms_to_f32(module):
     for name, child in module.named_children():
         if isinstance(child, (torch.nn.LayerNorm,)):
             setattr(module, name, f32Wrapper(child.to(torch.float32)))
-        elif 'RMSNorm' in child.__class__.__name__:
+        elif "RMSNorm" in child.__class__.__name__:
             setattr(module, name, f32Wrapper(child.to(torch.float32)))
         else:
             upcast_norms_to_f32(child)
@@ -128,7 +129,8 @@ def shard_vision_attention_fp32(tp_degree: int, attn):
         orig_qkv.out_features,
         bias=(orig_qkv.bias is not None),
         gather_output=False,
-        dtype=torch.float32)
+        dtype=torch.float32,
+    )
     attn.qkv.weight.data = get_sharded_data(orig_qkv.weight.data, 0)
     if orig_qkv.bias is not None:
         attn.qkv.bias.data = get_sharded_data(orig_qkv.bias.data, 0)
@@ -140,7 +142,8 @@ def shard_vision_attention_fp32(tp_degree: int, attn):
         orig_proj.out_features,
         bias=(orig_proj.bias is not None),
         input_is_parallel=True,
-        dtype=torch.float32)
+        dtype=torch.float32,
+    )
     attn.proj.weight.data = get_sharded_data(orig_proj.weight.data, 1)
     if orig_proj.bias is not None:
         attn.proj.bias.data = orig_proj.bias.data.detach()
@@ -173,7 +176,8 @@ def shard_vision_mlp_fp32(mlp):
         orig_gate.out_features,
         bias=(orig_gate.bias is not None),
         gather_output=False,
-        dtype=torch.float32)
+        dtype=torch.float32,
+    )
     mlp.gate_proj.weight.data = get_sharded_data(orig_gate.weight.data, 0)
     if orig_gate.bias is not None:
         mlp.gate_proj.bias.data = get_sharded_data(orig_gate.bias.data, 0)
@@ -185,7 +189,8 @@ def shard_vision_mlp_fp32(mlp):
         orig_up.out_features,
         bias=(orig_up.bias is not None),
         gather_output=False,
-        dtype=torch.float32)
+        dtype=torch.float32,
+    )
     mlp.up_proj.weight.data = get_sharded_data(orig_up.weight.data, 0)
     if orig_up.bias is not None:
         mlp.up_proj.bias.data = get_sharded_data(orig_up.bias.data, 0)
@@ -197,7 +202,8 @@ def shard_vision_mlp_fp32(mlp):
         orig_down.out_features,
         bias=(orig_down.bias is not None),
         input_is_parallel=True,
-        dtype=torch.float32)
+        dtype=torch.float32,
+    )
     mlp.down_proj.weight.data = get_sharded_data(orig_down.weight.data, 1)
     if orig_down.bias is not None:
         mlp.down_proj.bias.data = orig_down.bias.data.detach()
@@ -238,9 +244,9 @@ class NeuronVisionEncoderV3(nn.Module):
 
         # Shard the transformer blocks
         for i, block in enumerate(self.visual.blocks):
-            if hasattr(block, 'attn'):
+            if hasattr(block, "attn"):
                 block.attn = shard_vision_attention_fp32(tp_degree, block.attn)
-            if hasattr(block, 'mlp'):
+            if hasattr(block, "mlp"):
                 block.mlp = shard_vision_mlp_fp32(block.mlp)
             if i == 0:
                 print(f"  Sharded block 0 attention and MLP")
@@ -296,14 +302,16 @@ def compile_vision_encoder_v3(args):
     if image_size % patch_size != 0:
         raise ValueError(
             f"image_size ({image_size}) must be divisible by patch_size ({patch_size}). "
-            f"Valid sizes: 224, 336, 448, 560, etc.")
+            f"Valid sizes: 224, 336, 448, 560, etc."
+        )
 
     num_patches_per_side = image_size // patch_size
     if num_patches_per_side % spatial_merge_size != 0:
         raise ValueError(
             f"image_size / patch_size ({num_patches_per_side}) must be divisible by "
             f"spatial_merge_size ({spatial_merge_size}). "
-            f"Valid image sizes: 224, 336, 448, 560, etc.")
+            f"Valid image sizes: 224, 336, 448, 560, etc."
+        )
 
     num_patches_h = image_size // patch_size
     num_patches_w = image_size // patch_size
@@ -339,25 +347,38 @@ def compile_vision_encoder_v3(args):
 
     # Use NxDParallelState context for compilation
     with NxDParallelState(world_size=world_size, tensor_model_parallel_size=tp_degree):
-        print("Loading model...")
-        pipe = load_pipeline(torch.float32)
+        # On trn2.3xlarge (or instances with <96GB RAM), loading the full pipeline
+        # in fp32 (~95 GB) will OOM. Load in bf16 to save memory, then extract
+        # the vision encoder and explicitly convert its weights to fp32.
+        # On trn2.48xlarge, fp32 loading works fine.
+        load_dtype = torch.bfloat16 if args.load_bf16 else torch.float32
+        print(f"Loading model in {load_dtype}...")
+        pipe = load_pipeline(load_dtype)
 
         # Extract vision encoder
         original_visual = pipe.text_encoder.model.visual
 
-        # Save unsharded state dict before modifications
+        # Save unsharded state dict before modifications.
+        # CRITICAL: If pipeline was loaded in bf16, the state dict will be bf16.
+        # Vision encoder requires fp32 for accuracy, so we must explicitly cast.
         print("Saving unsharded state dict...")
-        unsharded_state = original_visual.state_dict()
+        unsharded_state = {
+            k: v.to(torch.float32) for k, v in original_visual.state_dict().items()
+        }
+
+        # Convert vision encoder to fp32 before sharding
+        if load_dtype != torch.float32:
+            original_visual = original_visual.to(torch.float32)
 
         # Create Neuron vision encoder with sharding
-        print(f"\nCreating Neuron vision encoder (sharding layers with TP={tp_degree})...")
-        neuron_vision_encoder = NeuronVisionEncoderV3(
-            original_visual, tp_degree
+        print(
+            f"\nCreating Neuron vision encoder (sharding layers with TP={tp_degree})..."
         )
+        neuron_vision_encoder = NeuronVisionEncoderV3(original_visual, tp_degree)
         neuron_vision_encoder = neuron_vision_encoder.to(torch.float32)
         neuron_vision_encoder.eval()
 
-        # Clear pipeline to save memory
+        # Clear pipeline to save memory (important on trn2.3xlarge)
         del pipe
         gc.collect()
 
@@ -423,13 +444,15 @@ def compile_vision_encoder_v3(args):
         # Collect inv_freq buffers from original model (they are not in state_dict)
         inv_freq_buffers = {}
         for name, buf in neuron_vision_encoder.visual.named_buffers():
-            if 'inv_freq' in name:
+            if "inv_freq" in name:
                 full_key = f"vision_encoder.visual.{name}"
                 inv_freq_buffers[full_key] = buf.to(torch.float32).clone()
         print(f"  Collected {len(inv_freq_buffers)} inv_freq buffers")
 
         for rank in range(tp_degree):
-            shard_file = os.path.join(weights_path, f"tp{rank}_sharded_checkpoint.safetensors")
+            shard_file = os.path.join(
+                weights_path, f"tp{rank}_sharded_checkpoint.safetensors"
+            )
             if not os.path.exists(shard_file):
                 print(f"  WARNING: {shard_file} not found!")
                 continue
@@ -440,7 +463,7 @@ def compile_vision_encoder_v3(args):
             original_size = sum(v.numel() * v.element_size() for v in data.values())
 
             # Remove master_weight tensors (they duplicate the sharded weights)
-            cleaned = {k: v for k, v in data.items() if 'master_weight' not in k}
+            cleaned = {k: v for k, v in data.items() if "master_weight" not in k}
 
             # Add inv_freq buffers
             cleaned.update(inv_freq_buffers)
@@ -449,8 +472,10 @@ def compile_vision_encoder_v3(args):
 
             # Save optimized checkpoint
             save_file(cleaned, shard_file)
-            print(f"  tp{rank}: {original_count} -> {len(cleaned)} tensors, "
-                  f"{original_size/1e9:.2f}GB -> {cleaned_size/1e9:.2f}GB")
+            print(
+                f"  tp{rank}: {original_count} -> {len(cleaned)} tensors, "
+                f"{original_size / 1e9:.2f}GB -> {cleaned_size / 1e9:.2f}GB"
+            )
 
         # Save config
         config = {
@@ -465,7 +490,7 @@ def compile_vision_encoder_v3(args):
             "dtype": "float32",
         }
         config_path = os.path.join(output_path, "config.json")
-        with open(config_path, 'w') as f:
+        with open(config_path, "w") as f:
             json.dump(config, f, indent=2)
 
         print(f"\nVision Encoder V3 compiled successfully!")
@@ -480,16 +505,37 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Compile Vision Encoder V3 using ModelBuilder API"
     )
-    parser.add_argument("--image_size", type=int, default=448,
-                        help="Vision encoder input image size (default: 448)")
-    parser.add_argument("--compiled_models_dir", type=str,
-                        default="/opt/dlami/nvme/compiled_models",
-                        help="Output directory for compiled models")
-    parser.add_argument("--compiler_workdir", type=str,
-                        default="/opt/dlami/nvme/compiler_workdir",
-                        help="Compiler working directory")
-    parser.add_argument("--model_path", type=str, default=None,
-                        help="Path to model (local dir or HuggingFace ID)")
+    parser.add_argument(
+        "--image_size",
+        type=int,
+        default=448,
+        help="Vision encoder input image size (default: 448)",
+    )
+    parser.add_argument(
+        "--compiled_models_dir",
+        type=str,
+        default="/opt/dlami/nvme/compiled_models",
+        help="Output directory for compiled models",
+    )
+    parser.add_argument(
+        "--compiler_workdir",
+        type=str,
+        default="/opt/dlami/nvme/compiler_workdir",
+        help="Compiler working directory",
+    )
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        default=None,
+        help="Path to model (local dir or HuggingFace ID)",
+    )
+    parser.add_argument(
+        "--load_bf16",
+        action="store_true",
+        default=False,
+        help="Load pipeline in bf16 to save memory (for trn2.3xlarge). "
+        "Weights are automatically cast to fp32 for compilation.",
+    )
 
     args = parser.parse_args()
 
