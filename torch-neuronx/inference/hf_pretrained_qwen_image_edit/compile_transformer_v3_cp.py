@@ -574,7 +574,7 @@ def compile_transformer_v3_cp(args):
     # world_size=8, tensor_model_parallel_size=4 means DP=2 (used for CP)
     with NxDParallelState(world_size=world_size, tensor_model_parallel_size=tp_degree):
         print("\nLoading model...")
-        load_kwargs = {"torch_dtype": torch.bfloat16, "local_files_only": True}
+        load_kwargs = {"torch_dtype": torch.bfloat16, "local_files_only": False}
         if CACHE_DIR:
             load_kwargs["cache_dir"] = CACHE_DIR
         pipe = QwenImageEditPlusPipeline.from_pretrained(MODEL_ID, **load_kwargs)

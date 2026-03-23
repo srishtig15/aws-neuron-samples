@@ -45,7 +45,7 @@ MODEL_ID = "meituan-longcat/LongCat-Image-Edit"
 
 
 def load_pipeline(dtype=torch.bfloat16):
-    load_kwargs = {"torch_dtype": dtype, "local_files_only": True}
+    load_kwargs = {"torch_dtype": dtype, "local_files_only": False}
     if CACHE_DIR:
         load_kwargs["cache_dir"] = CACHE_DIR
     return LongCatImageEditPipeline.from_pretrained(MODEL_ID, **load_kwargs)

@@ -550,7 +550,7 @@ def compile_transformer(args):
 
     # Load pipeline first (need it for RoPE computation)
     print("\nLoading model...")
-    load_kwargs = {"torch_dtype": torch.bfloat16, "local_files_only": True}
+    load_kwargs = {"torch_dtype": torch.bfloat16, "local_files_only": False}
     if CACHE_DIR:
         load_kwargs["cache_dir"] = CACHE_DIR
     pipe = LongCatImageEditPipeline.from_pretrained(MODEL_ID, **load_kwargs)

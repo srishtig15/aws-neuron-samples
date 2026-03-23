@@ -1002,7 +1002,7 @@ def main():
     # Load pipeline
     print("\n[Step 1/4] Loading LongCat pipeline...")
     t0 = time.perf_counter()
-    load_kwargs = {"torch_dtype": torch.bfloat16, "local_files_only": True}
+    load_kwargs = {"torch_dtype": torch.bfloat16, "local_files_only": False}
     if HUGGINGFACE_CACHE_DIR:
         load_kwargs["cache_dir"] = HUGGINGFACE_CACHE_DIR
     pipe = LongCatImageEditPipeline.from_pretrained(MODEL_ID, **load_kwargs)

@@ -77,7 +77,7 @@ def compile_vae(args):
     batch_size = args.batch_size
     dtype = torch.bfloat16
 
-    load_kwargs = {"local_files_only": True, "torch_dtype": dtype}
+    load_kwargs = {"local_files_only": False, "torch_dtype": dtype}
     if CACHE_DIR:
         load_kwargs["cache_dir"] = CACHE_DIR
     pipe = QwenImageEditPlusPipeline.from_pretrained(MODEL_ID, **load_kwargs)

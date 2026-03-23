@@ -41,7 +41,7 @@ MODEL_ID = "Qwen/Qwen-Image-Edit-2509"
 
 def load_pipeline(dtype=torch.bfloat16):
     """Load pipeline with appropriate kwargs based on MODEL_ID and CACHE_DIR."""
-    load_kwargs = {"torch_dtype": dtype, "local_files_only": True}
+    load_kwargs = {"torch_dtype": dtype, "local_files_only": False}
     if CACHE_DIR:
         load_kwargs["cache_dir"] = CACHE_DIR
     return QwenImageEditPlusPipeline.from_pretrained(MODEL_ID, **load_kwargs)
