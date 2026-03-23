@@ -6,7 +6,7 @@ from diffusers import QwenImageEditPlusPipeline
 # 启用内存优化
 torch.cuda.empty_cache()
 
-pipeline = QwenImageEditPlusPipeline.from_pretrained("Qwen/Qwen-Image-Edit-2509", torch_dtype=torch.bfloat16)
+pipeline = QwenImageEditPlusPipeline.from_pretrained("Qwen/Qwen-Image-Edit-2511", torch_dtype=torch.bfloat16)
 print("pipeline loaded")
 
 # 使用 CPU offload 来节省显存

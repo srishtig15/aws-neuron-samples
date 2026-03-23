@@ -15,7 +15,7 @@ import torch
 from PIL import Image
 
 CACHE_DIR = "/opt/dlami/nvme/qwen_image_edit_hf_cache_dir"
-MODEL_ID = "Qwen/Qwen-Image-Edit-2509"
+MODEL_ID = "Qwen/Qwen-Image-Edit-2511"
 COMPILED_MODELS_DIR = "/opt/dlami/nvme/compiled_models"
 
 

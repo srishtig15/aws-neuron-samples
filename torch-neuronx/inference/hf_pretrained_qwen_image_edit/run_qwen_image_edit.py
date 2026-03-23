@@ -75,7 +75,7 @@ except ImportError:
 # Constants
 COMPILED_MODELS_DIR = "/opt/dlami/nvme/compiled_models"
 HUGGINGFACE_CACHE_DIR = "/opt/dlami/nvme/qwen_image_edit_hf_cache_dir"
-MODEL_ID = "Qwen/Qwen-Image-Edit-2509"
+MODEL_ID = "Qwen/Qwen-Image-Edit-2511"
 SEED = 42
 
 

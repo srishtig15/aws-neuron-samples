@@ -2,7 +2,7 @@
 
 中文 | [English](README.md)
 
-本项目实现了在 AWS Trainium2 (trn2) 实例上使用 Neuron SDK 运行 [Qwen-Image-Edit-2509](https://huggingface.co/Qwen/Qwen-Image-Edit-2509) 模型。
+本项目实现了在 AWS Trainium2 (trn2) 实例上使用 Neuron SDK 运行 [Qwen-Image-Edit-2509](https://huggingface.co/Qwen/Qwen-Image-Edit-2511) 模型。
 
 ## 概述
 
@@ -666,7 +666,7 @@ NEURON_RT_NUM_CORES=8 python run_qwen_image_edit.py \
 
 ## 参考资料
 
-- [Qwen-Image-Edit 模型](https://huggingface.co/Qwen/Qwen-Image-Edit-2509)
+- [Qwen-Image-Edit 模型](https://huggingface.co/Qwen/Qwen-Image-Edit-2511)
 - [AWS Neuron SDK 文档](https://awsdocs-neuron.readthedocs-hosted.com/)
 - [Diffusers 库](https://github.com/huggingface/diffusers)
 
