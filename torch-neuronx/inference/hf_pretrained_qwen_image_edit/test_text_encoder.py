@@ -167,7 +167,7 @@ def test_vision_encoder(args):
         MODEL_ID,
         torch_dtype=dtype,
         cache_dir=CACHE_DIR,
-        local_files_only=True,
+        local_files_only=False,
     )
 
     # Get vision encoder
@@ -237,7 +237,7 @@ def test_language_model(args):
         MODEL_ID,
         torch_dtype=dtype,
         cache_dir=CACHE_DIR,
-        local_files_only=True,
+        local_files_only=False,
     )
 
     # Get language model
@@ -314,7 +314,7 @@ def test_text_encoder_full(args):
         MODEL_ID,
         torch_dtype=dtype,
         cache_dir=CACHE_DIR,
-        local_files_only=True,
+        local_files_only=False,
     )
 
     # Create a test image
@@ -426,7 +426,7 @@ def test_cpu_language_model_mode(args):
         MODEL_ID,
         torch_dtype=dtype,
         cache_dir=CACHE_DIR,
-        local_files_only=True,
+        local_files_only=False,
     )
 
     # Check if compiled vision encoder exists
@@ -607,7 +607,7 @@ def test_embedding_values(args):
         MODEL_ID,
         torch_dtype=dtype,
         cache_dir=CACHE_DIR,
-        local_files_only=True,
+        local_files_only=False,
     )
 
     embed_tokens = pipe.text_encoder.model.language_model.embed_tokens

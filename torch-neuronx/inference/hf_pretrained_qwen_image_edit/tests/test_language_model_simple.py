@@ -57,7 +57,7 @@ def test_language_model_cpu_only():
         MODEL_ID,
         torch_dtype=dtype,
         cache_dir=CACHE_DIR,
-        local_files_only=True,
+        local_files_only=False,
     )
 
     lang_model = pipe.text_encoder.model.language_model
@@ -113,7 +113,7 @@ def test_language_model_single_device():
         MODEL_ID,
         torch_dtype=dtype,
         cache_dir=CACHE_DIR,
-        local_files_only=True,
+        local_files_only=False,
     )
 
     lang_model = pipe.text_encoder.model.language_model
@@ -193,7 +193,7 @@ def test_attention_gqa():
         MODEL_ID,
         torch_dtype=dtype,
         cache_dir=CACHE_DIR,
-        local_files_only=True,
+        local_files_only=False,
     )
 
     lang_model = pipe.text_encoder.model.language_model

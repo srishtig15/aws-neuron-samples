@@ -43,7 +43,7 @@ def get_text_encoder(tp_degree: int, sequence_length: int):
     pipe: PixArtSigmaPipeline = PixArtSigmaPipeline.from_pretrained(
         "PixArt-alpha/PixArt-Sigma-XL-2-1024-MS",
         cache_dir="pixart_sigma_hf_cache_dir_1024",
-        local_files_only=True,
+        local_files_only=False,
         torch_dtype=torch.bfloat16)
     text_encoder: T5EncoderModel = pipe.text_encoder
     text_encoder.eval()

@@ -125,7 +125,7 @@ def test_vae_encoder(args):
         MODEL_ID,
         torch_dtype=dtype,
         cache_dir=CACHE_DIR,
-        local_files_only=True,
+        local_files_only=False,
     )
 
     # Create Neuron-compatible VAE with same weights
@@ -199,7 +199,7 @@ def test_vae_decoder(args):
         MODEL_ID,
         torch_dtype=dtype,
         cache_dir=CACHE_DIR,
-        local_files_only=True,
+        local_files_only=False,
     )
 
     # Create Neuron-compatible VAE with same weights
@@ -274,7 +274,7 @@ def test_vae_roundtrip(args):
         MODEL_ID,
         torch_dtype=dtype,
         cache_dir=CACHE_DIR,
-        local_files_only=True,
+        local_files_only=False,
     )
 
     # Create Neuron-compatible VAE with same weights

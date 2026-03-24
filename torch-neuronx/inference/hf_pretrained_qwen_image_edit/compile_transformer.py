@@ -70,7 +70,7 @@ def get_transformer_model(tp_degree: int, img_shapes: list):
     pipe = QwenImageEditPlusPipeline.from_pretrained(
         MODEL_ID,
         torch_dtype=torch.bfloat16,
-        local_files_only=True,
+        local_files_only=False,
         cache_dir=CACHE_DIR)
 
     # Patch RoPE to use Neuron-compatible implementation (no complex numbers)

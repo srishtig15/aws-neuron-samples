@@ -2750,7 +2750,7 @@ def run_inference(args):
         MODEL_ID,
         torch_dtype=dtype,
         cache_dir=HUGGINGFACE_CACHE_DIR,
-        local_files_only=True
+        local_files_only=False
     )
 
     # CRITICAL: Configure processor to output fixed image size matching compiled vision encoder

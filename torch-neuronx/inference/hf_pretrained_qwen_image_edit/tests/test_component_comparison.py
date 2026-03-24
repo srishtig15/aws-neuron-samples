@@ -91,7 +91,7 @@ def test_step_by_step(args):
         MODEL_ID,
         torch_dtype=dtype,
         cache_dir=CACHE_DIR,
-        local_files_only=True,
+        local_files_only=False,
     )
 
     # Configure processor for fixed image size

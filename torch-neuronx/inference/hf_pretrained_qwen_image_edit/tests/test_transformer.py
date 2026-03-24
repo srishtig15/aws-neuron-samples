@@ -156,7 +156,7 @@ def test_transformer_single_step(args):
         MODEL_ID,
         torch_dtype=dtype,
         cache_dir=CACHE_DIR,
-        local_files_only=True,
+        local_files_only=False,
     )
 
     # Patch RoPE for Neuron compatibility
@@ -254,7 +254,7 @@ def test_transformer_multiple_timesteps(args):
         MODEL_ID,
         torch_dtype=dtype,
         cache_dir=CACHE_DIR,
-        local_files_only=True,
+        local_files_only=False,
     )
     pipe.transformer = patch_qwenimage_rope(pipe.transformer)
     pipe.transformer.eval()
@@ -359,7 +359,7 @@ def test_transformer_block_by_block(args):
         MODEL_ID,
         torch_dtype=dtype,
         cache_dir=CACHE_DIR,
-        local_files_only=True,
+        local_files_only=False,
     )
     pipe.transformer = patch_qwenimage_rope(pipe.transformer)
     pipe.transformer.eval()

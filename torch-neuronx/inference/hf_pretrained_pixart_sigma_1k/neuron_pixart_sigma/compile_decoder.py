@@ -45,7 +45,7 @@ def compile_decoder(args):
     pipe: PixArtSigmaPipeline = PixArtSigmaPipeline.from_pretrained(
         "PixArt-alpha/PixArt-Sigma-XL-2-1024-MS",
         cache_dir="pixart_sigma_hf_cache_dir_1024",
-        local_files_only=True,
+        local_files_only=False,
         torch_dtype=dtype)
     
     decoder: Decoder = pipe.vae.decoder

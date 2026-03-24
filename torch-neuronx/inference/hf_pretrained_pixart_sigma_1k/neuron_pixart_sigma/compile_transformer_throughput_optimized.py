@@ -41,7 +41,7 @@ def get_transformer_model():
     pipe: PixArtSigmaPipeline = PixArtSigmaPipeline.from_pretrained(
         "PixArt-alpha/PixArt-Sigma-XL-2-1024-MS",
         torch_dtype=torch.bfloat16,
-        local_files_only=True,
+        local_files_only=False,
         cache_dir="pixart_sigma_hf_cache_dir_1024")    
     mod_pipe_transformer_f = TracingTransformerWrapper(pipe.transformer)
     return mod_pipe_transformer_f

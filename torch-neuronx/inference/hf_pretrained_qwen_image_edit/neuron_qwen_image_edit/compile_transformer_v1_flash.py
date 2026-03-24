@@ -482,7 +482,7 @@ def get_transformer_model_v1_flash(tp_degree: int, img_rotary_emb: torch.Tensor,
     pipe = QwenImageEditPlusPipeline.from_pretrained(
         MODEL_ID,
         torch_dtype=torch.bfloat16,
-        local_files_only=True,
+        local_files_only=False,
         cache_dir=CACHE_DIR
     )
 
@@ -531,7 +531,7 @@ def compile_transformer_v1_flash(args):
     pipe = QwenImageEditPlusPipeline.from_pretrained(
         MODEL_ID,
         torch_dtype=torch.bfloat16,
-        local_files_only=True,
+        local_files_only=False,
         cache_dir=CACHE_DIR
     )
 
